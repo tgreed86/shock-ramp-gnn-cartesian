@@ -1,0 +1,2583 @@
+# ------------------------------
+# PRECOMPUTE: mesh + GT→pred maps
+# ------------------------------
+# ---- rollout_precompute.py ----
+from __future__ import annotations
+from typing import Dict, List, Any, Optional
+import os, json, hashlib, torch
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+import numpy as np
+from matplotlib.path import Path
+import torch.nn.functional as F
+from utils.extract_dmr_boundaries import build_amr_mesh_for_wedge, plot_amr_mesh
+
+from amr_policy import (
+    predict_masks_hierarchical_from_gt_gradients, 
+    _parents_from_level_ij,
+    coarse_aggregate_from_dynamic
+)
+from utils_geom import (
+    dynamic_cells_from_parent_masks,
+    _targeted_map_to_pred,
+    parents_from_pos, build_idw_map,
+    apply_idw_map
+)
+from utils.precomp_h5 import precomp_h5_is_usable
+
+def _cfg_hash_for_cache(cfg):
+    # Small hash so different policy/interp settings produce separate caches
+    key = {
+        "policy": cfg.get("policy", {}),
+        "interp": {
+            "method": cfg.get("loss", {}).get("interp_method", "idw"),
+            "k":      int(cfg.get("loss", {}).get("interp_k", 8)),
+            "delta":  float(cfg.get("loss", {}).get("huber_delta", 0.05)),
+        },
+    }
+    s = json.dumps(key, sort_keys=True, default=str)
+    return hashlib.md5(s.encode()).hexdigest()[:8]
+
+def plot_precomputed_mesh_from_h5(
+    h5_path: str,
+    *,
+    t: int = 1,
+    out_path: str | None = None,
+    show: bool = False,
+    max_cells: int = 250_000,
+    linewidth: float = 0.05,
+    title: str | None = None,
+    wedge_path=None,          # optional: overlay wedge polygon if it has .vertices
+):
+    """
+    Plot the *predicted/training* mesh stored in the precompute HDF5.
+
+    - Reads group t{t:05d} (default t=1, which is the first 'predicted step' mesh).
+    - Uses pred_centers + pred_levels and meta dx/dy/bbox to draw rectangles.
+    - For large meshes, decimates to at most `max_cells` cells.
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to precomp_rollout.h5
+    t : int
+        Which group to plot (1..T-1). If missing, falls back to the first available group.
+    out_path : str | None
+        If provided, saves a PNG/PDF/etc. via matplotlib.
+    show : bool
+        If True, calls plt.show().
+    max_cells : int
+        Max number of cells to draw (decimates uniformly by index if exceeded).
+    linewidth : float
+        Line width for cell edges.
+    title : str | None
+        Plot title override.
+    wedge_path : optional
+        If provided and has attribute `.vertices`, overlays polygon boundary.
+    """
+    import numpy as np
+    import h5py
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+
+    with h5py.File(h5_path, "r") as f:
+        if "meta" not in f:
+            raise RuntimeError(f"H5 file missing 'meta' group: {h5_path}")
+
+        meta = f["meta"].attrs
+        H = int(meta["H"])
+        W = int(meta["W"])
+        dx = float(meta["dx"])
+        dy = float(meta["dy"])
+        bbox = np.asarray(meta["bbox"], dtype=np.float64).reshape(-1)
+        if bbox.size != 4:
+            raise RuntimeError(f"Expected bbox with 4 entries, got shape {bbox.shape}")
+        xmin, xmax, ymin, ymax = map(float, bbox)
+
+        gname = f"t{int(t):05d}"
+        if gname not in f:
+            # fall back to first available txxxxx group
+            keys = sorted([k for k in f.keys() if k.startswith("t")])
+            if not keys:
+                raise RuntimeError("No txxxxx groups found in H5; nothing to plot.")
+            gname = keys[0]
+
+        g = f[gname]
+        centers = np.asarray(g["pred_centers"][...], dtype=np.float32)  # [N,2]
+        levels = np.asarray(g["pred_levels"][...], dtype=np.int32)      # [N]
+
+    if centers.ndim != 2 or centers.shape[1] != 2:
+        raise RuntimeError(f"pred_centers has unexpected shape: {centers.shape}")
+    if levels.ndim != 1 or levels.shape[0] != centers.shape[0]:
+        raise RuntimeError(f"pred_levels shape mismatch: levels={levels.shape}, centers={centers.shape}")
+
+    N = centers.shape[0]
+    if N == 0:
+        raise RuntimeError("Mesh has zero cells; cannot plot.")
+
+    # Optional decimation (important for large refined meshes)
+    if max_cells is not None and N > int(max_cells):
+        idx = np.linspace(0, N - 1, int(max_cells), dtype=np.int64)
+        centers = centers[idx]
+        levels = levels[idx]
+        N = centers.shape[0]
+
+    # Cell half-widths/half-heights by refinement level:
+    # level L => cell size = (dx / 2^L, dy / 2^L)
+    scale = np.power(2.0, levels.astype(np.float32))  # 2^L
+    hx = (dx / scale) * 0.5
+    hy = (dy / scale) * 0.5
+
+    x = centers[:, 0]
+    y = centers[:, 1]
+    x0 = x - hx
+    x1 = x + hx
+    y0 = y - hy
+    y1 = y + hy
+
+    # Build 4 line segments per cell (bottom, top, left, right)
+    segs = np.empty((N * 4, 2, 2), dtype=np.float32)
+
+    # bottom: (x0,y0) -> (x1,y0)
+    segs[0::4, 0, 0] = x0
+    segs[0::4, 0, 1] = y0
+    segs[0::4, 1, 0] = x1
+    segs[0::4, 1, 1] = y0
+
+    # top: (x0,y1) -> (x1,y1)
+    segs[1::4, 0, 0] = x0
+    segs[1::4, 0, 1] = y1
+    segs[1::4, 1, 0] = x1
+    segs[1::4, 1, 1] = y1
+
+    # left: (x0,y0) -> (x0,y1)
+    segs[2::4, 0, 0] = x0
+    segs[2::4, 0, 1] = y0
+    segs[2::4, 1, 0] = x0
+    segs[2::4, 1, 1] = y1
+
+    # right: (x1,y0) -> (x1,y1)
+    segs[3::4, 0, 0] = x1
+    segs[3::4, 0, 1] = y0
+    segs[3::4, 1, 0] = x1
+    segs[3::4, 1, 1] = y1
+
+    fig, ax = plt.subplots(figsize=(11, 6.5), dpi=150)
+
+    lc = LineCollection(segs, linewidths=float(linewidth))
+    ax.add_collection(lc)
+
+    # Optional wedge overlay if wedge_path is a matplotlib.path.Path-like object
+    if wedge_path is not None and hasattr(wedge_path, "vertices"):
+        v = np.asarray(wedge_path.vertices, dtype=np.float32)
+        if v.ndim == 2 and v.shape[1] == 2 and v.shape[0] >= 2:
+            ax.plot(v[:, 0], v[:, 1], linewidth=2.0)
+
+    pad_x = 0.02 * (xmax - xmin)
+    pad_y = 0.02 * (ymax - ymin)
+    ax.set_xlim(xmin - pad_x, xmax + pad_x)
+    ax.set_ylim(ymin - pad_y, ymax + pad_y)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x (physical)")
+    ax.set_ylabel("y (physical)")
+
+    if title is None:
+        title = f"Precomputed training mesh from {os.path.basename(h5_path)} @ {gname} (N={N})"
+    ax.set_title(title)
+
+    fig.tight_layout()
+
+    if out_path is not None:
+        fig.savefig(out_path, bbox_inches="tight")
+    if show:
+        plt.show()
+
+    plt.close(fig)
+
+def _normalize_builder_output_to_mesh(
+    out,
+    *,
+    cfg: dict,
+    H: int,
+    W: int,
+    device: torch.device,
+):
+    """
+    Normalize various possible builder outputs into:
+      centers (N,2) float32,
+      levels  (N,)  int64,
+      parents (N,)  int64 (coarse parent flat index in [0, H*W)),
+      edge_index (2,E) int64,
+      mask_parent (H,W) bool
+
+    Supports:
+      - dict with centers/levels/(parents)/(edge_index)
+      - tuple/list of length 4 or 5
+      - list-of-cells (len >> 5), where each cell is dict/tuple-like
+    """
+    bbox = tuple(cfg["data"]["bbox"])
+    xmin, xmax, ymin, ymax = bbox
+
+    def _as_tensor(x, dtype=None):
+        if torch.is_tensor(x):
+            t = x
+        else:
+            t = torch.as_tensor(x)
+        if dtype is not None:
+            t = t.to(dtype)
+        return t
+
+    # -------------------------
+    # Case A: dict-style output
+    # -------------------------
+    if isinstance(out, dict):
+        # common key aliases
+        def pick(*names):
+            for n in names:
+                if n in out and out[n] is not None:
+                    return out[n]
+            return None
+
+        centers = pick("centers", "pred_centers", "pos", "xy", "cell_centers")
+        levels  = pick("levels", "pred_levels", "level", "cell_levels")
+        parents = pick("parents", "pred_parents", "parent", "parent_flat", "dyn_parents")
+        ei      = pick("edge_index", "pred_ei", "ei")
+
+        if centers is None or levels is None:
+            raise RuntimeError(f"Builder dict missing centers/levels. Keys={list(out.keys())}")
+
+        centers = _as_tensor(centers, torch.float32).to(device)
+        levels  = _as_tensor(levels).to(torch.int64).to(device)
+
+        if parents is None:
+            parents = parents_from_pos(centers, H, W, xmin, xmax, ymin, ymax)
+        else:
+            parents = _as_tensor(parents).to(torch.int64).to(device)
+
+        # if parents are (N,2) ij on coarse grid, flatten
+        if parents.ndim == 2 and parents.size(-1) == 2:
+            parents = parents[:, 1] * W + parents[:, 0]
+        parents = parents.view(-1)
+
+        if ei is not None:
+            ei = _as_tensor(ei).to(torch.int64).to(device)
+        else:
+            ei = build_amr_local_knn_edges(
+                centers, parents, H, W,
+                k_local=int(cfg.get("edges", {}).get("k_local", 4)),
+                max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
+            ).to(device)
+
+        mask_parent = _mask_from_parents(parents, H, W).to(device)
+        return centers, levels, parents, ei, mask_parent
+
+    # -----------------------------------
+    # Case B: short tuple/list (4 or 5)
+    # -----------------------------------
+    if isinstance(out, (tuple, list)) and len(out) in (4, 5):
+        centers, levels, parents, ei = out[:4]
+        mask_parent = out[4] if len(out) == 5 else None
+
+        centers = _as_tensor(centers, torch.float32).to(device)
+        levels  = _as_tensor(levels).to(torch.int64).to(device)
+        parents = _as_tensor(parents).to(torch.int64).to(device)
+
+        if parents.ndim == 2 and parents.size(-1) == 2:
+            parents = parents[:, 1] * W + parents[:, 0]
+        parents = parents.view(-1)
+
+        if ei is not None:
+            ei = _as_tensor(ei).to(torch.int64).to(device)
+        else:
+            ei = build_amr_local_knn_edges(
+                centers, parents, H, W,
+                k_local=int(cfg.get("edges", {}).get("k_local", 4)),
+                max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
+            ).to(device)
+
+        if mask_parent is None:
+            mask_parent = _mask_from_parents(parents, H, W).to(device)
+        else:
+            mask_parent = _as_tensor(mask_parent).to(torch.bool).to(device).view(H, W)
+
+        return centers, levels, parents, ei, mask_parent
+
+    # ----------------------------------------
+    # Case C: list-of-cells (len is large)
+    # ----------------------------------------
+    '''
+    if isinstance(out, (tuple, list)) and len(out) > 5:
+        cells = out
+
+        # Heuristic parse: each entry is either dict-like or tuple-like.
+        c_list = []
+        l_list = []
+        p_list = []
+
+        first = cells[0]
+        # dict-like per cell
+        if isinstance(first, dict):
+            # common per-cell key aliases
+            center_keys = ("center", "centers", "pos", "xy", "c", "center_xy")
+            level_keys  = ("level", "lvl", "L", "ref_level")
+            parent_keys = ("parent", "parent_flat", "parent_idx", "p", "coarse_parent", "parent_ij")
+
+            def _pick_cell(d, keys):
+                for k in keys:
+                    if k in d:
+                        return d[k]
+                return None
+
+            for d in cells:
+                c = _pick_cell(d, center_keys)
+                l = _pick_cell(d, level_keys)
+                p = _pick_cell(d, parent_keys)
+
+                if c is None or l is None:
+                    raise RuntimeError(
+                        f"Cell dict missing center/level. First cell keys={list(first.keys())}"
+                    )
+
+                c_list.append(_as_tensor(c, torch.float32).view(2))
+                l_list.append(int(_as_tensor(l).item()))
+
+                if p is None:
+                    p_list.append(None)
+                else:
+                    pt = _as_tensor(p)
+                    # allow parent as ij pair
+                    if pt.numel() == 2:
+                        p_list.append((int(pt.view(-1)[0].item()), int(pt.view(-1)[1].item())))
+                    else:
+                        p_list.append(int(pt.item()))
+
+        else:
+            # tuple-like per cell: we assume (center, level, parent?) in first 2-3 slots
+            for item in cells:
+                if not isinstance(item, (tuple, list)) or len(item) < 2:
+                    raise RuntimeError(
+                        f"Cannot parse list-of-cells; element type={type(item)} len={len(item) if hasattr(item,'__len__') else 'NA'}"
+                    )
+                c = item[0]
+                l = item[1]
+                p = item[2] if len(item) >= 3 else None
+
+                c_list.append(_as_tensor(c, torch.float32).view(2))
+                l_list.append(int(_as_tensor(l).item()))
+                p_list.append(None if p is None else int(_as_tensor(p).item()))
+        '''
+    # Case: builder returned a list of per-cell dicts (common for wedge mesh builders)
+    if isinstance(out, (list, tuple)) and len(out) > 0 and isinstance(out[0], dict):
+        first = out[0]
+        keys = list(first.keys())
+
+        # Required minimal keys from your builder: level, i, j
+        if not (("level" in first) and ("i" in first) and ("j" in first)):
+            raise RuntimeError(
+                f"Cell dict missing required (level,i,j). First cell keys={keys}"
+            )
+
+        # Extract arrays
+        levels = torch.as_tensor([c["level"] for c in out], dtype=torch.int64, device=device).view(-1)
+        ii     = torch.as_tensor([c["i"]     for c in out], dtype=torch.int64, device=device).view(-1)
+        jj     = torch.as_tensor([c["j"]     for c in out], dtype=torch.int64, device=device).view(-1)
+
+        bbox = tuple(cfg["data"]["bbox"])
+        centers = _centers_from_level_ij(
+            levels, ii, jj, H=H, W=W, bbox=bbox, device=device
+        ).to(dtype=torch.float32)
+
+        # Parents: coarse parent index on level-0 grid.
+        # For a level-L cell, its level-0 parent is (i // 2^L, j // 2^L).
+        scale_i = torch.pow(torch.tensor(2, device=device, dtype=torch.int64), levels)
+        i0 = torch.div(ii, scale_i, rounding_mode="floor")
+        j0 = torch.div(jj, scale_i, rounding_mode="floor")
+        parents = (j0 * int(W) + i0).to(torch.int64).view(-1)
+
+        # Coarse mask
+        mask_parent = _mask_from_parents(parents, H, W).to(device=device, dtype=torch.bool)
+
+        # Edge index: if you don't have one from the builder, rebuild local edges
+        edge_index = build_amr_local_knn_edges(
+            centers,
+            parents,
+            H,
+            W,
+            k_local=int(cfg.get("edges", {}).get("k_local", 4)),
+            max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
+        ).to(device=device, dtype=torch.int64)
+
+        return centers, levels, parents, edge_index, mask_parent
+
+
+        centers = torch.stack([t.to(device) for t in c_list], dim=0).to(torch.float32)
+        levels  = torch.tensor(l_list, device=device, dtype=torch.int64)
+
+        # parents: if missing, compute from centers; else normalize and flatten ij if needed
+        if all(p is None for p in p_list):
+            parents = parents_from_pos(centers, H, W, xmin, xmax, ymin, ymax).to(device).to(torch.int64)
+        else:
+            # mix of flat ints and (i,j) tuples
+            parents_arr = []
+            for p in p_list:
+                if p is None:
+                    parents_arr.append(-1)
+                elif isinstance(p, tuple) and len(p) == 2:
+                    i, j = p
+                    parents_arr.append(j * W + i)
+                else:
+                    parents_arr.append(int(p))
+            parents = torch.tensor(parents_arr, device=device, dtype=torch.int64)
+
+            # if -1 present (shouldn’t for active cells), replace via centers-based parents
+            bad = parents < 0
+            if bad.any():
+                parents2 = parents_from_pos(centers, H, W, xmin, xmax, ymin, ymax).to(device).to(torch.int64)
+                parents = torch.where(bad, parents2, parents)
+
+        # edges + mask
+        ei = build_amr_local_knn_edges(
+            centers, parents, H, W,
+            k_local=int(cfg.get("edges", {}).get("k_local", 4)),
+            max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
+        ).to(device)
+
+        mask_parent = _mask_from_parents(parents, H, W).to(device)
+        return centers, levels, parents, ei, mask_parent
+
+    raise RuntimeError(f"Unsupported builder return type: {type(out)}")
+
+def _centers_from_level_ij(
+    level_1d: torch.Tensor,  # (N,) int64
+    i_1d: torch.Tensor,      # (N,) int64
+    j_1d: torch.Tensor,      # (N,) int64
+    *,
+    H: int,
+    W: int,
+    bbox: tuple[float, float, float, float],
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Compute physical cell centers from (level, i, j) where i,j are indices
+    on the level-L grid (0 <= i < W*2^L, 0 <= j < H*2^L).
+
+    Assumes bbox spans the full level-0 domain discretized into HxW cells.
+    """
+    xmin, xmax, ymin, ymax = map(float, bbox)
+    dx0 = (xmax - xmin) / float(W)
+    dy0 = (ymax - ymin) / float(H)
+
+    # cell size at level L: dx0/2^L, dy0/2^L
+    lv = level_1d.to(device=device, dtype=torch.float32)
+    scale = torch.pow(torch.tensor(2.0, device=device), lv)
+
+    dxL = dx0 / scale
+    dyL = dy0 / scale
+
+    # center = lower_left + (i+0.5)*dxL, (j+0.5)*dyL
+    x = torch.tensor(xmin, device=device) + (i_1d.to(device=device, dtype=torch.float32) + 0.5) * dxL
+    y = torch.tensor(ymin, device=device) + (j_1d.to(device=device, dtype=torch.float32) + 0.5) * dyL
+    return torch.stack([x, y], dim=1)  # (N,2)
+
+@torch.no_grad()
+def debug_plot_policy_gradients(
+    grad_debug: dict,
+    cfg: dict,
+    t: int | None = None,
+    use_pooled_up: bool = False,
+    out_dir: str = "./debug_grad_plots",
+    prefix: str = "grads",
+):
+    """
+    Plot gradient magnitude maps used by the AMR policy.
+
+    grad_debug should be the dict that predict_masks_hierarchical_from_gt_gradients
+    filled when called with debug_out=...:
+        grad_debug["G"]         : raw per-level magnitudes (dict[L] -> (h_L, w_L))
+        grad_debug["pooled_up"] : pooled-up maps used for parent thresholds
+
+    If use_pooled_up=False, plots G[L]; if True, plots pooled_up[L].
+
+    Produces one PNG with subplots for all levels.
+    """
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    maps = grad_debug["pooled_up"] if use_pooled_up else grad_debug["G"]
+    if not maps:
+        print("[DEBUG GRADS] No gradient maps in grad_debug; nothing to plot.")
+        return
+
+    xmin, xmax, ymin, ymax = cfg["data"]["bbox"]
+
+    # Convert to numpy, collect vmin/vmax over finite entries
+    maps_np = {}
+    vmin = float("inf")
+    vmax = float("-inf")
+
+    for L, m in maps.items():
+        if torch.is_tensor(m):
+            m_np = m.detach().cpu().numpy()
+        else:
+            m_np = np.asarray(m)
+        maps_np[L] = m_np
+        finite = np.isfinite(m_np)
+        if finite.any():
+            vmin = min(vmin, float(m_np[finite].min()))
+            vmax = max(vmax, float(m_np[finite].max()))
+
+    if not np.isfinite(vmin) or not np.isfinite(vmax):
+        vmin, vmax = 0.0, 1.0
+
+    # non-negative mags: clamp min at 0 for color scale
+    vmin = max(0.0, vmin)
+
+    levels = sorted(maps_np.keys())
+    nL = len(levels)
+
+    fig, axes = plt.subplots(
+        1, nL, figsize=(4 * nL, 4), squeeze=False,
+        sharex=True, sharey=True,
+    )
+
+    for idx, L in enumerate(levels):
+        ax = axes[0, idx]
+        m_np = maps_np[L]
+
+        im = ax.imshow(
+            m_np,
+            origin="lower",
+            extent=[xmin, xmax, ymin, ymax],
+            vmin=vmin,
+            vmax=vmax,
+            aspect="equal",
+        )
+        ax.set_title(f"L{L} {'(pooled)' if use_pooled_up else ''}")
+        ax.set_xlabel("x")
+        if idx == 0:
+            ax.set_ylabel("y")
+
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    if t is None:
+        t_tag = "tXXXX"
+    else:
+        t_tag = f"t{int(t):04d}"
+
+    fname = f"{prefix}_{t_tag}_{'pooled' if use_pooled_up else 'raw'}.png"
+    out_path = os.path.join(out_dir, fname)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+    print(f"[DEBUG GRADS] saved {out_path}")
+
+def _cell_corners_from_centers_levels(
+    centers: torch.Tensor,  # (N,2)
+    levels: torch.Tensor,   # (N,)
+    H: int, W: int,
+    bbox: tuple[float, float, float, float],
+) -> torch.Tensor:
+    """
+    Return corners for each AMR cell (axis-aligned) as (N,4,2) in physical coords.
+    Corner order: (-x,-y), (-x,+y), (+x,-y), (+x,+y) relative to center.
+    """
+    xmin, xmax, ymin, ymax = bbox
+    dx0 = (xmax - xmin) / float(W)
+    dy0 = (ymax - ymin) / float(H)
+
+    lv = levels.to(torch.float32)
+    # cell width at level l is dx0 / 2^l, so half-width is dx0 / 2^(l+1)
+    halfx = (dx0 * 0.5) * torch.pow(torch.tensor(2.0, device=centers.device), -lv)
+    halfy = (dy0 * 0.5) * torch.pow(torch.tensor(2.0, device=centers.device), -lv)
+
+    # (N,1) for broadcasting
+    halfx = halfx.view(-1, 1)
+    halfy = halfy.view(-1, 1)
+
+    # 4 corners
+    sx = torch.tensor([-1.0, -1.0,  1.0,  1.0], device=centers.device).view(1, 4)
+    sy = torch.tensor([-1.0,  1.0, -1.0,  1.0], device=centers.device).view(1, 4)
+
+    corners = torch.empty((centers.shape[0], 4, 2), device=centers.device, dtype=centers.dtype)
+    corners[..., 0] = centers[:, 0:1] + sx * halfx
+    corners[..., 1] = centers[:, 1:2] + sy * halfy
+    return corners
+
+def _build_starting_mesh_from_spec(
+    mesh_spec_path_or_spec,
+    cfg: Dict[str, Any],
+    H: int,
+    W: int,
+    dx: float,
+    dy: float,
+    device: torch.device,
+):
+    """
+    Build an explicit AMR wedge mesh (centers/levels/parents/edge_index) from the wedge spec.
+
+    Accepts either:
+      - mesh_spec_path_or_spec: str path to .pt spec, OR a dict already loaded
+
+    Returns:
+      centers: (N,2) float32
+      levels : (N,)  int64
+      parents_flat: (N,) int64  parent indices on coarse HxW grid in [0, H*W)
+      edge_index: (2,E) int64
+      mask_parent: (H,W) bool
+    """
+    import inspect
+
+    # --- load spec + keep path if available ---
+    mesh_spec_path = mesh_spec_path_or_spec if isinstance(mesh_spec_path_or_spec, str) else None
+    spec = _load_mesh_spec(mesh_spec_path) if mesh_spec_path is not None else mesh_spec_path_or_spec
+    if not isinstance(spec, dict):
+        raise RuntimeError(f"Expected dict mesh spec, got {type(spec)}")
+
+    bbox = tuple(map(float, cfg["data"]["bbox"]))
+    n0 = int(spec.get("n0", W))
+    max_level = int(spec.get("max_level", cfg.get("policy", {}).get("max_level", 3)))
+
+    # --- call build_amr_mesh_for_wedge with signature-agnostic kwargs ---
+    """
+    fn = build_amr_mesh_for_wedge
+    params = inspect.signature(fn).parameters
+    kwargs = {}
+
+    # pass spec or path depending on what the function accepts
+    if "spec" in params:
+        kwargs["spec"] = spec
+    elif "mesh_spec" in params:
+        kwargs["mesh_spec"] = spec
+    elif "mesh_spec_path" in params or "spec_path" in params or "path" in params:
+        if mesh_spec_path is None:
+            raise RuntimeError(
+                "build_amr_mesh_for_wedge appears to require a file path, "
+                "but _build_starting_mesh_from_spec was given a dict."
+            )
+        if "mesh_spec_path" in params:
+            kwargs["mesh_spec_path"] = mesh_spec_path
+        elif "spec_path" in params:
+            kwargs["spec_path"] = mesh_spec_path
+        else:
+            kwargs["path"] = mesh_spec_path
+    else:
+        # last resort: try first positional arg as spec
+        # (we’ll do this by calling with **kwargs empty below)
+        pass
+
+    # common optional args
+    if "bbox" in params:
+        kwargs["bbox"] = bbox
+    if "H" in params:
+        kwargs["H"] = int(H)
+    if "W" in params:
+        kwargs["W"] = int(W)
+    if "n0" in params:
+        kwargs["n0"] = n0
+    if "max_level" in params:
+        kwargs["max_level"] = max_level
+    if "device" in params:
+        kwargs["device"] = device
+
+    try:
+        out = fn(**kwargs) if kwargs else fn(spec)
+    except TypeError:
+        # fallback: try passing path if we have one
+        if mesh_spec_path is not None:
+            out = fn(mesh_spec_path)
+        else:
+            raise
+    """
+        # --- call build_amr_mesh_for_wedge with signature-agnostic kwargs ---
+    fn = build_amr_mesh_for_wedge
+    params = inspect.signature(fn).parameters
+    kwargs = {}
+
+    # This builder wants a dict called "boundaries"
+    if "boundaries" in params:
+        kwargs["boundaries"] = spec
+    elif "spec" in params:
+        kwargs["spec"] = spec
+    elif "mesh_spec" in params:
+        kwargs["mesh_spec"] = spec
+    else:
+        # If there is no obvious dict parameter, try passing spec positionally
+        # (but DO NOT pass the path, because we already know this builder indexes like a dict)
+        #out = fn(spec)
+        # then skip to normalize output
+        # (return handling continues below)
+        # NOTE: put `out = fn(spec)` in a small else block in your file
+        # For clarity, we’ll fall through by setting `kwargs` empty and calling below.
+        kwargs = {}
+    
+    # common optional args
+    if "bbox" in params:
+        kwargs["bbox"] = bbox
+    if "H" in params:
+        kwargs["H"] = int(H)
+    if "W" in params:
+        kwargs["W"] = int(W)
+    if "n0" in params:
+        kwargs["n0"] = n0
+    if "max_level" in params:
+        kwargs["max_level"] = max_level
+    if "device" in params:
+        kwargs["device"] = device
+
+    # Call it. IMPORTANT: do not fall back to fn(mesh_spec_path).
+    out = fn(**kwargs) if kwargs else fn(spec)
+    '''
+    # --- normalize output to centers/levels/parents/edge_index ---
+    centers = levels = parents = edge_index = mask_parent = None
+
+    if isinstance(out, dict):
+        def pick(*names):
+            for n in names:
+                if n in out and out[n] is not None:
+                    return out[n]
+            return None
+        centers = pick("centers", "pred_centers", "pos")
+        levels  = pick("levels", "pred_levels", "level")
+        parents = pick("parents", "pred_parents", "parent", "parent_flat")
+        edge_index = pick("edge_index", "pred_ei", "ei")
+        mask_parent = pick("mask_parent", "mask", "mask_parent_hw")
+    elif isinstance(out, (tuple, list)):
+        if len(out) == 4:
+            centers, levels, parents, edge_index = out
+        elif len(out) == 5:
+            centers, levels, parents, edge_index, mask_parent = out
+        else:
+            raise RuntimeError(f"Unexpected tuple/list return from build_amr_mesh_for_wedge: len={len(out)}")
+    else:
+        raise RuntimeError(f"Unexpected return type from build_amr_mesh_for_wedge: {type(out)}")
+
+    if centers is None or levels is None:
+        raise RuntimeError(
+            "build_amr_mesh_for_wedge did not return centers/levels in a recognizable format. "
+            "Please print(type(out), out.keys()) once and I’ll adapt the pick list."
+        )
+
+    centers = centers if torch.is_tensor(centers) else torch.as_tensor(centers)
+    levels  = levels  if torch.is_tensor(levels)  else torch.as_tensor(levels)
+    centers = centers.to(device=device, dtype=torch.float32)
+    levels  = levels.to(device=device, dtype=torch.int64).view(-1)
+
+    # parents -> flat coarse parent indices
+    if parents is None:
+        xmin, xmax, ymin, ymax = bbox
+        parents = parents_from_pos(centers, H, W, xmin, xmax, ymin, ymax)
+    parents = parents if torch.is_tensor(parents) else torch.as_tensor(parents)
+    parents = parents.to(device=device, dtype=torch.int64).view(-1)
+
+    if parents.ndim == 2 and parents.size(1) == 2:
+        # (i,j) -> flat
+        parents = parents[:, 1] * W + parents[:, 0]
+        parents = parents.to(device=device, dtype=torch.int64).view(-1)
+
+    # edges
+    if edge_index is None:
+        edge_index = torch.empty((2, 0), dtype=torch.int64, device=device)
+    else:
+        edge_index = edge_index if torch.is_tensor(edge_index) else torch.as_tensor(edge_index)
+        edge_index = edge_index.to(device=device, dtype=torch.int64)
+        if edge_index.ndim != 2 or edge_index.size(0) != 2:
+            raise RuntimeError(f"edge_index must be (2,E); got {tuple(edge_index.shape)}")
+
+    # if edges are empty, build local edges
+    if edge_index.numel() == 0 or edge_index.size(1) == 0:
+        edge_index = build_amr_local_knn_edges(
+            centers,
+            parents,
+            H,
+            W,
+            k_local=int(cfg.get("edges", {}).get("k_local", 4)),
+            max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
+        )
+
+    # mask
+    if mask_parent is None:
+        mask_parent = _mask_from_parents(parents, H, W)
+    else:
+        mask_parent = mask_parent if torch.is_tensor(mask_parent) else torch.as_tensor(mask_parent)
+        mask_parent = mask_parent.to(device=device).view(H, W).to(torch.bool)
+
+    return centers, levels, parents, edge_index, mask_parent
+    '''
+    # --- normalize any builder output into the canonical mesh tensors ---
+    centers, levels, parents, edge_index, mask_parent = _normalize_builder_output_to_mesh(
+        out,
+        cfg=cfg,
+        H=H,
+        W=W,
+        device=torch.device(device) if not isinstance(device, torch.device) else device,
+    )
+
+    # Optional: enforce expected shapes early
+    if centers.ndim != 2 or centers.size(1) != 2:
+        raise RuntimeError(f"normalized centers must be (N,2), got {tuple(centers.shape)}")
+    if levels.ndim != 1 or levels.size(0) != centers.size(0):
+        raise RuntimeError(f"normalized levels must be (N,), got {tuple(levels.shape)} for N={centers.size(0)}")
+    if parents.ndim != 1 or parents.size(0) != centers.size(0):
+        raise RuntimeError(f"normalized parents must be (N,), got {tuple(parents.shape)} for N={centers.size(0)}")
+    if edge_index.ndim != 2 or edge_index.size(0) != 2:
+        raise RuntimeError(f"normalized edge_index must be (2,E), got {tuple(edge_index.shape)}")
+    if mask_parent.ndim != 2 or tuple(mask_parent.shape) != (H, W):
+        raise RuntimeError(f"normalized mask_parent must be (H,W)={(H,W)}, got {tuple(mask_parent.shape)}")
+
+    return centers, levels, parents, edge_index, mask_parent
+
+
+def _path_contains_points_torch(wedge_path, pts: torch.Tensor, radius: float = 0.0) -> torch.Tensor:
+    """
+    pts: (N,2) torch tensor on any device.
+    Returns: (N,) bool torch tensor on same device.
+    """
+    pts_np = pts.detach().cpu().numpy()
+    inside_np = wedge_path.contains_points(pts_np, radius=radius)
+    return torch.from_numpy(inside_np).to(device=pts.device)
+
+def _load_mesh_spec(mesh_spec_path: str) -> dict:
+    spec = torch.load(mesh_spec_path, map_location="cpu")
+    if not isinstance(spec, dict):
+        raise RuntimeError(f"Expected dict from mesh spec, got {type(spec)}")
+    return spec
+
+def _refine_cells_one_level(
+    centers: torch.Tensor,     # (N,2)
+    levels: torch.Tensor,      # (N,)
+    parents: torch.Tensor,     # (N,)
+    refine_mask: torch.Tensor, # (N,) bool
+    H: int, W: int,
+    bbox: tuple[float, float, float, float],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Replace each selected cell by its 4 children (level+1). Non-selected cells are kept.
+    """
+    xmin, xmax, ymin, ymax = bbox
+    dx0 = (xmax - xmin) / float(W)
+    dy0 = (ymax - ymin) / float(H)
+
+    keep_mask = ~refine_mask
+    c_keep = centers[keep_mask]
+    l_keep = levels[keep_mask]
+    p_keep = parents[keep_mask]
+
+    c_ref = centers[refine_mask]
+    l_ref = levels[refine_mask]
+    p_ref = parents[refine_mask]
+
+    if c_ref.numel() == 0:
+        return centers, levels, parents
+
+    # parent cell size at level l is dx0/2^l, child centers are offset by (dx_l/4, dy_l/4)
+    lv = l_ref.to(torch.float32)
+    offx = (dx0 * 0.25) * torch.pow(torch.tensor(2.0, device=centers.device), -lv)  # dx0 / 2^(l+2)
+    offy = (dy0 * 0.25) * torch.pow(torch.tensor(2.0, device=centers.device), -lv)
+
+    offx = offx.view(-1, 1)
+    offy = offy.view(-1, 1)
+
+    sx = torch.tensor([-1.0, -1.0,  1.0,  1.0], device=centers.device).view(1, 4)
+    sy = torch.tensor([-1.0,  1.0, -1.0,  1.0], device=centers.device).view(1, 4)
+
+    child = torch.empty((c_ref.shape[0], 4, 2), device=centers.device, dtype=centers.dtype)
+    child[..., 0] = c_ref[:, 0:1] + sx * offx
+    child[..., 1] = c_ref[:, 1:2] + sy * offy
+    child_centers = child.reshape(-1, 2)
+
+    child_levels = (l_ref + 1).repeat_interleave(4)
+    child_parents = p_ref.repeat_interleave(4)
+
+    new_centers = torch.cat([c_keep, child_centers], dim=0)
+    new_levels  = torch.cat([l_keep, child_levels], dim=0)
+    new_parents = torch.cat([p_keep, child_parents], dim=0)
+    return new_centers, new_levels, new_parents
+
+
+def _mask_from_parents(parents_flat: torch.Tensor, H: int, W: int) -> torch.Tensor:
+    """
+    parents_flat: (H*W,) or (N_dynamic,) parent indices into H*W in [0, H*W), or -1 for inactive.
+    Returns boolean (H, W) mask where True = active parent.
+    """
+    pf = parents_flat.view(-1)
+    if pf.numel() == H * W:
+        # already parent-grid length; treat >=0 as active
+        m = (pf >= 0)
+        return m.view(H, W)
+    # dynamic-length: scatter to parent-grid
+    m = torch.zeros(H * W, dtype=torch.bool, device=pf.device)
+    valid = (pf >= 0)
+    if valid.any():
+        m[pf[valid].long()] = True
+    return m.view(H, W)
+
+
+@torch.no_grad()
+def build_amr_local_knn_edges(
+    centers: torch.Tensor,          # (N,2)
+    parents_flat: torch.Tensor,     # (N,) parent idx in [0, H*W) (>=0 valid)
+    H: int, W: int,
+    k_local: int = 4,
+    max_local: int = 2048,
+):
+    """
+    Build edges by restricting KNN to each coarse parent and its 4-neighborhood.
+    Returns undirected, self-loop free, deduplicated (2,E) int64 edge_index.
+    MPS-safe (no unique(dim=...)).
+    """
+    device = centers.device
+    N = int(centers.size(0))
+    if N == 0:
+        return torch.empty(2, 0, dtype=torch.long, device=device)
+
+    # ensure CPU-friendly Python lists for buckets
+    pf = parents_flat.long().view(-1)
+    buckets = [[] for _ in range(H * W)]
+    # only keep valid parents
+    valid_mask = (pf >= 0) & (pf < H * W)
+    valid_idx = torch.nonzero(valid_mask, as_tuple=False).view(-1).tolist()
+    for i in valid_idx:
+        p = int(pf[i].item())
+        buckets[p].append(i)
+
+    def neigh_parents(p):
+        r, c = divmod(p, W)
+        out = [p]
+        if c > 0:      out.append(p - 1)
+        if c + 1 < W:  out.append(p + 1)
+        if r > 0:      out.append(p - W)
+        if r + 1 < H:  out.append(p + W)
+        return out
+
+    rows, cols = [], []
+    for p in range(H * W):
+        src_idx = buckets[p]
+        if not src_idx:
+            continue
+        cand_idx = []
+        for q in neigh_parents(p):
+            cand_idx.extend(buckets[q])
+        if len(cand_idx) <= 1:
+            continue
+
+        # cap candidate set to keep cdist small
+        if len(cand_idx) > max_local:
+            cand_idx = cand_idx[:max_local]
+
+        S = centers[torch.as_tensor(src_idx, device=device, dtype=torch.long)]  # (S,2)
+        C = centers[torch.as_tensor(cand_idx, device=device, dtype=torch.long)] # (M,2)
+        D = torch.cdist(S, C)                                                   # (S,M)
+        k = min(k_local + 1, C.size(0))  # +1 to drop self if present
+        nbr = torch.topk(D, k, largest=False).indices                           # (S,k)
+
+        # append pairs
+        for a in range(nbr.size(0)):
+            i_src = src_idx[a]
+            for pos in nbr[a].tolist():
+                j_cand = cand_idx[pos]
+                if j_cand == i_src:  # drop self here
+                    continue
+                rows.append(i_src)
+                cols.append(j_cand)
+
+    if not rows:
+        return torch.empty(2, 0, dtype=torch.long, device=device)
+
+    u0 = torch.tensor(rows, dtype=torch.long, device=device)
+    v0 = torch.tensor(cols, dtype=torch.long, device=device)
+
+    # make undirected correctly (use copies, not the mutated tensors)
+    u = torch.cat([u0, v0], dim=0)
+    v = torch.cat([v0, u0], dim=0)
+
+    # drop any (rare) self-loops
+    mask = (u != v)
+    if not mask.any():
+        return torch.empty(2, 0, dtype=torch.long, device=device)
+    u = u[mask]; v = v[mask]
+
+    # MPS-safe dedup on CPU using 1-D keys
+    keys = (u.to(torch.int64) * N + v.to(torch.int64)).to("cpu")
+    keys = torch.unique(keys)  # 1-D unique is supported
+    u = (keys // N).to(device, torch.long)
+    v = (keys %  N).to(device, torch.long)
+
+    return torch.stack([u, v], dim=0)
+
+
+@torch.no_grad()
+def _build_pred_mesh_from_gt_gradients(
+    ex: dict,
+    cfg: dict,
+    H: int,
+    W: int,
+    dx: float,
+    dy: float,
+    device,
+):
+    """
+    Predict the mesh at t+1 using the gradient-based AMR policy.
+
+    IMPORTANT:
+      - This function is *rectangular-domain only*: it knows nothing about the
+        wedge geometry.  Wedge clipping is handled upstream in
+        precompute_pred_mesh_and_interps_for_rollout via _clip_pred_mesh_to_wedge.
+      - It returns:
+          pred_centers : (N,2)  physical centers
+          pred_levels  : (N,)   refinement level of each leaf
+          parent_flat  : (N,)   coarse parent index in [0, H*W)
+          pred_ei      : (2,E)  edge_index (AMR-local KNN)
+          mask_pred_parent : (H,W) bool, mask of which coarse parents are occupied
+    """
+    dev = torch.device(device)
+
+    # -------------------------------
+    # 1. GT(t) centers and features
+    # -------------------------------
+    centers_t = ex["centers_t"]
+    if not torch.is_tensor(centers_t):
+        centers_t = torch.as_tensor(centers_t)
+    centers_t = centers_t.to(dev)
+
+    feat_t = ex.get("center_feat_t", ex.get("dyn_feat_t"))
+    if feat_t is None:
+        raise KeyError("Expected 'center_feat_t' or 'dyn_feat_t' in dataset sample.")
+    if not torch.is_tensor(feat_t):
+        feat_t = torch.as_tensor(feat_t)
+    feat_t = feat_t.to(dev).to(torch.float32)
+
+    # -------------------------------
+    # 2. Parents on coarse (H,W) grid
+    # -------------------------------
+    if "level_t" in ex and ex["level_t"] is not None and \
+       "ij_t" in ex and ex["ij_t"] is not None:
+        parents_t = _parents_from_level_ij(
+            ex["level_t"].to(dev),
+            ex["ij_t"].to(dev),
+            H,
+            W,
+        )
+    elif "dyn_parents" in ex and ex["dyn_parents"] is not None:
+        parents_t = ex["dyn_parents"].to(dev)
+    else:
+        xmin, xmax, ymin, ymax = cfg["data"]["bbox"]
+        parents_t = parents_from_pos(
+            centers_t,
+            H,
+            W,
+            xmin,
+            xmax,
+            ymin,
+            ymax,
+        ).to(dev)
+
+    # Coarse mask at t
+    if "mask_t" in ex and ex["mask_t"] is not None:
+        mask_t_parent = ex["mask_t"].to(dev).view(H, W)
+    else:
+        mask_t_parent = _mask_from_parents(parents_t, H, W)
+
+    # -------------------------------
+    # 3. Build batch for policy call
+    # -------------------------------
+    batch_like = {
+        "centers_t":     centers_t,
+        "center_feat_t": feat_t,
+        "dyn_feat_t":    feat_t,
+        "dyn_parents":   parents_t,
+        "mask_t":        mask_t_parent.view(-1),
+    }
+    if "level_t" in ex:
+        batch_like["level_t"] = ex["level_t"]
+    if "ij_t" in ex:
+        batch_like["ij_t"] = ex["ij_t"]
+    if "ei_t" in ex and ex["ei_t"] is not None:
+        batch_like["ei_t"] = ex["ei_t"]
+
+    # -------------------------------
+    # 4. Gradient-based masks
+    # -------------------------------
+    """
+    masks_pred_by_level = predict_masks_hierarchical_from_gt_gradients(
+        batch_like,
+        cfg,
+        H,
+        W,
+        dx,
+        dy,
+        device=dev,
+    )
+    """
+    # --- call policy, capturing gradient maps for debugging ---
+    grad_debug: dict = {}
+    masks_pred_by_level = predict_masks_hierarchical_from_gt_gradients(
+        batch_like,
+        cfg,
+        H,
+        W,
+        dx,
+        dy,
+        device=device,
+        debug_out=grad_debug,
+    )
+    """
+    t_idx = ex.get("t", None)
+    if torch.is_tensor(t_idx):
+        t_idx = int(t_idx.item())
+    debug_plot_policy_gradients(
+        grad_debug,
+        cfg=cfg,
+        t=t_idx,
+        use_pooled_up=False,   # or True, if you prefer the pooled maps
+        out_dir="./debug_grad_plots",
+        prefix="policy_grads",
+    )
+    """
+    # -------------------------------
+    # 5. Masks -> dynamic leaf mesh
+    # -------------------------------
+    xmin, xmax, ymin, ymax = cfg["data"]["bbox"]
+    pred_centers, pred_levels, pred_parents, pred_ei = dynamic_cells_from_parent_masks(
+        masks_pred_by_level,
+        H,
+        W,
+        xmin,
+        xmax,
+        ymin,
+        ymax,
+    )
+
+    # Flatten parents to [N] indices on level-0 grid
+    if pred_parents.ndim == 2 and pred_parents.size(1) == 2:
+        # pred_parents is (i,j) at level-0 resolution
+        parent_flat = pred_parents[:, 1].long() * W + pred_parents[:, 0].long()
+    else:
+        parent_flat = pred_parents.view(-1).long()
+
+    # -------------------------------
+    # 6. Ensure edges exist
+    # -------------------------------
+    if (not torch.is_tensor(pred_ei)) or pred_ei.numel() == 0:
+        pred_ei = build_amr_local_knn_edges(
+            pred_centers,
+            parent_flat,
+            H,
+            W,
+            k_local=int(cfg.get("edges", {}).get("k_local", 4)),
+            max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
+        )
+    pred_ei = pred_ei.to(dev).long()
+
+    if pred_ei.ndim != 2 or pred_ei.size(0) != 2 or pred_ei.size(1) == 0:
+        sid = ex.get("t", None)
+        sid_int = int(sid.item()) if torch.is_tensor(sid) else int(sid) if sid is not None else -1
+        raise RuntimeError(f"[precompute] empty pred_ei for sample t={sid_int}")
+
+    # -------------------------------
+    # 7. Parent-grid occupancy mask
+    # -------------------------------
+    mask_pred_parent = _mask_from_parents(parent_flat, H, W)
+
+    return pred_centers, pred_levels, parent_flat, pred_ei, mask_pred_parent
+
+
+@torch.no_grad()
+def _map_gt_on_pred_mesh_once(
+    *,
+    src_centers, src_feats,            # centers/features on GT mesh
+    mask_src_parent, parents_src,      # (H,W) mask of active parents & parent indices for src
+    pred_centers, pred_levels, pred_parents, mask_pred_parent,
+    H, W, device
+):
+
+    src_feats = src_feats.to(device)
+    Xc = coarse_aggregate_from_dynamic(src_feats, parents_src, H, W)
+    feat_on_pred, _stat = _targeted_map_to_pred(
+        pred_centers=pred_centers,
+        pred_levels=pred_levels,
+        pred_parents=pred_parents,
+        mask_pred=mask_pred_parent,
+        src_centers=src_centers,
+        src_feats=src_feats,
+        H=H, W=W,
+        #mask_src_parent=mask_src_parent,
+        mask_src_parent=None,
+        #src_parent_feats=Xc,
+        src_parent_feats=None,
+    )
+    return feat_on_pred
+
+
+def make_collate_with_precompute(pre_dir: str):
+    def _collate(samples):
+        ex = samples[0]  # bs=1
+        sid = int(ex["t"].item()) if torch.is_tensor(ex["t"]) else int(ex["t"])
+        p = os.path.join(pre_dir, f"{sid:07d}.pt")
+        if os.path.exists(p):
+            blob = torch.load(p, map_location="cpu", weights_only=False)
+            # ---- normalize types right here ----
+            if "pred_ei" in blob:
+                blob["pred_ei"] = blob["pred_ei"].to(torch.long).contiguous()
+            if "mask_pred_parent" in blob and blob["mask_pred_parent"].dtype != torch.bool:
+                blob["mask_pred_parent"] = (blob["mask_pred_parent"] > 0)
+            ex.update(blob)
+        return ex
+    return _collate
+
+
+@torch.no_grad()
+def _load_wedge_path_from_spec(mesh_spec_path: str, cfg: Dict[str, Any]):
+    """
+    Load the wedge polygon from wedge_mesh_spec.pt and return a
+    matplotlib.path.Path object, rescaled into the same coordinate
+    system as cfg["data"]["bbox"].
+
+    We infer the native wedge extents directly from outer_polygon_ccw,
+    rather than relying on spec["left"/"right"/"bottom"/"top"].
+    """
+    import numpy as np
+    from matplotlib.path import Path
+
+    if mesh_spec_path is None:
+        raise ValueError("mesh_spec_path is None in _load_wedge_path_from_spec")
+
+    # Load the saved spec
+    spec = torch.load(mesh_spec_path, map_location="cpu", weights_only=False)
+    if "outer_polygon_ccw" not in spec:
+        raise KeyError(
+            f"Expected key 'outer_polygon_ccw' in mesh spec {mesh_spec_path}, "
+            f"found keys={list(spec.keys())}"
+        )
+
+    outer = spec["outer_polygon_ccw"]
+    if isinstance(outer, torch.Tensor):
+        outer = outer.detach().cpu().numpy()
+    else:
+        outer = np.asarray(outer, dtype=np.float64)
+
+    if outer.ndim != 2 or outer.shape[1] != 2:
+        raise ValueError(
+            f"'outer_polygon_ccw' must be (M,2), got shape {outer.shape}"
+        )
+
+    # Native wedge extents inferred from the polygon itself
+    left   = float(outer[:, 0].min())
+    right  = float(outer[:, 0].max())
+    bottom = float(outer[:, 1].min())
+    top    = float(outer[:, 1].max())
+
+    # Target extents from the training config
+    xmin, xmax, ymin, ymax = cfg["data"]["bbox"]
+
+    dx_src = right  - left
+    dy_src = top    - bottom
+    if dx_src == 0.0 or dy_src == 0.0:
+        raise ValueError(
+            f"Degenerate wedge extents inferred from outer_polygon_ccw: "
+            f"left={left}, right={right}, bottom={bottom}, top={top}"
+        )
+
+    dx_tgt = xmax - xmin
+    dy_tgt = ymax - ymin
+
+    # Affine map: [left,right] x [bottom,top] -> [xmin,xmax] x [ymin,ymax]
+    outer_scaled = outer.copy()
+    outer_scaled[:, 0] = xmin + (outer[:, 0] - left)   / dx_src * dx_tgt
+    outer_scaled[:, 1] = ymin + (outer[:, 1] - bottom) / dy_src * dy_tgt
+
+    return Path(outer_scaled)
+
+
+@torch.no_grad()
+def _clip_pred_mesh_to_wedge(
+    pred_centers: torch.Tensor,     # (N,2), physical coordinates
+    pred_levels: torch.Tensor,      # (N,)
+    pred_parents: torch.Tensor,     # (N,) parent indices in [0, H*W)
+    pred_ei: torch.Tensor,          # (2,E) edge_index
+    H: int,
+    W: int,
+    wedge_path,                     # matplotlib.path.Path or None
+    cfg: Dict[str, Any],
+    device: torch.device | str,
+):
+    """
+    Restrict a predicted mesh to the wedge domain, with optional boundary refinement.
+
+    New behavior (when wedge_path is not None):
+      - Keep cells that intersect the wedge (center-in OR any-corner-in).
+      - Refine boundary-intersecting cells until they are fully inside (all corners in),
+        up to policy.max_level.
+      - Drop any remaining cells that are not fully inside at max_level.
+      - Rebuild edges and parent mask.
+    """
+    dev = torch.device(device)
+
+    # Normalize parents to flat long
+    parent_flat = pred_parents.view(-1).long().to(pred_centers.device)
+
+    if wedge_path is None:
+        if not torch.is_tensor(pred_ei):
+            pred_ei = torch.as_tensor(pred_ei, dtype=torch.long, device=dev)
+        else:
+            pred_ei = pred_ei.to(dev, dtype=torch.long)
+        mask_pred_parent = _mask_from_parents(parent_flat, H, W)
+        return pred_centers, pred_levels, parent_flat, pred_ei, mask_pred_parent
+
+    pol = cfg.get("policy", {})
+    Lmax = int(pol.get("max_level", 3))
+    bbox = tuple(cfg["data"]["bbox"])
+
+    # Small positive radius expands the polygon slightly so boundary points count "inside"
+    # (important to avoid over-pruning/refining due to numerical edge cases).
+    xspan = float(bbox[1] - bbox[0])
+    yspan = float(bbox[3] - bbox[2])
+    radius = float(pol.get("wedge_clip_radius", 1e-9 * max(xspan, yspan)))
+
+    # ---------- Step 1: keep cells that intersect the wedge ----------
+    center_inside = _path_contains_points_torch(wedge_path, pred_centers, radius=radius)
+
+    corners = _cell_corners_from_centers_levels(pred_centers, pred_levels, H, W, bbox)  # (N,4,2)
+    corner_inside = _path_contains_points_torch(wedge_path, corners.reshape(-1, 2), radius=radius).view(-1, 4)
+    any_corner_inside = corner_inside.any(dim=1)
+
+    keep0 = center_inside | any_corner_inside
+    if not keep0.any():
+        raise RuntimeError(
+            "Wedge clipping removed all predicted cells. "
+            "Check wedge_mesh_spec.pt vs cfg['data']['bbox']."
+        )
+
+    pred_centers = pred_centers[keep0]
+    pred_levels  = pred_levels[keep0]
+    parent_flat  = parent_flat[keep0]
+
+    # ---------- Step 2: boundary refinement until cells are fully inside ----------
+    # A cell is "fully inside" if all 4 corners are inside.
+    # Refine any cell that is not fully inside, up to Lmax.
+    for _ in range(Lmax + 1):
+        corners = _cell_corners_from_centers_levels(pred_centers, pred_levels, H, W, bbox)
+        corner_inside = _path_contains_points_torch(wedge_path, corners.reshape(-1, 2), radius=radius).view(-1, 4)
+        fully_inside = corner_inside.all(dim=1)
+
+        # Cells that still cross boundary
+        crossing = ~fully_inside
+
+        # Refine those that can still be refined
+        refine_mask = crossing & (pred_levels < Lmax)
+
+        if not refine_mask.any():
+            break
+
+        pred_centers, pred_levels, parent_flat = _refine_cells_one_level(
+            pred_centers, pred_levels, parent_flat,
+            refine_mask=refine_mask,
+            H=H, W=W, bbox=bbox,
+        )
+
+    # ---------- Step 3: final strict keep (no cells outside wedge) ----------
+    corners = _cell_corners_from_centers_levels(pred_centers, pred_levels, H, W, bbox)
+    corner_inside = _path_contains_points_torch(wedge_path, corners.reshape(-1, 2), radius=radius).view(-1, 4)
+    fully_inside = corner_inside.all(dim=1)
+
+    pred_centers = pred_centers[fully_inside]
+    pred_levels  = pred_levels[fully_inside]
+    parent_flat  = parent_flat[fully_inside]
+
+    if pred_centers.numel() == 0:
+        raise RuntimeError(
+            "After boundary refinement, no fully-inside cells remained. "
+            "This usually means Lmax is too low for the wedge geometry or the wedge/bbox mismatch."
+        )
+
+    # ---------- Step 4: rebuild edges + mask ----------
+    k_local   = int(cfg.get("edges", {}).get("k_local", 4))
+    max_local = int(cfg.get("edges", {}).get("max_local", 2048))
+
+    pred_ei = build_amr_local_knn_edges(
+        pred_centers,
+        parent_flat,
+        H,
+        W,
+        k_local=k_local,
+        max_local=max_local,
+    ).to(dev, dtype=torch.long)
+
+    if pred_ei.numel() == 0 or int(pred_ei.shape[1]) == 0:
+        raise RuntimeError("Empty edge_index after wedge clipping/refinement.")
+
+    mask_pred_parent = _mask_from_parents(parent_flat, H, W)
+
+    return pred_centers, pred_levels, parent_flat, pred_ei, mask_pred_parent
+
+
+def debug_print_precomp_h5_meta(path: str):
+    import h5py
+    import numpy as np
+
+    print(f"[DEBUG H5] opening: {path}")
+    with h5py.File(path, "r") as f:
+        if "meta" not in f:
+            print("[DEBUG H5] missing group: /meta")
+            print("[DEBUG H5] top-level keys:", list(f.keys()))
+            return
+
+        meta = f["meta"]
+        print("[DEBUG H5] meta attrs:")
+        for k, v in meta.attrs.items():
+            # make bytes readable
+            if isinstance(v, (bytes, np.bytes_)):
+                try:
+                    v = v.decode("utf-8")
+                except Exception:
+                    pass
+            print(f"  - {k}: {v}")
+
+        print("[DEBUG H5] top-level keys:", list(f.keys())[:20], "..." if len(f.keys()) > 20 else "")
+        # If you store timesteps under a group, print that too
+        if "steps" in f:
+            print("[DEBUG H5] /steps keys count:", len(f["steps"].keys()))
+            # print a few keys
+            ks = sorted(list(f["steps"].keys()))
+            print("[DEBUG H5] /steps first/last:", ks[:3], ks[-3:])
+
+'''
+@torch.no_grad()
+def precompute_pred_mesh_and_interps_for_rollout(
+    steps: List[Dict[str, torch.Tensor]],
+    cfg: Dict[str, Any],
+    H: int,
+    W: int,
+    dx: float,
+    dy: float,
+    device: str = "cpu",
+    progress: bool = True,
+    cache_path: str | None = None,
+    force_recompute: bool = False,
+):
+    """
+    Stream precompute outputs to ONE HDF5 file (no in-memory accumulation).
+
+    For each absolute time t = 0..T-2:
+      1) Predict mesh at t+1 via _build_pred_mesh_from_gt_gradients(...)
+      2) Clip predicted mesh to wedge via _clip_pred_mesh_to_wedge(...)
+      3) Interpolate GT(t)   -> pred(t+1)  (saved at group for dst=t+1)
+      4) Interpolate GT(t+1) -> pred(t+1)  (saved at group for dst=t+1)
+
+    Second pass:
+      - For t = 1..T-2, compute pred→pred IDW maps from pred(t) -> pred(t+1),
+        and store them in group t as:
+          pred2pred_idx_to_next  (int32) shape (N_{t+1}, k)
+          pred2pred_w_to_next    (float16) shape (N_{t+1}, k)
+
+    Output file structure:
+      /meta
+        attrs: H, W, dx, dy, bbox, T, cfg_sha1
+        dataset: cfg_json
+      /t00001
+        pred_centers                 float32 [N,2]
+        pred_levels                  int16   [N]
+        pred_parents                 int32   [N]
+        pred_ei                      int32   [2,E]
+        mask_pred_parent_flat_u8     uint8   [H*W]
+        feat_t_on_pred               float32 [N,F]
+        feat_tp1_on_pred             float32 [N,F]
+      ...
+      /t00010
+        (same as above)
+      /t00001
+        pred2pred_idx_to_next        int32   [N_{2},k]   # mapping pred(1)->pred(2)
+        pred2pred_w_to_next          float16 [N_{2},k]
+      ...
+
+    Returns a lightweight handle dict, not the full tensors:
+      {"type":"h5","path":..., "T":T, "H":H, "W":W, "dx":dx, "dy":dy, "bbox":bbox}
+    """
+    try:
+        import h5py
+    except ImportError as e:
+        raise ImportError("This streaming mode requires h5py. Install with: pip install h5py") from e
+
+    def _cfg_sha1(_cfg: dict) -> str:
+        s = json.dumps(_cfg, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha1(s).hexdigest()
+
+    def _h5_is_usable(path: str, cfg: dict, expected_T: int) -> bool:
+        if not os.path.exists(path):
+            return False
+        try:
+            with h5py.File(path, "r") as f:
+                if "meta" not in f:
+                    return False
+                #sha = f["meta"].attrs.get("cfg_sha1", None)
+                #if sha != _cfg_sha1(cfg):
+                #    return False
+                T_in = int(f["meta"].attrs.get("T", -1))
+                if T_in != int(expected_T):
+                    print("[H5 CHECK] reject: cfg hash mismatch or missing groups")
+                    return False
+                # require that all predicted-step groups exist: 1..T-1
+                for t in range(1, expected_T):
+                    if f"t{t:05d}" not in f:
+                        print("[H5 CHECK] reject: cfg hash mismatch or missing groups")
+                        return False
+                return True
+        except Exception:
+            print("[H5 CHECK] reject: cfg hash mismatch or missing groups")
+            return False
+
+    def _ensure_group(f: "h5py.File", t: int):
+        gname = f"t{int(t):05d}"
+        if gname in f:
+            return f[gname]
+        return f.create_group(gname)
+
+    def _write_ds(g, name: str, arr: np.ndarray, *, compress=True):
+        if name in g:
+            del g[name]
+        kwargs = {}
+        if compress:
+            kwargs = dict(compression="gzip", compression_opts=4, shuffle=True, chunks=True)
+        g.create_dataset(name, data=arr, **kwargs)
+
+    def _to_np(x: torch.Tensor, dtype=None) -> np.ndarray:
+        a = x.detach().cpu().numpy()
+        if dtype is not None:
+            a = a.astype(dtype, copy=False)
+        return a
+
+    def _read_centers(f: "h5py.File", t: int) -> torch.Tensor:
+        g = f[f"t{int(t):05d}"]
+        return torch.from_numpy(g["pred_centers"][...]).to(device=torch.device("cpu"), dtype=torch.float32)
+
+    # ----------------- basic checks -----------------
+    dev = torch.device(device)
+    T = len(steps)
+    if T < 2:
+        raise RuntimeError("Need at least 2 timesteps for rollout precompute.")
+
+    # ----------------- determine HDF5 cache path -----------------
+    if cache_path is None:
+        cache_dir = cfg.get("train", {}).get("cache_dir", cfg.get("train", {}).get("save_dir", "."))
+        cache_path = os.path.join(cache_dir, "precomp_rollout.h5")
+
+    if not str(cache_path).endswith(".h5"):
+        raise ValueError(f"Streaming mode writes a single HDF5 file; cache_path must end with .h5, got: {cache_path}")
+
+    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+
+    #debug_print_precomp_h5_meta(cache_path)
+    #print("[DEBUG PRECOMP] expected_steps =", steps)
+
+    # ----------------- optional reuse -----------------
+    if (not force_recompute) and _h5_is_usable(cache_path, cfg, expected_T=T):
+        print(f"[PRECOMP] Using existing H5 cache: {cache_path}")
+        return {
+            "type": "h5",
+            "path": cache_path,
+            "T": int(T),
+            "H": int(H),
+            "W": int(W),
+            "dx": float(dx),
+            "dy": float(dy),
+            "bbox": cfg["data"]["bbox"],
+        }
+
+    print("[PRECOMP] No valid cache found; computing precomputed meshes + interps...")
+
+    # ----------------- load wedge polygon -----------------
+    mesh_cfg = cfg.get("mesh", {})
+    mesh_spec_path = mesh_cfg.get("starting_mesh_path", None)
+
+    wedge_path = None
+    if mesh_spec_path is not None:
+        wedge_path = _load_wedge_path_from_spec(mesh_spec_path, cfg=cfg)
+        print(f"[GEOM] Clipping predicted meshes to wedge spec (rescaled): {mesh_spec_path}")
+    else:
+        print("[GEOM] No mesh_spec_path provided; wedge clipping disabled.")
+
+    # ----------------- choose device for IDW mapping (GT→pred) -----------------
+    # On MPS, default to CPU to avoid fragmentation / late-iteration OOM.
+    speed = cfg.get("speed", {})
+    idw_on_cpu = bool(speed.get("idw_on_cpu", dev.type == "mps"))
+    map_dev = torch.device("cpu") if idw_on_cpu else dev
+
+    # ----------------- open HDF5 (overwrite) -----------------
+    import h5py  # local for type checker
+    f = h5py.File(cache_path, "w")
+    try:
+        # meta
+        meta = f.create_group("meta")
+        meta.attrs["H"] = int(H)
+        meta.attrs["W"] = int(W)
+        meta.attrs["dx"] = float(dx)
+        meta.attrs["dy"] = float(dy)
+        meta.attrs["bbox"] = np.asarray(cfg["data"]["bbox"], dtype=np.float64)
+        meta.attrs["T"] = int(T)
+        meta.attrs["cfg_sha1"] = _cfg_sha1(cfg)
+        #meta.create_dataset("cfg_json", data=np.string_(json.dumps(cfg, sort_keys=True, default=str)))
+        meta.create_dataset("cfg_json", data=np.bytes_(json.dumps(cfg, sort_keys=True, default=str)))
+
+
+        # progress iterator
+        it = range(T - 1)
+        if progress:
+            try:
+                from tqdm import tqdm
+                it = tqdm(it, desc="[rollout precompute] mesh @ t+1 and GT→pred mappings")
+            except Exception:
+                pass
+
+        # ---------- FIRST PASS: predict meshes + GT→pred(t+1) ----------
+        for t in it:
+            dst = t + 1
+
+            # ----------------- pull GT(t) -----------------
+            s = steps[t]
+            centers_t = s["pos"]
+            centers_t = centers_t if torch.is_tensor(centers_t) else torch.as_tensor(centers_t)
+            feat_t = s["x"]
+            feat_t = feat_t if torch.is_tensor(feat_t) else torch.as_tensor(feat_t)
+            level_t = s.get("level")
+            ij_t = s.get("ij")
+            ei_t = s.get("edge_index")
+
+            centers_t = centers_t.to(dev)
+            feat_t = feat_t.to(dev, dtype=torch.float32)
+
+            if level_t is not None and ij_t is not None:
+                parents_t = _parents_from_level_ij(level_t.to(dev), ij_t.to(dev), H, W)
+            elif "parents" in s:
+                parents_t = s["parents"].to(dev)
+            else:
+                xmin, xmax, ymin, ymax = cfg["data"]["bbox"]
+                parents_t = _parents_from_pos(centers_t, H, W, xmin, xmax, ymin, ymax).to(dev)
+
+            if "mask" in s:
+                mask_t_parent = s["mask"].to(dev).view(H, W)
+            else:
+                mask_t_parent = _mask_from_parents(parents_t, H, W)
+
+            # ----------------- predict mesh at t+1 (rectangle) -----------------
+            ex_compat = {
+                "centers_t": centers_t,
+                "center_feat_t": feat_t,
+                "level_t": level_t.to(dev) if level_t is not None else None,
+                "ij_t": ij_t.to(dev) if ij_t is not None else None,
+                "dyn_parents": parents_t,
+                "mask_t": mask_t_parent.view(-1),
+                "ei_t": ei_t.to(dev) if (ei_t is not None and torch.is_tensor(ei_t)) else None,
+                "t": s.get("t", torch.tensor(t)),
+            }
+
+            pred_c_rect, pred_l_rect, pred_p_rect, pred_e_rect, _mask_p_rect = _build_pred_mesh_from_gt_gradients(
+                ex_compat, cfg, H, W, dx, dy, dev
+            )
+
+            # ----------------- clip pred mesh to wedge -----------------
+            pred_c, pred_l, pred_p, pred_e, mask_p = _clip_pred_mesh_to_wedge(
+                pred_c_rect,
+                pred_l_rect,
+                pred_p_rect,
+                pred_e_rect,
+                H,
+                W,
+                wedge_path=wedge_path,
+                cfg=cfg,
+                device=dev,
+            )
+
+            # ----------------- pull GT(t+1) -----------------
+            s_next = steps[dst]
+            centers_tp1 = s_next["pos"]
+            centers_tp1 = centers_tp1 if torch.is_tensor(centers_tp1) else torch.as_tensor(centers_tp1)
+            feat_tp1 = s_next["x"]
+            feat_tp1 = feat_tp1 if torch.is_tensor(feat_tp1) else torch.as_tensor(feat_tp1)
+            level_tp1 = s_next.get("level")
+            ij_tp1 = s_next.get("ij")
+
+            centers_tp1 = centers_tp1.to(dev)
+            feat_tp1 = feat_tp1.to(dev, dtype=torch.float32)
+
+            if level_tp1 is not None and ij_tp1 is not None:
+                parents_tp1 = _parents_from_level_ij(level_tp1.to(dev), ij_tp1.to(dev), H, W)
+            elif "parents" in s_next:
+                parents_tp1 = s_next["parents"].to(dev)
+            else:
+                xmin, xmax, ymin, ymax = cfg["data"]["bbox"]
+                parents_tp1 = _parents_from_pos(centers_tp1, H, W, xmin, xmax, ymin, ymax).to(dev)
+
+            if "mask" in s_next:
+                mask_tp1_parent = s_next["mask"].to(dev).view(H, W)
+            else:
+                mask_tp1_parent = _mask_from_parents(parents_tp1, H, W)
+
+            # ----------------- GT(t) -> pred(t+1) -----------------
+            # (run on map_dev if configured, to avoid MPS fragmentation)
+            ft_on_pred = _map_gt_on_pred_mesh_once(
+                src_centers=centers_t.to(map_dev),
+                src_feats=feat_t.to(map_dev),
+                mask_src_parent=mask_t_parent.to(map_dev),
+                parents_src=parents_t.to(map_dev),
+                pred_centers=pred_c.to(map_dev),
+                pred_levels=pred_l.to(map_dev),
+                pred_parents=pred_p.to(map_dev),
+                mask_pred_parent=mask_p.to(map_dev),
+                H=H,
+                W=W,
+                device=map_dev,
+            )
+
+            # ----------------- GT(t+1) -> pred(t+1) -----------------
+            f1_on_pred = _map_gt_on_pred_mesh_once(
+                src_centers=centers_tp1.to(map_dev),
+                src_feats=feat_tp1.to(map_dev),
+                mask_src_parent=mask_tp1_parent.to(map_dev),
+                parents_src=parents_tp1.to(map_dev),
+                pred_centers=pred_c.to(map_dev),
+                pred_levels=pred_l.to(map_dev),
+                pred_parents=pred_p.to(map_dev),
+                mask_pred_parent=mask_p.to(map_dev),
+                H=H,
+                W=W,
+                device=map_dev,
+            )
+
+            # ----------------- write dst group immediately -----------------
+            g = _ensure_group(f, dst)
+
+            _write_ds(g, "pred_centers", _to_np(pred_c, dtype=np.float32))
+            _write_ds(g, "pred_levels",  _to_np(pred_l.to(torch.int16), dtype=np.int16))
+            _write_ds(g, "pred_parents", _to_np(pred_p.to(torch.int32), dtype=np.int32))
+            _write_ds(g, "pred_ei",      _to_np(pred_e.to(torch.int32), dtype=np.int32))
+
+            mask_flat_u8 = mask_p.view(-1).to(torch.uint8)
+            _write_ds(g, "mask_pred_parent_flat_u8", _to_np(mask_flat_u8, dtype=np.uint8))
+
+            _write_ds(g, "feat_t_on_pred",   _to_np(ft_on_pred, dtype=np.float32))
+            _write_ds(g, "feat_tp1_on_pred", _to_np(f1_on_pred, dtype=np.float32))
+
+            g.attrs["N_pred"] = int(pred_c.shape[0])
+            g.attrs["E"] = int(pred_e.shape[1]) if (pred_e is not None and pred_e.numel() > 0) else 0
+
+            f.flush()
+
+            # ----------------- free refs per-iter -----------------
+            del pred_c_rect, pred_l_rect, pred_p_rect, pred_e_rect, _mask_p_rect
+            del pred_c, pred_l, pred_p, pred_e, mask_p
+            del ft_on_pred, f1_on_pred
+            del centers_t, feat_t, parents_t, mask_t_parent
+            del centers_tp1, feat_tp1, parents_tp1, mask_tp1_parent
+
+            if dev.type == "mps":
+                torch.mps.empty_cache()
+
+        # ---------- SECOND PASS: build pred→pred IDW maps (geometry only) ----------
+        knn_k = int(cfg["loss"].get("interp_k", 8))
+        chunk = int(cfg.get("speed", {}).get("interp_chunk", 8192))
+        knn_device = torch.device("cpu")
+
+        for t in range(1, T - 1):
+            # src: pred(t), dst: pred(t+1)
+            if f"t{t:05d}" not in f or f"t{t+1:05d}" not in f:
+                continue
+
+            src_c = _read_centers(f, t).to(knn_device)
+            dst_c = _read_centers(f, t + 1).to(knn_device)
+
+            idx_map, w_map = build_idw_map(
+                dst_c,  # queries: centers at time t+1
+                src_c,  # keys: centers at time t
+                k=knn_k,
+                chunk=chunk,
+            )
+
+            g = _ensure_group(f, t)
+            _write_ds(g, "pred2pred_idx_to_next", _to_np(idx_map.to(torch.int32), dtype=np.int32))
+            _write_ds(g, "pred2pred_w_to_next",   _to_np(w_map.to(torch.float16), dtype=np.float16))
+            f.flush()
+
+            del src_c, dst_c, idx_map, w_map
+
+        f.flush()
+
+    finally:
+        f.close()
+
+    print(f"[PRECOMP] Saved H5 precompute to {cache_path}")
+
+    return {
+        "type": "h5",
+        "path": cache_path,
+        "T": int(T),
+        "H": int(H),
+        "W": int(W),
+        "dx": float(dx),
+        "dy": float(dy),
+        "bbox": cfg["data"]["bbox"],
+    }
+'''
+@torch.no_grad()
+def precompute_pred_mesh_and_interps_for_rollout(
+    steps,
+    cfg,
+    H: int,
+    W: int,
+    dx: float,
+    dy: float,
+    device: str = "cpu",
+    progress: bool = True,
+    cache_path: str | None = None,
+    force_recompute: bool = False,
+):
+    """
+    Streaming precompute to ONE HDF5 file (no in-memory accumulation).
+
+    Geometry modes (cfg['mesh']['geometry_mode']):
+      1) "gt_gradients" (default): per-step predicted mesh from GT feature gradients (existing behavior)
+      2) "starting_refine": static mesh from starting_mesh_path, deterministically refined to a target level
+
+    In "starting_refine" mode:
+      - The SAME pred mesh is used for every dst=t+1 group.
+      - pred2pred maps are written as identity maps (since pred(t) == pred(t+1) geometry).
+    """
+    import os, json, hashlib
+    import numpy as np
+
+    try:
+        import h5py
+    except ImportError as e:
+        raise ImportError("This streaming mode requires h5py. Install with: pip install h5py") from e
+
+    import torch
+
+    # ----------------- cfg helpers -----------------
+    def _cfg_sha1(_cfg: dict) -> str:
+        s = json.dumps(_cfg, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha1(s).hexdigest()
+    
+    dbg = cfg.get("debug", {})
+
+    def _h5_is_usable(path: str, cfg: dict, expected_T: int) -> bool:
+        if not os.path.exists(path):
+            return False
+        try:
+            with h5py.File(path, "r") as f:
+                if "meta" not in f:
+                    return False
+                T_in = int(f["meta"].attrs.get("T", -1))
+                if T_in != int(expected_T):
+                    print("[H5 CHECK] reject: missing groups or wrong T")
+                    return False
+                for t in range(1, expected_T):
+                    if f"t{t:05d}" not in f:
+                        print("[H5 CHECK] reject: missing groups")
+                        return False
+                return True
+        except Exception:
+            print("[H5 CHECK] reject: unreadable")
+            return False
+
+    def _ensure_group(f: "h5py.File", t: int):
+        gname = f"t{int(t):05d}"
+        if gname in f:
+            return f[gname]
+        return f.create_group(gname)
+
+    def _write_ds(g, name: str, arr: np.ndarray, *, compress=True):
+        if name in g:
+            del g[name]
+        kwargs = {}
+        if compress:
+            kwargs = dict(compression="gzip", compression_opts=4, shuffle=True, chunks=True)
+        g.create_dataset(name, data=arr, **kwargs)
+
+    def _to_np(x: torch.Tensor, dtype=None) -> np.ndarray:
+        a = x.detach().cpu().numpy()
+        if dtype is not None:
+            a = a.astype(dtype, copy=False)
+        return a
+
+    def _read_centers(f: "h5py.File", t: int) -> torch.Tensor:
+        g = f[f"t{int(t):05d}"]
+        return torch.from_numpy(g["pred_centers"][...]).to(device=torch.device("cpu"), dtype=torch.float32)
+
+    # ----------------- load starting mesh + deterministic refinement -----------------
+    def _load_starting_mesh_from_spec(mesh_spec_path: str):
+        spec = torch.load(mesh_spec_path, map_location="cpu")
+        if not isinstance(spec, dict):
+            raise RuntimeError(f"Expected dict in mesh spec, got: {type(spec)}")
+
+        def _pick(*names):
+            for n in names:
+                if n in spec:
+                    return spec[n]
+            return None
+
+        centers = _pick("pred_centers", "centers", "pos", "centers_u", "centers_selected")
+        levels  = _pick("pred_levels", "levels", "level", "levels_selected")
+        parents = _pick("pred_parents", "parents", "parent", "dyn_parents")
+        ei      = _pick("pred_ei", "edge_index", "ei")
+
+        if centers is None or levels is None:
+            raise RuntimeError(
+                f"Mesh spec missing centers/levels. Keys found: {sorted(list(spec.keys()))}"
+            )
+
+        centers = centers if torch.is_tensor(centers) else torch.as_tensor(centers)
+        levels  = levels  if torch.is_tensor(levels)  else torch.as_tensor(levels)
+
+        centers = centers.to(dtype=torch.float32)
+        if levels.dtype not in (torch.int16, torch.int32, torch.int64):
+            levels = levels.to(torch.int64)
+
+        # Parents are optional in the spec; if absent, compute coarse parents from pos.
+        if parents is None:
+            xmin, xmax, ymin, ymax = cfg["data"]["bbox"]
+            parents = parents_from_pos(centers, H, W, xmin, xmax, ymin, ymax)
+        else:
+            parents = parents if torch.is_tensor(parents) else torch.as_tensor(parents)
+            if parents.dtype not in (torch.int16, torch.int32, torch.int64):
+                parents = parents.to(torch.int64)
+
+        if ei is not None:
+            ei = ei if torch.is_tensor(ei) else torch.as_tensor(ei)
+            if ei.dtype not in (torch.int32, torch.int64):
+                ei = ei.to(torch.int64)
+        return centers, levels, parents, ei
+
+    def _refine_cells_one_level(centers: torch.Tensor, levels: torch.Tensor, parents: torch.Tensor):
+        """
+        Refine every cell in (centers, levels, parents) by one level (split into 4 children).
+        Returns children arrays.
+        """
+        xmin, xmax, ymin, ymax = map(float, cfg["data"]["bbox"])
+
+        L = levels.to(torch.int64)
+        # cell size at current level
+        # dx_L = dx / 2^L, dy_L = dy / 2^L
+        dx_L = (torch.tensor(float(dx)) / torch.pow(torch.tensor(2.0), L.to(torch.float32))).to(torch.float32)
+        dy_L = (torch.tensor(float(dy)) / torch.pow(torch.tensor(2.0), L.to(torch.float32))).to(torch.float32)
+
+        # child offsets: +/- dx_L/4, +/- dy_L/4
+        ox = (dx_L * 0.25)[:, None]
+        oy = (dy_L * 0.25)[:, None]
+
+        c = centers.to(torch.float32)
+        x = c[:, 0:1]
+        y = c[:, 1:2]
+
+        # 4 children per parent
+        c00 = torch.cat([x - ox, y - oy], dim=1)
+        c01 = torch.cat([x - ox, y + oy], dim=1)
+        c10 = torch.cat([x + ox, y - oy], dim=1)
+        c11 = torch.cat([x + ox, y + oy], dim=1)
+
+        child_centers = torch.cat([c00, c01, c10, c11], dim=0)
+        child_levels  = torch.cat([L + 1, L + 1, L + 1, L + 1], dim=0)
+        child_parents = torch.cat([parents, parents, parents, parents], dim=0)
+
+        return child_centers, child_levels, child_parents
+
+    def _refine_mesh_to_target(centers, levels, parents, target_level: int, policy: str):
+        """
+        Deterministic refinement:
+          - policy="min_level": refine every cell with level < target until all >= target
+          - policy="level0_only": refine only cells that started at level==0 up to target
+        """
+        target_level = int(target_level)
+        if target_level <= 0:
+            return centers, levels, parents
+
+        centers = centers.clone()
+        levels  = levels.clone().to(torch.int64)
+        parents = parents.clone().to(torch.int64)
+
+        if policy not in ("min_level", "level0_only"):
+            raise ValueError(f"Unknown starting_refine_policy='{policy}'")
+
+        if policy == "level0_only":
+            base_is_level0 = (levels == 0)
+
+        # iterative refine
+        while True:
+            if policy == "min_level":
+                need = (levels < target_level)
+            else:
+                need = base_is_level0 & (levels < target_level)
+
+            if not bool(need.any().item()):
+                break
+
+            keep = ~need
+            c_keep = centers[keep]
+            l_keep = levels[keep]
+            p_keep = parents[keep]
+
+            c_need = centers[need]
+            l_need = levels[need]
+            p_need = parents[need]
+
+            c_child, l_child, p_child = _refine_cells_one_level(c_need, l_need, p_need)
+
+            centers = torch.cat([c_keep, c_child], dim=0)
+            levels  = torch.cat([l_keep, l_child], dim=0)
+            parents = torch.cat([p_keep, p_child], dim=0)
+
+            if policy == "level0_only":
+                # base_is_level0 must track new children of originally level0 cells
+                base_keep = base_is_level0[keep]
+                base_child = torch.ones((c_child.shape[0],), dtype=torch.bool)
+                base_is_level0 = torch.cat([base_keep, base_child], dim=0)
+
+        return centers, levels, parents
+
+    def _build_edge_index_from_maxgrid_partition(centers: torch.Tensor, levels: torch.Tensor):
+        """
+        Build face-adjacency edges by rasterizing the AMR partition onto the max-level grid.
+
+        Works well for dyadic-aligned AMR meshes (your wedge mesh is dyadic with max_level <= 3).
+        """
+        xmin, xmax, ymin, ymax = map(float, cfg["data"]["bbox"])
+
+        levels_i64 = levels.to(torch.int64)
+        Lmax = int(levels_i64.max().item()) if levels_i64.numel() > 0 else 0
+        if Lmax > 6:
+            raise RuntimeError(f"Lmax={Lmax} is too large for max-grid raster adjacency (guard).")
+
+        Hmax = int(H) * (2 ** Lmax)
+        Wmax = int(W) * (2 ** Lmax)
+
+        # occupancy grid of cell IDs at max resolution
+        occ = np.full((Hmax, Wmax), fill_value=-1, dtype=np.int32)
+
+        c = centers.detach().cpu().to(torch.float32).numpy()
+        l = levels_i64.detach().cpu().numpy()
+
+        for cid in range(c.shape[0]):
+            L = int(l[cid])
+            scale = 2 ** (Lmax - L)
+
+            dxL = float(dx) / (2 ** L)
+            dyL = float(dy) / (2 ** L)
+
+            # integer indices at level L grid
+            ixL = int(np.floor((c[cid, 0] - xmin) / dxL))
+            iyL = int(np.floor((c[cid, 1] - ymin) / dyL))
+
+            ixL = max(0, min(ixL, (W * (2 ** L)) - 1))
+            iyL = max(0, min(iyL, (H * (2 ** L)) - 1))
+
+            ix0 = ixL * scale
+            iy0 = iyL * scale
+
+            # fill block at max level
+            occ[iy0:iy0 + scale, ix0:ix0 + scale] = cid
+
+        # collect adjacency by scanning max-grid neighbors
+        a = occ[:, :-1]
+        b = occ[:,  1:]
+        m = (a != b) & (a >= 0) & (b >= 0)
+        pairs_h = np.stack([a[m], b[m]], axis=1) if np.any(m) else np.zeros((0, 2), dtype=np.int32)
+
+        a = occ[:-1, :]
+        b = occ[ 1:, :]
+        m = (a != b) & (a >= 0) & (b >= 0)
+        pairs_v = np.stack([a[m], b[m]], axis=1) if np.any(m) else np.zeros((0, 2), dtype=np.int32)
+
+        pairs = np.concatenate([pairs_h, pairs_v], axis=0)
+        if pairs.shape[0] == 0:
+            # no edges
+            return torch.empty((2, 0), dtype=torch.int64)
+
+        u = np.minimum(pairs[:, 0], pairs[:, 1])
+        v = np.maximum(pairs[:, 0], pairs[:, 1])
+        uv = np.stack([u, v], axis=1)
+
+        # unique undirected edges
+        uv_unique = np.unique(uv, axis=0)
+
+        # symmetrize
+        src = uv_unique[:, 0]
+        dst = uv_unique[:, 1]
+        e0 = np.stack([src, dst], axis=0)
+        e1 = np.stack([dst, src], axis=0)
+        e = np.concatenate([e0, e1], axis=1)
+
+        return torch.from_numpy(e).to(torch.int64)
+
+    def _identity_pred2pred_map(N_dst: int, k: int, device: torch.device):
+        """
+        Identity IDW map: output at each dst node copies the same-index src node.
+        Shapes:
+          idx: [N_dst, k] int32, w: [N_dst, k] float16
+        """
+        k = int(k)
+        if k <= 0:
+            raise ValueError("interp_k must be >= 1 for pred2pred maps.")
+
+        idx0 = torch.arange(N_dst, device=device, dtype=torch.int32).view(-1, 1)  # [N,1]
+        idx  = idx0.repeat(1, k)  # [N,k]
+        w = torch.full((N_dst, k), fill_value=(1.0 / float(k)), device=device, dtype=torch.float16)
+        return idx, w
+
+    # ----------------- basic checks -----------------
+    dev = torch.device(device)
+    T = len(steps)
+    if T < 2:
+        raise RuntimeError("Need at least 2 timesteps for rollout precompute.")
+
+    # ----------------- determine HDF5 cache path -----------------
+    if cache_path is None:
+        cache_dir = cfg.get("train", {}).get("cache_dir", cfg.get("train", {}).get("save_dir", "."))
+        cache_path = os.path.join(cache_dir, "precomp_rollout.h5")
+
+    if not str(cache_path).endswith(".h5"):
+        raise ValueError(f"Streaming mode writes a single HDF5 file; cache_path must end with .h5, got: {cache_path}")
+
+    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+
+    # ----------------- optional reuse -----------------
+    if (not force_recompute) and _h5_is_usable(cache_path, cfg, expected_T=T):
+        print(f"[PRECOMP] Using existing H5 cache: {cache_path}")
+        return {
+            "type": "h5",
+            "path": cache_path,
+            "T": int(T),
+            "H": int(H),
+            "W": int(W),
+            "dx": float(dx),
+            "dy": float(dy),
+            "bbox": cfg["data"]["bbox"],
+        }
+
+    print("[PRECOMP] No valid cache found; computing precomputed meshes + interps...")
+
+    # ----------------- load wedge polygon -----------------
+    mesh_cfg = cfg.get("mesh", {})
+    mesh_spec_path = mesh_cfg.get("starting_mesh_path", None)
+
+    wedge_path = None
+    if mesh_spec_path is not None:
+        wedge_path = _load_wedge_path_from_spec(mesh_spec_path, cfg=cfg)
+        print(f"[GEOM] Wedge path loaded from mesh spec (rescaled): {mesh_spec_path}")
+    else:
+        print("[GEOM] No starting_mesh_path provided; wedge clipping disabled.")
+
+    # ----------------- choose IDW mapping device (GT→pred) -----------------
+    speed = cfg.get("speed", {})
+    idw_on_cpu = bool(speed.get("idw_on_cpu", dev.type == "mps"))
+    map_dev = torch.device("cpu") if idw_on_cpu else dev
+
+    # ----------------- geometry mode -----------------
+    mesh_policy = cfg.get("policy", {})
+    geometry_mode = str(mesh_policy.get("geometry_mode", "gt_gradients")).lower()
+    refine_to_level = int(mesh_policy.get("starting_refine_to_level", 0))
+    refine_policy = str(mesh_policy.get("starting_refine_policy", "min_level")).lower()
+
+    # In starting_refine mode, build ONE static pred mesh now
+    static_pred = None
+    if geometry_mode in ("starting_refine", "starting", "static_refine", "refine_test"):
+        if mesh_spec_path is None:
+            raise RuntimeError("starting_refine mode requires cfg['mesh']['starting_mesh_path'].")
+
+        base_c, base_l, base_p, base_ei, base_mask_parent = _build_starting_mesh_from_spec(
+            mesh_spec_path, cfg, H, W, dx, dy, device=dev
+        )
+        #base_c, base_l, base_p, base_ei = _load_starting_mesh_from_spec(mesh_spec_path)
+
+        pred_c, pred_l, pred_p = _refine_mesh_to_target(base_c, base_l, base_p, refine_to_level, refine_policy)
+
+        # build edges (reuse if no refinement happened AND spec had edges)
+        if (refine_to_level <= 0) and (base_ei is not None):
+            pred_e = base_ei.to(torch.int64)
+        else:
+            pred_e = _build_edge_index_from_maxgrid_partition(pred_c, pred_l)
+
+        # mask on coarse parents (domain mask)
+        mask_p = _mask_from_parents(pred_p.to(dev), H, W).to(torch.bool)
+
+        # optional clip to wedge (keeps behavior aligned with your pipeline)
+        if wedge_path is not None:
+            pred_c, pred_l, pred_p, pred_e, mask_p = _clip_pred_mesh_to_wedge(
+                pred_c.to(dev),
+                pred_l.to(dev),
+                pred_p.to(dev),
+                pred_e.to(dev),
+                H, W,
+                wedge_path=wedge_path,
+                cfg=cfg,
+                device=dev,
+            )
+            # move back to CPU tensors for reuse
+            pred_c = pred_c.detach().cpu()
+            pred_l = pred_l.detach().cpu()
+            pred_p = pred_p.detach().cpu()
+            pred_e = pred_e.detach().cpu()
+            mask_p = mask_p.detach().cpu()
+
+        static_pred = (pred_c, pred_l, pred_p, pred_e, mask_p)
+
+        # Build device-ready versions ONCE (avoid per-timestep .to(...) overhead)
+        pred_c_cpu, pred_l_cpu, pred_p_cpu, pred_e_cpu, mask_p_cpu = static_pred
+
+        static_pred_pack = {
+            "pred_c_map": pred_c_cpu.to(map_dev),
+            "pred_l_map": pred_l_cpu.to(map_dev),
+            "pred_p_map": pred_p_cpu.to(map_dev),
+            "mask_p_hw_map": mask_p_cpu.to(map_dev).view(H, W).to(torch.bool),
+            "mask_p_flat_u8_cpu": mask_p_cpu.view(-1).to(torch.uint8),  # for H5 writing
+            "pred_e_dev": pred_e_cpu.to(dev),  # edges used on model device / stored to H5
+            "pred_c_cpu": pred_c_cpu,          # for H5 writing if you want
+            "pred_l_cpu": pred_l_cpu,
+            "pred_p_cpu": pred_p_cpu,
+            "pred_e_cpu": pred_e_cpu,
+        }
+
+        print(f"[PRECOMP][STATIC] Using starting mesh refined to min_level={refine_to_level} (policy={refine_policy})")
+        print(f"[PRECOMP][STATIC] N={int(pred_c.shape[0])}, E={int(pred_e.shape[1])}")
+
+    elif geometry_mode in ("gt_gradients", "gradients", "gradient_policy"):
+        static_pred = None
+        # existing per-step behavior will run in loop
+    else:
+        raise ValueError(f"Unknown cfg['policy']['geometry_mode'] = '{geometry_mode}'")
+
+    # ----------------- open HDF5 (overwrite) -----------------
+    f = h5py.File(cache_path, "w")
+    try:
+        meta = f.create_group("meta")
+        meta.attrs["H"] = int(H)
+        meta.attrs["W"] = int(W)
+        meta.attrs["dx"] = float(dx)
+        meta.attrs["dy"] = float(dy)
+        meta.attrs["bbox"] = np.asarray(cfg["data"]["bbox"], dtype=np.float64)
+        meta.attrs["T"] = int(T)
+        meta.attrs["cfg_sha1"] = _cfg_sha1(cfg)
+        meta.attrs["geometry_mode"] = str(geometry_mode)
+        meta.attrs["starting_refine_to_level"] = int(refine_to_level)
+        meta.attrs["starting_refine_policy"] = str(refine_policy)
+        meta.create_dataset("cfg_json", data=np.bytes_(json.dumps(cfg, sort_keys=True, default=str)))
+
+        # iterator
+        it = range(T - 1)
+        if progress:
+            try:
+                from tqdm import tqdm
+                it = tqdm(it, desc="[rollout precompute] mesh @ t+1 and GT→pred mappings")
+            except Exception:
+                pass
+
+        # ---------- FIRST PASS: meshes + GT→pred(t+1) ----------
+        for t in it:
+            dst = t + 1
+
+            # pull GT(t)
+            s = steps[t]
+            centers_t = s["pos"]
+            centers_t = centers_t if torch.is_tensor(centers_t) else torch.as_tensor(centers_t)
+            feat_t = s["x"]
+            feat_t = feat_t if torch.is_tensor(feat_t) else torch.as_tensor(feat_t)
+            level_t = s.get("level")
+            ij_t = s.get("ij")
+            ei_t = s.get("edge_index")
+
+            centers_t = centers_t.to(dev)
+            feat_t = feat_t.to(dev, dtype=torch.float32)
+
+            if level_t is not None and ij_t is not None:
+                parents_t = _parents_from_level_ij(level_t.to(dev), ij_t.to(dev), H, W)
+            elif "parents" in s:
+                parents_t = s["parents"].to(dev)
+            else:
+                xmin, xmax, ymin, ymax = cfg["data"]["bbox"]
+                parents_t = parents_from_pos(centers_t, H, W, xmin, xmax, ymin, ymax).to(dev)
+
+            if "mask" in s:
+                mask_t_parent = s["mask"].to(dev).view(H, W)
+            else:
+                mask_t_parent = _mask_from_parents(parents_t, H, W)
+
+            # pull GT(t+1)
+            s_next = steps[dst]
+            centers_tp1 = s_next["pos"]
+            centers_tp1 = centers_tp1 if torch.is_tensor(centers_tp1) else torch.as_tensor(centers_tp1)
+            feat_tp1 = s_next["x"]
+            feat_tp1 = feat_tp1 if torch.is_tensor(feat_tp1) else torch.as_tensor(feat_tp1)
+            level_tp1 = s_next.get("level")
+            ij_tp1 = s_next.get("ij")
+
+            centers_tp1 = centers_tp1.to(dev)
+            feat_tp1 = feat_tp1.to(dev, dtype=torch.float32)
+
+            if level_tp1 is not None and ij_tp1 is not None:
+                parents_tp1 = _parents_from_level_ij(level_tp1.to(dev), ij_tp1.to(dev), H, W)
+            elif "parents" in s_next:
+                parents_tp1 = s_next["parents"].to(dev)
+            else:
+                xmin, xmax, ymin, ymax = cfg["data"]["bbox"]
+                parents_tp1 = parents_from_pos(centers_tp1, H, W, xmin, xmax, ymin, ymax).to(dev)
+
+            if "mask" in s_next:
+                mask_tp1_parent = s_next["mask"].to(dev).view(H, W)
+            else:
+                mask_tp1_parent = _mask_from_parents(parents_tp1, H, W)
+
+            # -------- choose pred mesh for this dst --------
+            if static_pred is not None:
+                pred_c, pred_l, pred_p, pred_e, mask_p = static_pred
+                # use CPU copies; map to map_dev for IDW
+                pred_c_dev = pred_c.to(map_dev)
+                pred_l_dev = pred_l.to(map_dev)
+                pred_p_dev = pred_p.to(map_dev)
+                pred_e_dev = pred_e.to(dev)  # edges are used downstream on model device; store as int32 in H5
+                mask_p_dev = mask_p.to(map_dev).view(-1).to(torch.bool)
+            else:
+                # ----- EXISTING per-step predicted mesh from gradients (your current pipeline) -----
+                ex_compat = {
+                    "centers_t": centers_t,
+                    "center_feat_t": feat_t,
+                    "level_t": level_t.to(dev) if level_t is not None else None,
+                    "ij_t": ij_t.to(dev) if ij_t is not None else None,
+                    "dyn_parents": parents_t,
+                    "mask_t": mask_t_parent.view(-1),
+                    "ei_t": ei_t.to(dev) if (ei_t is not None and torch.is_tensor(ei_t)) else None,
+                    "t": s.get("t", torch.tensor(t)),
+                }
+
+                pred_c_rect, pred_l_rect, pred_p_rect, pred_e_rect, _mask_p_rect = _build_pred_mesh_from_gt_gradients(
+                    ex_compat, cfg, H, W, dx, dy, dev
+                )
+
+                pred_c_dev, pred_l_dev, pred_p_dev, pred_e_dev, mask_p_dev = _clip_pred_mesh_to_wedge(
+                    pred_c_rect,
+                    pred_l_rect,
+                    pred_p_rect,
+                    pred_e_rect,
+                    H,
+                    W,
+                    wedge_path=wedge_path,
+                    cfg=cfg,
+                    device=dev,
+                )
+
+                pred_c_dev = pred_c_dev.to(map_dev)
+                pred_l_dev = pred_l_dev.to(map_dev)
+                pred_p_dev = pred_p_dev.to(map_dev)
+                mask_p_dev = mask_p_dev.to(map_dev).view(-1).to(torch.bool)
+
+            # -------- GT(t) -> pred(dst) --------
+            ft_on_pred = _map_gt_on_pred_mesh_once(
+                src_centers=centers_t.to(map_dev),
+                src_feats=feat_t.to(map_dev),
+                mask_src_parent=mask_t_parent.to(map_dev),
+                parents_src=parents_t.to(map_dev),
+                pred_centers=pred_c_dev,
+                pred_levels=pred_l_dev,
+                pred_parents=pred_p_dev,
+                mask_pred_parent=mask_p_dev.view(H, W),
+                H=H,
+                W=W,
+                device=map_dev,
+            )
+
+            # -------- GT(t+1) -> pred(dst) --------
+            f1_on_pred = _map_gt_on_pred_mesh_once(
+                src_centers=centers_tp1.to(map_dev),
+                src_feats=feat_tp1.to(map_dev),
+                mask_src_parent=mask_tp1_parent.to(map_dev),
+                parents_src=parents_tp1.to(map_dev),
+                pred_centers=pred_c_dev,
+                pred_levels=pred_l_dev,
+                pred_parents=pred_p_dev,
+                mask_pred_parent=mask_p_dev.view(H, W),
+                H=H,
+                W=W,
+                device=map_dev,
+            )
+
+            # write dst group
+            g = _ensure_group(f, dst)
+
+            _write_ds(g, "pred_centers", _to_np(pred_c_dev.to("cpu"), dtype=np.float32))
+            _write_ds(g, "pred_levels",  _to_np(pred_l_dev.to("cpu").to(torch.int16), dtype=np.int16))
+            _write_ds(g, "pred_parents", _to_np(pred_p_dev.to("cpu").to(torch.int32), dtype=np.int32))
+            _write_ds(g, "pred_ei",      _to_np(pred_e_dev.to("cpu").to(torch.int32), dtype=np.int32))
+
+            mask_flat_u8 = mask_p_dev.to("cpu").view(-1).to(torch.uint8)
+            _write_ds(g, "mask_pred_parent_flat_u8", _to_np(mask_flat_u8, dtype=np.uint8))
+
+            _write_ds(g, "feat_t_on_pred",   _to_np(ft_on_pred.to("cpu"), dtype=np.float32))
+            _write_ds(g, "feat_tp1_on_pred", _to_np(f1_on_pred.to("cpu"), dtype=np.float32))
+
+            g.attrs["N_pred"] = int(pred_c_dev.shape[0])
+            g.attrs["E"] = int(pred_e_dev.shape[1]) if (pred_e_dev is not None and pred_e_dev.numel() > 0) else 0
+
+            f.flush()
+
+            # cleanup
+            del ft_on_pred, f1_on_pred
+            del centers_t, feat_t, parents_t, mask_t_parent
+            del centers_tp1, feat_tp1, parents_tp1, mask_tp1_parent
+
+            if dev.type == "mps":
+                torch.mps.empty_cache()
+
+        # ---------- SECOND PASS: pred→pred IDW maps ----------
+        knn_k = int(cfg["loss"].get("interp_k", 8))
+        chunk = int(cfg.get("speed", {}).get("interp_chunk", 8192))
+
+        if static_pred is not None:
+            # geometry is constant => identity maps for every t
+            # store maps in groups t=1..T-2 (mapping pred(t)->pred(t+1))
+            # use N from any group (t=00001 exists)
+            g1 = f.get("t00001", None)
+            if g1 is None:
+                raise RuntimeError("Missing t00001 group after first pass.")
+            N_dst = int(g1.attrs.get("N_pred", g1["pred_centers"].shape[0]))
+
+            idx_map, w_map = _identity_pred2pred_map(N_dst=N_dst, k=knn_k, device=torch.device("cpu"))
+
+            for t in range(1, T - 1):
+                g = _ensure_group(f, t)
+                _write_ds(g, "pred2pred_idx_to_next", _to_np(idx_map.to(torch.int32), dtype=np.int32))
+                _write_ds(g, "pred2pred_w_to_next",   _to_np(w_map.to(torch.float16), dtype=np.float16))
+                f.flush()
+
+            del idx_map, w_map
+
+        else:
+            # existing behavior: build pred(t) -> pred(t+1) maps from centers
+            knn_device = torch.device("cpu")
+
+            for t in range(1, T - 1):
+                if f"t{t:05d}" not in f or f"t{t+1:05d}" not in f:
+                    continue
+
+                src_c = _read_centers(f, t).to(knn_device)
+                dst_c = _read_centers(f, t + 1).to(knn_device)
+
+                idx_map, w_map = build_idw_map(
+                    dst_c,
+                    src_c,
+                    k=knn_k,
+                    chunk=chunk,
+                )
+
+                g = _ensure_group(f, t)
+                _write_ds(g, "pred2pred_idx_to_next", _to_np(idx_map.to(torch.int32), dtype=np.int32))
+                _write_ds(g, "pred2pred_w_to_next",   _to_np(w_map.to(torch.float16), dtype=np.float16))
+                f.flush()
+
+                del src_c, dst_c, idx_map, w_map
+
+        f.flush()
+
+    finally:
+        f.close()
+
+    print(f"[PRECOMP] Saved H5 precompute to {cache_path}")
+
+    # plot the first predicted-step mesh (t00001). For static refinement tests, all groups are the same anyway.
+    out_png = os.path.join(os.path.dirname(cache_path) or ".", "precomp_mesh_t00001.png")
+    plot_precomputed_mesh_from_h5(
+        cache_path,
+        t=1,
+        out_path=out_png,
+        show=bool(dbg.get("show_precomp_mesh", False)),
+        max_cells=int(dbg.get("plot_precomp_max_cells", 250_000)),
+        linewidth=float(dbg.get("plot_precomp_linewidth", 0.15)),
+        wedge_path=wedge_path,  # if in-scope in your function; otherwise drop this arg
+    )
+    print(f"[PRECOMP] Saved mesh plot: {out_png}")
+
+    return {
+        "type": "h5",
+        "path": cache_path,
+        "T": int(T),
+        "H": int(H),
+        "W": int(W),
+        "dx": float(dx),
+        "dy": float(dy),
+        "bbox": cfg["data"]["bbox"],
+    }
+
+
+class CollateWithPrecompute:
+    def __init__(self, precomp: Dict[str, List], *, dt_transitions: torch.Tensor, dt_ref: torch.Tensor | float | None = None):
+        self.precomp = precomp
+        self.dt_transitions = dt_transitions  # length T-1, CPU tensor is fine
+        self.dt_ref = dt_ref
+
+
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        # identity (batch_size=1) + enrich with precomputed lists for the window
+        ex = batch[0]
+        idxs = ex["t_indices"].tolist()  # absolute time indices in the window
+        K = len(idxs)
+
+        # dt per transition in this window: dt_list[j] corresponds to idxs[j] -> idxs[j+1]
+        # dt_transitions[t] is dt from t -> t+1
+        dt_list = []
+        for j in range(K - 1):
+            t_src = idxs[j]
+            dt_list.append(self.dt_transitions[t_src])  # scalar tensor on CPU
+
+        ex["dt_list"] = dt_list
+        if self.dt_ref is not None:
+            ex["dt_ref"] = float(self.dt_ref) if not torch.is_tensor(self.dt_ref) else float(self.dt_ref.item())
+
+        pc    = self.precomp["pred_centers"]
+        pl    = self.precomp["pred_levels"]
+        pp    = self.precomp["pred_parents"]
+        pei   = self.precomp["pred_ei"]
+        mp    = self.precomp["mask_pred"]
+        ft    = self.precomp["feat_t_on_pred"]
+        ftp1  = self.precomp["feat_tp1_on_pred"]
+
+        # ----- geometry + GT→pred lists (length = K) -----
+        ex["pred_centers_list"]    = [pc[i]   for i in idxs]
+        ex["pred_levels_list"]     = [pl[i]   for i in idxs]
+        ex["pred_parents_list"]    = [pp[i]   for i in idxs]
+        ex["pred_ei_list"]         = [pei[i]  for i in idxs]
+        ex["mask_pred_list"]       = [mp[i]   for i in idxs]
+
+        ex["feat_t_on_pred_list"]   = [ft[i]   for i in idxs]
+        ex["feat_tp1_on_pred_list"] = [ftp1[i] for i in idxs]
+
+        # ----- optional pred→pred IDW maps (length = K-1) -----
+        pred2pred_idx = self.precomp.get("pred2pred_idx", None)
+        pred2pred_w   = self.precomp.get("pred2pred_w",   None)
+
+        if pred2pred_idx is not None and pred2pred_w is not None:
+            pred2pred_idx_list = []
+            pred2pred_w_list   = []
+
+            # For training step k = 1..K-1 (our loop is k=1..K-2),
+            # we want a map from mesh at idxs[k] -> mesh at idxs[k+1].
+            # Training then uses pred2pred_idx_list[k-1] at step k.
+            for k in range(1, K):
+                t_src = idxs[k]          # "source" time for this map
+                pred2pred_idx_list.append(pred2pred_idx[t_src])
+                pred2pred_w_list.append(pred2pred_w[t_src])
+
+            ex["pred2pred_idx_list"] = pred2pred_idx_list
+            ex["pred2pred_w_list"]   = pred2pred_w_list
+
+            # Debug (optional)
+            # print("K =", K)
+            # for j, (idx_j, w_j) in enumerate(zip(pred2pred_idx_list, pred2pred_w_list)):
+            #     if idx_j is None or w_j is None:
+            #         print(f"  step {j}: idx=None or w=None")
+            #     else:
+#                 print(f"  step {j}: idx shape={idx_j.shape}, w shape={w_j.shape}")
+
+        return ex
+
+
+
+
+

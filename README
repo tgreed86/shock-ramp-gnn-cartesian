@@ -1,0 +1,16 @@
+The first step in analyzing the shock ramp simulation is processing the raw hdf5 files with:
+
+/Users/trevorreed/UVA_postdoc_stuff/gparc/data/shock_ramp/dynamic_mesh_reader_physical_space.py
+
+This outputs a single pt with all of the relevant info to continue.
+Then use extract_dmr_boundaries.py in utils/ to read from one of the hdf5 "map" files.
+This file extracts the physical shock ramp boundaries and saves that info to utils/wedge_mesh_spec.pt
+
+With the above steps complete, I can move to the mesh prediction. This can be done by running the main file,
+train.py, with "precomp_force_recompute": true in the config file under "train". This automatically
+runs the training after the mesh prediction and interpolation steps have completed. 
+An h5 file with the info from the pre-training steps is saved to cache/, with the
+name specified by "precomp_cache_path": under "train" in the config file. 
+
+The training can be run again without the pre-training steps by setting "precomp_force_recompute": false
+in the config file. This will read from the saved h5 file in cache.  

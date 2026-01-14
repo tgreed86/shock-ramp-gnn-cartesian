@@ -1,0 +1,118 @@
+{
+  "seed": 1337,
+  "device": "mps",
+
+  "data": {
+    "pt_path": "/Users/trevorreed/UVA_postdoc_stuff/gparc/data/shock_ramp/shock_ramp_amr.pt",
+    "H": 64,
+    "W": 64,
+    "L_max": 3,
+    "bbox": [0.0, 1.0, 0.0, 1.0],
+    "pre_train_dir": "./precomp_cache",
+    "window_size": 20,
+    "stride": 1,
+    "num_workers": 0
+  },
+
+  "features": {
+    "use_columns": [0, 1, 2, 3],
+    "names": ["density", "x_momentum", "y_momentum", "energy"],
+    "normalize": true
+  },
+
+  "split": { "train": 0.85, "val": 0.1, "test": 0.05 },
+
+  "train": {
+    "precomp_cache_path": "./cache/all/shock_ramp_precomp_pLow85_pHigh95.h5",
+    "precomp_force_recompute": false,
+    "epochs": 200,
+    "batch_size": 1,
+    "lr": 0.0001,
+    "weight_decay": 0.0,
+    "grad_clip": 1.0,
+    "interp_type": "standard", 
+    "_comment_interp_type": "overlay or knn",
+    "overlay_fill": "value",  
+    "_comment_interp_type": "value or none",
+    "overlay_fill_value": 0.0,
+    "knn_k": 8,
+    "mesh_mode": "predicted",
+    "save_dir": "./runs_mesh_first",
+    "multi_step_K": 2,
+    "mesh_mode": "uniform",
+    "uniform_H": 256,
+    "uniform_W": 256,
+    "teacher_forcing_uniform": false,
+    "uniform_diag_edges": false
+  },
+
+  "scheduler": {
+    "use": true,
+    "mode": "min",
+    "factor": 0.5,
+    "patience": 5,
+    "threshold": 0.001,
+    "threshold_mode": "rel",
+    "cooldown": 0,
+    "min_lr": 0.000001,
+    "verbose": true
+  },
+
+  "policy": {
+    "geometry_mode": "starting_refine",
+    "_comment_geometry_mode": "gt_gradients or starting_refine for uniform mesh",
+    "starting_refine_to_level": 0,
+    "hysteresis_mode": "percentile",
+    "percentile_low":  85.0,
+    "percentile_high": 95.0,
+    "percentiles_by_level": {
+    "1": {"low": 100.0, "high": 100.0},
+    "2": {"low": 100.0, "high": 100.0},
+    "3": {"low": 100.0, "high": 100.0}
+    },
+    "combine": "l2",
+    "grad_channels": [3],
+    "grad_norm": "l2",
+    "max_level": 3,
+    "tau_low":  1.0,
+    "tau_high": 1.0
+  },
+
+  "loss": {
+    "use_huber": true,
+    "huber_delta": 0.05,
+    "interp_type": "standard",
+    "interp_k": 8,
+    "primary_weight": 1.0,
+    "laplacian_weight": 0.0,
+    "temporal_weight": 0.0
+  },
+
+  "eval": {
+    "checkpoint": "./runs_mesh_first/best.pt",
+    "qual_pdf": "./qual_rollout.pdf",
+    "fine_L": 3,
+    "show_mesh": true
+  },
+
+  "mesh": {
+    "starting_mesh_path": "./utils/wedge_mesh_spec.pt"
+  },
+
+  "model": {
+    "name": "FeatureNet",
+    "hidden": 128,
+    "layers": 3,
+    "predict_type": "rate",
+    "_comment_predict_type": "absolute, delta, or rate"
+  },
+  "debug": {
+    "plot_gradients": true,
+    "profile": false,
+    "plot_precomp_max_cells":  "None",
+    "plot_precomp_linewidth": 0.05
+  },
+  "speed": {
+    "interp_chunk": 4096
+  }
+}

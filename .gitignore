@@ -1,0 +1,20 @@
+# ================================
+# Explicit project outputs to exclude
+# (ignored anywhere in the repo)
+# ================================
+runs_mesh_first/
+debug_mesh_plots/
+debug_grad_plots/
+cache/
+__pycache__/
+
+# ================================
+# Python bytecode / caches
+# ================================
+*.py[cod]
+*.pyo
+
+# ================================
+# macOS / editor noise
+# ================================
+.DS_Store
