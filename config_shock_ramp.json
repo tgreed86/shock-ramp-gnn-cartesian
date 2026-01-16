@@ -9,7 +9,7 @@
     "L_max": 3,
     "bbox": [0.0, 1.0, 0.0, 1.0],
     "pre_train_dir": "./precomp_cache",
-    "window_size": 20,
+    "window_size": 5,
     "stride": 1,
     "num_workers": 0
   },
@@ -23,9 +23,9 @@
   "split": { "train": 0.85, "val": 0.1, "test": 0.05 },
 
   "train": {
-    "precomp_cache_path": "./cache/all/shock_ramp_precomp_pLow85_pHigh95.h5",
-    "precomp_force_recompute": false,
-    "epochs": 200,
+    "precomp_cache_path": "./cache/all/shock_ramp_precomp_pLow85_pHigh95_faceAdj.h5",
+    "precomp_force_recompute": true,
+    "epochs": 2,
     "batch_size": 1,
     "lr": 0.0001,
     "weight_decay": 0.0,
@@ -46,6 +46,12 @@
     "uniform_diag_edges": false
   },
 
+  "edges": {
+    "method": "face",
+    "_comment_method": "face (for face-adjacency) or knn",
+    "knn_k": 8
+  },
+
   "scheduler": {
     "use": true,
     "mode": "min",
@@ -59,7 +65,7 @@
   },
 
   "policy": {
-    "geometry_mode": "starting_refine",
+    "geometry_mode": "gt_gradients",
     "_comment_geometry_mode": "gt_gradients or starting_refine for uniform mesh",
     "starting_refine_to_level": 0,
     "hysteresis_mode": "percentile",
@@ -109,7 +115,7 @@
   "debug": {
     "plot_gradients": true,
     "profile": false,
-    "plot_precomp_max_cells":  "None",
+    "plot_precomp_max_cells":  "250_000",
     "plot_precomp_linewidth": 0.05
   },
   "speed": {

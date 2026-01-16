@@ -1183,7 +1183,7 @@ def main():
     # ----- Load checkpoint -----
     log(f"[INFO] Loading checkpoint from {args.checkpoint}")
     with Timer("torch.load(checkpoint)"):
-        ckpt = torch.load(args.checkpoint, map_location="cpu")
+        ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
 
     # Base config
     if args.config is not None:

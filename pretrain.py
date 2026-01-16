@@ -8,7 +8,10 @@ import os, json, hashlib, torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
+import h5py
+import matplotlib.pyplot as plt
 from matplotlib.path import Path
+from matplotlib.collections import LineCollection
 import torch.nn.functional as F
 from utils.extract_dmr_boundaries import build_amr_mesh_for_wedge, plot_amr_mesh
 
@@ -75,10 +78,6 @@ def plot_precomputed_mesh_from_h5(
     wedge_path : optional
         If provided and has attribute `.vertices`, overlays polygon boundary.
     """
-    import numpy as np
-    import h5py
-    import matplotlib.pyplot as plt
-    from matplotlib.collections import LineCollection
 
     with h5py.File(h5_path, "r") as f:
         if "meta" not in f:
@@ -194,6 +193,321 @@ def plot_precomputed_mesh_from_h5(
 
     plt.close(fig)
 
+def plot_precomputed_mesh_with_edges_from_h5(
+    h5_path: str,
+    *,
+    t: int = 1,
+    out_path: str | None = None,
+    show: bool = False,
+    # zoom control:
+    zoom_bbox: tuple[float, float, float, float] | None = None,  # (xmin,xmax,ymin,ymax) in physical coords
+    zoom_cells: float = 20.0,   # size of auto-zoom window in units of coarse-cell widths/heights
+    # drawing control:
+    max_cells: int = 200_000,   # cap ONLY after cropping
+    max_edges: int = 400_000,   # cap ONLY after cropping
+    cell_linewidth: float = 0.25,
+    edge_linewidth: float = 0.40,
+    node_size: float = 3.0,
+    title: str | None = None,
+    wedge_path=None,            # optional: overlay wedge polygon if it has .vertices
+):
+    """
+    Zoomed mesh plot that overlays the *saved* graph edges and node centers.
+
+    - Reads group t{t:05d}.
+    - Uses pred_centers + pred_levels + meta dx/dy/bbox to draw cell rectangles.
+    - Uses *saved* pred_ei (edge_index) to draw graph edges (no adjacency recomputation).
+    - Auto-zooms to a coarse–fine interface (an edge connecting nodes of different levels),
+      unless zoom_bbox is explicitly provided.
+    """
+
+    def _fix_ei_shape(ei_np: np.ndarray) -> np.ndarray:
+        # expected (2,E); accept (E,2)
+        ei_np = np.asarray(ei_np)
+        if ei_np.ndim != 2:
+            raise RuntimeError(f"pred_ei must be 2D, got shape {ei_np.shape}")
+        if ei_np.shape[0] == 2:
+            return ei_np
+        if ei_np.shape[1] == 2:
+            return ei_np.T
+        raise RuntimeError(f"pred_ei must be (2,E) or (E,2), got shape {ei_np.shape}")
+
+    def _auto_zoom_bbox_from_level_interface(
+        centers: np.ndarray,
+        levels: np.ndarray,
+        ei: np.ndarray,
+        dx0: float,
+        dy0: float,
+        bbox_full: tuple[float, float, float, float],
+        zoom_cells: float,
+    ):
+        """
+        Find one edge (u,v) in saved ei where levels differ, then build a zoom bbox around it.
+        """
+        xmin_full, xmax_full, ymin_full, ymax_full = bbox_full
+        if ei.size == 0:
+            return None, None
+
+        u = ei[0].astype(np.int64, copy=False)
+        v = ei[1].astype(np.int64, copy=False)
+
+        # Keep only valid indices
+        N = int(centers.shape[0])
+        valid = (u >= 0) & (u < N) & (v >= 0) & (v < N) & (u != v)
+        if not valid.any():
+            return None, None
+        u = u[valid]; v = v[valid]
+
+        # Find an interface edge: different refinement levels
+        diff = (levels[u] != levels[v])
+        if not diff.any():
+            return None, None
+
+        # pick the first such edge
+        u0 = int(u[diff][0]); v0 = int(v[diff][0])
+
+        # center the view on the midpoint of the two node centers
+        c_mid = 0.5 * (centers[u0] + centers[v0])
+
+        # scale the window using the *coarser* of the two levels
+        Lc = int(min(levels[u0], levels[v0]))
+        w = dx0 / (2 ** Lc)
+        h = dy0 / (2 ** Lc)
+
+        half_w = 0.5 * float(zoom_cells) * float(w)
+        half_h = 0.5 * float(zoom_cells) * float(h)
+
+        xmin = float(c_mid[0] - half_w)
+        xmax = float(c_mid[0] + half_w)
+        ymin = float(c_mid[1] - half_h)
+        ymax = float(c_mid[1] + half_h)
+
+        # clamp to full bbox
+        xmin = max(xmin, xmin_full); xmax = min(xmax, xmax_full)
+        ymin = max(ymin, ymin_full); ymax = min(ymax, ymax_full)
+
+        return (xmin, xmax, ymin, ymax), (u0, v0)
+
+    # ------------------- read H5 -------------------
+    with h5py.File(h5_path, "r") as f:
+        if "meta" not in f:
+            raise RuntimeError(f"H5 file missing 'meta' group: {h5_path}")
+
+        meta = f["meta"].attrs
+        H = int(meta["H"])
+        W = int(meta["W"])
+        dx0 = float(meta["dx"])
+        dy0 = float(meta["dy"])
+        bbox = np.asarray(meta["bbox"], dtype=np.float64).reshape(-1)
+        if bbox.size != 4:
+            raise RuntimeError(f"Expected bbox with 4 entries, got shape {bbox.shape}")
+        xmin_full, xmax_full, ymin_full, ymax_full = map(float, bbox)
+        bbox_full = (xmin_full, xmax_full, ymin_full, ymax_full)
+
+        gname = f"t{int(t):05d}"
+        if gname not in f:
+            keys = sorted([k for k in f.keys() if k.startswith("t")])
+            if not keys:
+                raise RuntimeError("No txxxxx groups found in H5; nothing to plot.")
+            gname = keys[0]
+
+        g = f[gname]
+        centers = np.asarray(g["pred_centers"][...], dtype=np.float32)   # (N,2)
+        levels  = np.asarray(g["pred_levels"][...], dtype=np.int32)      # (N,)
+        if "pred_ei" not in g:
+            raise RuntimeError(f"Group {gname} missing pred_ei; cannot plot saved edges.")
+        ei = _fix_ei_shape(np.asarray(g["pred_ei"][...], dtype=np.int64))
+
+    if centers.ndim != 2 or centers.shape[1] != 2:
+        raise RuntimeError(f"pred_centers has unexpected shape: {centers.shape}")
+    if levels.ndim != 1 or levels.shape[0] != centers.shape[0]:
+        raise RuntimeError(f"pred_levels shape mismatch: levels={levels.shape}, centers={centers.shape}")
+
+    N = int(centers.shape[0])
+    if N == 0:
+        raise RuntimeError("Mesh has zero cells; cannot plot.")
+
+    # ------------------- choose zoom bbox -------------------
+    anchor = None
+    if zoom_bbox is None:
+        zoom_bbox, anchor = _auto_zoom_bbox_from_level_interface(
+            centers=centers,
+            levels=levels,
+            ei=ei,
+            dx0=dx0,
+            dy0=dy0,
+            bbox_full=bbox_full,
+            zoom_cells=zoom_cells,
+        )
+        if zoom_bbox is None:
+            # fallback: just zoom to the center of the domain
+            cx = 0.5 * (xmin_full + xmax_full)
+            cy = 0.5 * (ymin_full + ymax_full)
+            # window ~ zoom_cells * level-0 cell sizes
+            half_w = 0.5 * float(zoom_cells) * dx0
+            half_h = 0.5 * float(zoom_cells) * dy0
+            zoom_bbox = (
+                max(xmin_full, cx - half_w),
+                min(xmax_full, cx + half_w),
+                max(ymin_full, cy - half_h),
+                min(ymax_full, cy + half_h),
+            )
+
+    zx0, zx1, zy0, zy1 = map(float, zoom_bbox)
+
+    # ------------------- crop nodes to zoom region -------------------
+    x = centers[:, 0]
+    y = centers[:, 1]
+    keep = (x >= zx0) & (x <= zx1) & (y >= zy0) & (y <= zy1)
+    keep_idx = np.nonzero(keep)[0].astype(np.int64)
+
+    if keep_idx.size == 0:
+        raise RuntimeError(f"No cells found inside zoom_bbox={zoom_bbox}")
+
+    keep_set = np.zeros((N,), dtype=np.bool_)
+    keep_set[keep_idx] = True
+
+    # cap cells (after crop), preserving anchor and its 1-hop neighborhood if available
+    if keep_idx.size > int(max_cells):
+        mandatory = set()
+        if anchor is not None:
+            u0, v0 = anchor
+            if keep_set[u0]:
+                mandatory.add(u0)
+            if keep_set[v0]:
+                mandatory.add(v0)
+
+            # add 1-hop neighbors via SAVED edges
+            u = ei[0].astype(np.int64, copy=False)
+            v = ei[1].astype(np.int64, copy=False)
+            for a in (u0, v0):
+                m = (u == a) | (v == a)
+                nbr = np.unique(np.concatenate([u[m], v[m]], axis=0))
+                for n in nbr.tolist():
+                    if 0 <= n < N and keep_set[n]:
+                        mandatory.add(int(n))
+
+        mandatory = np.array(sorted(mandatory), dtype=np.int64)
+        remaining = np.setdiff1d(keep_idx, mandatory, assume_unique=False)
+
+        # uniform downsample remaining
+        need = int(max_cells) - int(mandatory.size)
+        if need <= 0:
+            keep_idx = mandatory
+        else:
+            sel = np.linspace(0, max(0, remaining.size - 1), need, dtype=np.int64)
+            keep_idx = np.concatenate([mandatory, remaining[sel]], axis=0)
+
+        keep_set[:] = False
+        keep_set[keep_idx] = True
+
+    # ------------------- build cell-wall segments for kept nodes -------------------
+    lev_k = levels[keep_idx].astype(np.int32, copy=False)
+    c_k = centers[keep_idx]
+
+    scale = np.power(2.0, lev_k.astype(np.float32))  # 2^L
+    hx = (dx0 / scale) * 0.5
+    hy = (dy0 / scale) * 0.5
+
+    x0 = c_k[:, 0] - hx
+    x1 = c_k[:, 0] + hx
+    y0 = c_k[:, 1] - hy
+    y1 = c_k[:, 1] + hy
+
+    Nc = int(c_k.shape[0])
+    segs = np.empty((Nc * 4, 2, 2), dtype=np.float32)
+
+    segs[0::4, 0, 0] = x0; segs[0::4, 0, 1] = y0
+    segs[0::4, 1, 0] = x1; segs[0::4, 1, 1] = y0
+
+    segs[1::4, 0, 0] = x0; segs[1::4, 0, 1] = y1
+    segs[1::4, 1, 0] = x1; segs[1::4, 1, 1] = y1
+
+    segs[2::4, 0, 0] = x0; segs[2::4, 0, 1] = y0
+    segs[2::4, 1, 0] = x0; segs[2::4, 1, 1] = y1
+
+    segs[3::4, 0, 0] = x1; segs[3::4, 0, 1] = y0
+    segs[3::4, 1, 0] = x1; segs[3::4, 1, 1] = y1
+
+    # ------------------- filter SAVED edges to kept nodes -------------------
+    u = ei[0].astype(np.int64, copy=False)
+    v = ei[1].astype(np.int64, copy=False)
+    valid = (u >= 0) & (u < N) & (v >= 0) & (v < N) & (u != v)
+    u = u[valid]; v = v[valid]
+
+    in_view = keep_set[u] & keep_set[v]
+    u = u[in_view]; v = v[in_view]
+
+    # dedup as undirected for plotting clarity
+    if u.size > 0:
+        uu = np.minimum(u, v)
+        vv = np.maximum(u, v)
+        keys = uu.astype(np.int64) * np.int64(N) + vv.astype(np.int64)
+        uniq = np.unique(keys)
+        uu = (uniq // np.int64(N)).astype(np.int64)
+        vv = (uniq %  np.int64(N)).astype(np.int64)
+        u, v = uu, vv
+
+    # cap edges after filtering
+    if u.size > int(max_edges):
+        sel = np.linspace(0, u.size - 1, int(max_edges), dtype=np.int64)
+        u = u[sel]; v = v[sel]
+
+    edge_segs = None
+    if u.size > 0:
+        edge_segs = np.empty((u.size, 2, 2), dtype=np.float32)
+        edge_segs[:, 0, :] = centers[u]
+        edge_segs[:, 1, :] = centers[v]
+
+    # ------------------- plot -------------------
+    fig, ax = plt.subplots(figsize=(8.5, 6.5), dpi=180)
+
+    # cell walls (solid)
+    lc_cells = LineCollection(segs, linewidths=float(cell_linewidth))
+    ax.add_collection(lc_cells)
+
+    # graph edges (dashed + distinct)
+    if edge_segs is not None and edge_segs.shape[0] > 0:
+        lc_edges = LineCollection(edge_segs, linewidths=float(edge_linewidth))
+        lc_edges.set_linestyle((0, (3.0, 3.0)))  # dashed
+        lc_edges.set_alpha(0.9)
+        lc_edges.set_color("tab:red")
+        ax.add_collection(lc_edges)
+
+    # node centers
+    ax.scatter(c_k[:, 0], c_k[:, 1], s=float(node_size), alpha=0.85)
+
+    # optional wedge overlay
+    if wedge_path is not None and hasattr(wedge_path, "vertices"):
+        vtx = np.asarray(wedge_path.vertices, dtype=np.float32)
+        if vtx.ndim == 2 and vtx.shape[1] == 2 and vtx.shape[0] >= 2:
+            ax.plot(vtx[:, 0], vtx[:, 1], linewidth=2.0)
+
+    # view
+    pad_x = 0.02 * (zx1 - zx0)
+    pad_y = 0.02 * (zy1 - zy0)
+    ax.set_xlim(zx0 - pad_x, zx1 + pad_x)
+    ax.set_ylim(zy0 - pad_y, zy1 + pad_y)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x (physical)")
+    ax.set_ylabel("y (physical)")
+
+    if title is None:
+        title = (
+            f"Zoomed mesh + saved edges/nodes: {os.path.basename(h5_path)} @ {gname} "
+            f"(cells_in_view={Nc}, edges_in_view={0 if edge_segs is None else edge_segs.shape[0]})"
+        )
+    ax.set_title(title)
+
+    fig.tight_layout()
+
+    if out_path is not None:
+        fig.savefig(out_path, bbox_inches="tight")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
 def _normalize_builder_output_to_mesh(
     out,
     *,
@@ -286,6 +600,7 @@ def _normalize_builder_output_to_mesh(
             parents = parents[:, 1] * W + parents[:, 0]
         parents = parents.view(-1)
 
+        '''
         if ei is not None:
             ei = _as_tensor(ei).to(torch.int64).to(device)
         else:
@@ -294,7 +609,22 @@ def _normalize_builder_output_to_mesh(
                 k_local=int(cfg.get("edges", {}).get("k_local", 4)),
                 max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
             ).to(device)
-
+        '''
+        if ei is not None:
+            ei = _as_tensor(ei).to(torch.int64).to(device)
+        else:
+            if use_face:
+                ei = build_amr_face_adjacency_edges(
+                    centers, levels, H, W,
+                    bbox=bbox,
+                    return_edge_attr=False,
+                ).to(device)
+            else:
+                ei = build_amr_local_knn_edges(
+                    centers, parents, H, W,
+                    k_local=int(cfg.get("edges", {}).get("k_local", 4)),
+                    max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
+                ).to(device)
         if mask_parent is None:
             mask_parent = _mask_from_parents(parents, H, W).to(device)
         else:
@@ -398,6 +728,7 @@ def _normalize_builder_output_to_mesh(
         mask_parent = _mask_from_parents(parents, H, W).to(device=device, dtype=torch.bool)
 
         # Edge index: if you don't have one from the builder, rebuild local edges
+        '''
         edge_index = build_amr_local_knn_edges(
             centers,
             parents,
@@ -406,6 +737,22 @@ def _normalize_builder_output_to_mesh(
             k_local=int(cfg.get("edges", {}).get("k_local", 4)),
             max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
         ).to(device=device, dtype=torch.int64)
+        '''
+        if edge_index.numel() == 0 or edge_index.size(1) == 0:
+            if use_face:
+                edge_index = build_amr_face_adjacency_edges(
+                    centers, levels, H, W,
+                    bbox=bbox,
+                    return_edge_attr=False,
+                )
+            else:
+                edge_index = build_amr_local_knn_edges(
+                    centers,
+                    parents,
+                    H, W,
+                    k_local=int(cfg.get("edges", {}).get("k_local", 4)),
+                    max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
+                )
 
         return centers, levels, parents, edge_index, mask_parent
 
@@ -500,9 +847,6 @@ def debug_plot_policy_gradients(
 
     Produces one PNG with subplots for all levels.
     """
-    import os
-    import numpy as np
-    import matplotlib.pyplot as plt
 
     os.makedirs(out_dir, exist_ok=True)
 
@@ -915,6 +1259,198 @@ def _mask_from_parents(parents_flat: torch.Tensor, H: int, W: int) -> torch.Tens
         m[pf[valid].long()] = True
     return m.view(H, W)
 
+@torch.no_grad()
+def cell_area_from_levels(
+    levels: torch.Tensor,
+    H: int,
+    W: int,
+    bbox: tuple[float, float, float, float],
+) -> torch.Tensor:
+    """
+    Compute area per cell for axis-aligned dyadic quads:
+      area(L) = (dx0 * dy0) / 4^L
+    where dx0, dy0 are level-0 cell sizes from bbox and (H,W).
+    """
+    xmin, xmax, ymin, ymax = map(float, bbox)
+    dx0 = (xmax - xmin) / float(W)
+    dy0 = (ymax - ymin) / float(H)
+    levels_f = levels.to(torch.float32)
+    area = (dx0 * dy0) * torch.pow(torch.tensor(0.25, device=levels.device), levels_f)
+    return area.to(torch.float32)
+
+
+@torch.no_grad()
+def build_amr_face_adjacency_edges(
+    centers: torch.Tensor,      # (N,2) physical cell centers
+    levels: torch.Tensor,       # (N,) int
+    H: int,
+    W: int,
+    bbox: tuple[float, float, float, float],
+    *,
+    max_L_guard: int = 6,
+    return_edge_attr: bool = True,
+):
+    """
+    Face-adjacency edge builder for axis-aligned dyadic AMR quads.
+
+    Uses a max-grid occupancy rasterization to detect which *original* cells share a face,
+    including coarse–fine partial overlaps. Nodes remain original cells (true centers).
+
+    Returns:
+      edge_index: (2,E) int64, directed, includes both directions, deduplicated, no self-loops.
+
+    If return_edge_attr=True, also returns:
+      edge_attr: (E,5) float32 columns:
+        [nx, ny, face_len, center_dist, w_diff]
+      where:
+        (nx,ny)     = unit outward normal for the directed edge src->dst (axis-aligned),
+        face_len    = shared face length between src and dst (exact on max-grid),
+        center_dist = ||c_dst - c_src||,
+        w_diff      = face_len / center_dist   (canonical two-point diffusion weight).
+    """
+    device = centers.device
+    N = int(centers.shape[0])
+    if N == 0:
+        ei = torch.empty((2, 0), dtype=torch.long, device=device)
+        if return_edge_attr:
+            ea = torch.empty((0, 5), dtype=torch.float32, device=device)
+            return ei, ea
+        return ei
+
+    xmin, xmax, ymin, ymax = map(float, bbox)
+
+    levels_i64 = levels.to(torch.int64)
+    Lmax = int(levels_i64.max().item()) if levels_i64.numel() else 0
+    if Lmax > int(max_L_guard):
+        raise RuntimeError(
+            f"Lmax={Lmax} exceeds guard={max_L_guard}. "
+            "Raster-based face adjacency will be too large; "
+            "raise guard or use a hierarchical neighbor finder."
+        )
+
+    # Level-0 cell sizes
+    dx0 = (xmax - xmin) / float(W)
+    dy0 = (ymax - ymin) / float(H)
+
+    # Max-grid resolution
+    Hmax = int(H) * (2 ** Lmax)
+    Wmax = int(W) * (2 ** Lmax)
+    dx_max = dx0 / (2 ** Lmax)
+    dy_max = dy0 / (2 ** Lmax)
+
+    # occupancy grid storing ORIGINAL cell id
+    occ = np.full((Hmax, Wmax), fill_value=-1, dtype=np.int32)
+
+    c = centers.detach().cpu().to(torch.float32).numpy()
+    l = levels_i64.detach().cpu().numpy()
+
+    # Rasterize: stamp each AMR cell id into the max-grid region it occupies
+    for cid in range(N):
+        L = int(l[cid])
+        scale = 2 ** (Lmax - L)  # block size in max-grid pixels along each axis
+
+        dxL = dx0 / (2 ** L)
+        dyL = dy0 / (2 ** L)
+
+        # integer index in the level-L grid
+        ixL = int(np.floor((c[cid, 0] - xmin) / dxL))
+        iyL = int(np.floor((c[cid, 1] - ymin) / dyL))
+
+        # clamp for numerical edge cases at domain boundary
+        ixL = max(0, min(ixL, (W * (2 ** L)) - 1))
+        iyL = max(0, min(iyL, (H * (2 ** L)) - 1))
+
+        ix0 = ixL * scale
+        iy0 = iyL * scale
+
+        occ[iy0:iy0 + scale, ix0:ix0 + scale] = cid
+
+    # Helper: aggregate boundary pixel transitions into (src,dst,face_len)
+    def _agg_directed(src_ids: np.ndarray, dst_ids: np.ndarray, seg_len: float):
+        # Count how many max-grid segments each directed pair owns
+        keys = src_ids.astype(np.int64) * N + dst_ids.astype(np.int64)
+        uniq, counts = np.unique(keys, return_counts=True)
+        src_u = (uniq // N).astype(np.int64)
+        dst_u = (uniq %  N).astype(np.int64)
+        face_len = counts.astype(np.float32) * float(seg_len)
+        return src_u, dst_u, face_len
+
+    # Horizontal scan: left pixel vs right pixel -> vertical face segments (length dy_max)
+    left = occ[:, :-1]
+    right = occ[:, 1:]
+    m = (left != right) & (left >= 0) & (right >= 0)
+    src_lr = left[m]
+    dst_lr = right[m]
+    # directed pairs: left->right and right->left
+    s1, d1, fl1 = _agg_directed(src_lr, dst_lr, dy_max)
+    s2, d2, fl2 = _agg_directed(dst_lr, src_lr, dy_max)
+
+    # Vertical scan: bottom pixel vs top pixel -> horizontal face segments (length dx_max)
+    bot = occ[:-1, :]
+    top = occ[1:, :]
+    m = (bot != top) & (bot >= 0) & (top >= 0)
+    src_bt = bot[m]
+    dst_bt = top[m]
+    # directed pairs: bottom->top and top->bottom
+    s3, d3, fl3 = _agg_directed(src_bt, dst_bt, dx_max)
+    s4, d4, fl4 = _agg_directed(dst_bt, src_bt, dx_max)
+
+    src_all = np.concatenate([s1, s2, s3, s4], axis=0)
+    dst_all = np.concatenate([d1, d2, d3, d4], axis=0)
+    fl_all  = np.concatenate([fl1, fl2, fl3, fl4], axis=0)
+
+    # Remove self-loops (should not happen, but safe)
+    keep = (src_all != dst_all)
+    src_all = src_all[keep]
+    dst_all = dst_all[keep]
+    fl_all  = fl_all[keep]
+
+    if src_all.size == 0:
+        ei = torch.empty((2, 0), dtype=torch.long, device=device)
+        if return_edge_attr:
+            ea = torch.empty((0, 5), dtype=torch.float32, device=device)
+            return ei, ea
+        return ei
+
+    # Final dedup: sum face lengths if duplicates exist
+    keys = src_all.astype(np.int64) * N + dst_all.astype(np.int64)
+    uniq, inv = np.unique(keys, return_inverse=True)
+    if uniq.size != keys.size:
+        fl_sum = np.zeros((uniq.size,), dtype=np.float32)
+        np.add.at(fl_sum, inv, fl_all)
+        src_all = (uniq // N).astype(np.int64)
+        dst_all = (uniq %  N).astype(np.int64)
+        fl_all  = fl_sum
+
+    edge_index = torch.as_tensor(
+        np.stack([src_all, dst_all], axis=0),
+        dtype=torch.int64,
+        device=device,
+    )
+
+    if not return_edge_attr:
+        return edge_index
+
+    # Edge geometry for operator-style message passing
+    c_t = centers.to(torch.float32)
+    src_t = edge_index[0]
+    dst_t = edge_index[1]
+    delta = c_t[dst_t] - c_t[src_t]
+    dist = torch.linalg.norm(delta, dim=1).clamp_min(1e-12)
+
+    # For axis-aligned dyadic quads, neighbor centers differ predominantly in x or y.
+    # Use the dominant component to set the outward normal for src->dst.
+    use_x = (delta[:, 0].abs() >= delta[:, 1].abs())
+    nx = torch.zeros((edge_index.shape[1],), dtype=torch.float32, device=device)
+    ny = torch.zeros((edge_index.shape[1],), dtype=torch.float32, device=device)
+    nx[use_x] = torch.sign(delta[use_x, 0])
+    ny[~use_x] = torch.sign(delta[~use_x, 1])
+
+    face_len = torch.as_tensor(fl_all, dtype=torch.float32, device=device)
+    w_diff = face_len / dist
+
+    edge_attr = torch.stack([nx, ny, face_len, dist, w_diff], dim=1)  # (E,5)
+    return edge_index, edge_attr
 
 @torch.no_grad()
 def build_amr_local_knn_edges(
@@ -1161,7 +1697,29 @@ def _build_pred_mesh_from_gt_gradients(
     # -------------------------------
     # 6. Ensure edges exist
     # -------------------------------
+    '''
     if (not torch.is_tensor(pred_ei)) or pred_ei.numel() == 0:
+        pred_ei = build_amr_local_knn_edges(
+            pred_centers,
+            parent_flat,
+            H,
+            W,
+            k_local=int(cfg.get("edges", {}).get("k_local", 4)),
+            max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
+        )
+    '''
+    edge_method = str(cfg.get("edges", {}).get("method", "knn")).lower()
+    #print(f"[precompute] building pred_ei using method='{edge_method}'")
+    if ("face" in edge_method):
+        pred_ei = build_amr_face_adjacency_edges(
+            pred_centers,
+            pred_levels,
+            H,
+            W,
+            bbox=tuple(cfg["data"]["bbox"]),
+            return_edge_attr=False,  # keep identical downstream contract for now
+        )
+    else:
         pred_ei = build_amr_local_knn_edges(
             pred_centers,
             parent_flat,
@@ -1394,9 +1952,30 @@ def _clip_pred_mesh_to_wedge(
         )
 
     # ---------- Step 4: rebuild edges + mask ----------
-    k_local   = int(cfg.get("edges", {}).get("k_local", 4))
+    k_local   = int(cfg.get("edges", {}).get("knn_k", 4))
     max_local = int(cfg.get("edges", {}).get("max_local", 2048))
 
+    edge_method = str(cfg.get("edges", {}).get("method", "amr_local_knn")).lower()
+
+    if ("face" in edge_method):
+        pred_ei = build_amr_face_adjacency_edges(
+            pred_centers,
+            pred_levels,
+            H,
+            W,
+            bbox=bbox,
+            return_edge_attr=False,
+        ).to(dev, dtype=torch.long)
+    else:
+        pred_ei = build_amr_local_knn_edges(
+            pred_centers,
+            parent_flat,
+            H,
+            W,
+            k_local=int(cfg.get("edges", {}).get("k_local", 4)),
+            max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
+        ).to(dev, dtype=torch.long)
+    '''
     pred_ei = build_amr_local_knn_edges(
         pred_centers,
         parent_flat,
@@ -1405,6 +1984,7 @@ def _clip_pred_mesh_to_wedge(
         k_local=k_local,
         max_local=max_local,
     ).to(dev, dtype=torch.long)
+    '''
 
     if pred_ei.numel() == 0 or int(pred_ei.shape[1]) == 0:
         raise RuntimeError("Empty edge_index after wedge clipping/refinement.")
@@ -1415,8 +1995,6 @@ def _clip_pred_mesh_to_wedge(
 
 
 def debug_print_precomp_h5_meta(path: str):
-    import h5py
-    import numpy as np
 
     print(f"[DEBUG H5] opening: {path}")
     with h5py.File(path, "r") as f:
@@ -1844,7 +2422,6 @@ def precompute_pred_mesh_and_interps_for_rollout(
       - The SAME pred mesh is used for every dst=t+1 group.
       - pred2pred maps are written as identity maps (since pred(t) == pred(t+1) geometry).
     """
-    import os, json, hashlib
     import numpy as np
 
     try:
@@ -2493,6 +3070,23 @@ def precompute_pred_mesh_and_interps_for_rollout(
         wedge_path=wedge_path,  # if in-scope in your function; otherwise drop this arg
     )
     print(f"[PRECOMP] Saved mesh plot: {out_png}")
+
+    out_png_zoom = os.path.join(os.path.dirname(cache_path) or ".", "precomp_mesh_edges_zoom_t00001.png")
+    plot_precomputed_mesh_with_edges_from_h5(
+        cache_path,
+        t=1,
+        out_path=out_png_zoom,
+        show=bool(dbg.get("show_precomp_mesh", False)),
+        zoom_bbox=None,          # None => auto-zoom to a coarse–fine interface using SAVED pred_ei
+        zoom_cells=20.0,         # adjust window size as needed
+        max_cells=200_000,
+        max_edges=400_000,
+        cell_linewidth=0.20,
+        edge_linewidth=0.45,
+        node_size=3.0,
+        wedge_path=wedge_path,
+    )
+    print(f"[PRECOMP] Saved zoomed mesh+edges plot: {out_png_zoom}")
 
     return {
         "type": "h5",

@@ -1514,7 +1514,7 @@ def main(config_path: str | None = None):
             threshold_mode=sch_cfg.get("threshold_mode", "rel"),
             cooldown=int(sch_cfg.get("cooldown", 0)),
             min_lr=float(sch_cfg.get("min_lr", 1e-6)),
-            verbose=bool(sch_cfg.get("verbose", True)),
+            #verbose=bool(sch_cfg.get("verbose", True)),
         )
 
     # Load the raw list[Data] and let the dataset preprocess ONCE in memory:
@@ -1835,6 +1835,7 @@ def main(config_path: str | None = None):
 
     out_pdf = os.path.join(cfg["train"]["save_dir"], "qual_with_deltas.pdf")
     feature_names = cfg.get("features", {}).get("names", ["U", "V", "E"])
+    '''
     print(f"[INFO] Generating qualitative PDF with deltas: {out_pdf}")
     #for ex in test_examples:
     #    print("t: ", int(ex["t"]))
@@ -1849,7 +1850,7 @@ def main(config_path: str | None = None):
         rasterize=True,
         colorbars="row",
     )
-    
+    '''
     # This is very computionally heavy; use only if needed
     """
     plot_qual_2x3_pdf_with_cells(
