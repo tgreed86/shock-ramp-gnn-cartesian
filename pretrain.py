@@ -617,7 +617,7 @@ def _normalize_builder_output_to_mesh(
                 ei = build_amr_face_adjacency_edges(
                     centers, levels, H, W,
                     bbox=bbox,
-                    return_edge_attr=False,
+                    return_edge_attr=True,
                 ).to(device)
             else:
                 ei = build_amr_local_knn_edges(
@@ -743,7 +743,7 @@ def _normalize_builder_output_to_mesh(
                 edge_index = build_amr_face_adjacency_edges(
                     centers, levels, H, W,
                     bbox=bbox,
-                    return_edge_attr=False,
+                    return_edge_attr=True,
                 )
             else:
                 edge_index = build_amr_local_knn_edges(
@@ -793,6 +793,88 @@ def _normalize_builder_output_to_mesh(
         return centers, levels, parents, ei, mask_parent
 
     raise RuntimeError(f"Unsupported builder return type: {type(out)}")
+
+def amr_cell_wh_area_from_levels(levels: torch.Tensor, *, dx0: float, dy0: float):
+    """
+    levels: (N,) int64
+    Returns:
+      w: (N,) float32
+      h: (N,) float32
+      area: (N,) float32
+      hx: (N,) float32
+      hy: (N,) float32
+    """
+    lv = levels.to(dtype=torch.float32)
+    scale = torch.pow(torch.tensor(2.0, device=levels.device), lv)  # 2^L
+    w = (float(dx0) / scale).to(torch.float32)
+    h = (float(dy0) / scale).to(torch.float32)
+    area = (w * h).to(torch.float32)
+    hx = (0.5 * w).to(torch.float32)
+    hy = (0.5 * h).to(torch.float32)
+    return w, h, area, hx, hy
+
+
+def dec_edge_attr_for_dyadic_quads(
+    centers: torch.Tensor,     # (N,2) float32, physical
+    levels: torch.Tensor,      # (N,) int64
+    edge_index: torch.Tensor,  # (2,E) int64, directed edges (both directions allowed)
+    *,
+    dx0: float,
+    dy0: float,
+):
+    """
+    Returns edge_attr: (E,5) float32 with columns:
+      [nx, ny, face_len, dual_len, tau]
+    """
+    device = centers.device
+    ei = edge_index.to(device=device, dtype=torch.int64)
+    u = ei[0]
+    v = ei[1]
+
+    w, h, _area, hx, hy = amr_cell_wh_area_from_levels(levels, dx0=dx0, dy0=dy0)
+
+    du = centers[v] - centers[u]  # (E,2)
+    dx = du[:, 0]
+    dy = du[:, 1]
+
+    # Expected normal separations (orthogonal dyadic quads)
+    exp_dx = hx[u] + hx[v]
+    exp_dy = hy[u] + hy[v]
+
+    # Decide whether this edge corresponds to a vertical face (left/right) or horizontal face (up/down).
+    # Use "which component matches the expected separation better" rather than abs(dx)>abs(dy),
+    # because coarse-fine neighbors can have tangential offsets.
+    err_x = (dx.abs() - exp_dx).abs()
+    err_y = (dy.abs() - exp_dy).abs()
+    is_lr = err_x <= err_y  # True => left/right neighbor across vertical face
+
+    # Unit normal from u->v
+    nx = torch.zeros_like(dx, dtype=torch.float32)
+    ny = torch.zeros_like(dy, dtype=torch.float32)
+
+    # Dual length (center-to-center distance along normal)
+    dual_len = torch.empty_like(dx, dtype=torch.float32)
+
+    # Shared face length
+    face_len = torch.empty_like(dx, dtype=torch.float32)
+
+    # Left/right edges (vertical face): normal is ±x, face length is overlap in y => min(h_u,h_v)
+    nx[is_lr] = torch.sign(dx[is_lr]).to(torch.float32)
+    dual_len[is_lr] = exp_dx[is_lr].to(torch.float32)
+    face_len[is_lr] = torch.minimum(h[u[is_lr]], h[v[is_lr]]).to(torch.float32)
+
+    # Up/down edges (horizontal face): normal is ±y, face length is overlap in x => min(w_u,w_v)
+    inv = ~is_lr
+    ny[inv] = torch.sign(dy[inv]).to(torch.float32)
+    dual_len[inv] = exp_dy[inv].to(torch.float32)
+    face_len[inv] = torch.minimum(w[u[inv]], w[v[inv]]).to(torch.float32)
+
+    # Hodge-star ratio / diffusion weight
+    eps = torch.tensor(1e-12, device=device, dtype=torch.float32)
+    tau = face_len / torch.maximum(dual_len, eps)
+
+    edge_attr = torch.stack([nx, ny, face_len, dual_len, tau], dim=1).to(torch.float32)
+    return edge_attr
 
 def _centers_from_level_ij(
     level_1d: torch.Tensor,  # (N,) int64
@@ -1711,14 +1793,16 @@ def _build_pred_mesh_from_gt_gradients(
     edge_method = str(cfg.get("edges", {}).get("method", "knn")).lower()
     #print(f"[precompute] building pred_ei using method='{edge_method}'")
     if ("face" in edge_method):
-        pred_ei = build_amr_face_adjacency_edges(
+        pred_ei, pred_ea = build_amr_face_adjacency_edges(
             pred_centers,
             pred_levels,
             H,
             W,
             bbox=tuple(cfg["data"]["bbox"]),
-            return_edge_attr=False,  # keep identical downstream contract for now
+            return_edge_attr=True,  # keep identical downstream contract for now
         )
+        pred_ei = pred_ei.to(dev, dtype=torch.long)
+        pred_ea = pred_ea.to(dev, dtype=torch.float32)      
     else:
         pred_ei = build_amr_local_knn_edges(
             pred_centers,
@@ -1728,7 +1812,7 @@ def _build_pred_mesh_from_gt_gradients(
             k_local=int(cfg.get("edges", {}).get("k_local", 4)),
             max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
         )
-    pred_ei = pred_ei.to(dev).long()
+        pred_ei = pred_ei.to(dev).long()
 
     if pred_ei.ndim != 2 or pred_ei.size(0) != 2 or pred_ei.size(1) == 0:
         sid = ex.get("t", None)
@@ -1958,14 +2042,16 @@ def _clip_pred_mesh_to_wedge(
     edge_method = str(cfg.get("edges", {}).get("method", "amr_local_knn")).lower()
 
     if ("face" in edge_method):
-        pred_ei = build_amr_face_adjacency_edges(
+        pred_ei, pred_ea = build_amr_face_adjacency_edges(
             pred_centers,
             pred_levels,
             H,
             W,
             bbox=bbox,
-            return_edge_attr=False,
-        ).to(dev, dtype=torch.long)
+            return_edge_attr=True,
+        )
+        pred_ei = pred_ei.to(dev, dtype=torch.long)
+        pred_ea = pred_ea.to(dev, dtype=torch.float32)
     else:
         pred_ei = build_amr_local_knn_edges(
             pred_centers,
@@ -2720,6 +2806,22 @@ def precompute_pred_mesh_and_interps_for_rollout(
     # ----------------- optional reuse -----------------
     if (not force_recompute) and _h5_is_usable(cache_path, cfg, expected_T=T):
         print(f"[PRECOMP] Using existing H5 cache: {cache_path}")
+
+        if cfg.get("debug", {}).get("print_dec_checks", False):
+            with h5py.File(cache_path, "r") as f:
+                # pick one timestep group
+                gname = next(k for k in f.keys() if k.startswith("t"))
+                g = f[gname]
+                print("Group:", gname)
+                print("Datasets:", list(g.keys()))
+
+                # common expected names
+                for k in ["pred_edge_attr", "pred_ea", "pred_edge_attr_layout", "pred_cell_area", "pred_cell_wh"]:
+                    if k in g:
+                        print(k, "shape=", g[k].shape, "dtype=", g[k].dtype)
+                    else:
+                        print(k, "MISSING")
+
         return {
             "type": "h5",
             "path": cache_path,
@@ -2990,6 +3092,26 @@ def precompute_pred_mesh_and_interps_for_rollout(
             _write_ds(g, "feat_t_on_pred",   _to_np(ft_on_pred.to("cpu"), dtype=np.float32))
             _write_ds(g, "feat_tp1_on_pred", _to_np(f1_on_pred.to("cpu"), dtype=np.float32))
 
+            # --- Discrete Exterior Calculus related stuff ---
+            # Work on CPU for consistency and to avoid device-mismatch headaches
+            c_cpu  = pred_c_dev.to("cpu", dtype=torch.float32)
+            l_cpu  = pred_l_dev.to("cpu", dtype=torch.int64)
+            ei_cpu = pred_e_dev.to("cpu", dtype=torch.int64)
+
+            # dx,dy in your meta are level-0 cell sizes (you already store them in /meta attrs)
+            w_cpu, h_cpu, area_cpu, *_ = amr_cell_wh_area_from_levels(l_cpu, dx0=float(dx), dy0=float(dy))
+            cell_wh = torch.stack([w_cpu, h_cpu], dim=1)  # (N,2)
+
+            edge_attr = dec_edge_attr_for_dyadic_quads(
+                c_cpu, l_cpu, ei_cpu,
+                dx0=float(dx), dy0=float(dy),
+            )
+
+            _write_ds(g, "pred_cell_area", _to_np(area_cpu, dtype=np.float32))
+            _write_ds(g, "pred_cell_wh",   _to_np(cell_wh,  dtype=np.float32))
+            _write_ds(g, "pred_edge_attr", _to_np(edge_attr, dtype=np.float32))
+
+            g.attrs["pred_edge_attr_layout"] = np.bytes_("nx,ny,face_len,dual_len,tau")
             g.attrs["N_pred"] = int(pred_c_dev.shape[0])
             g.attrs["E"] = int(pred_e_dev.shape[1]) if (pred_e_dev is not None and pred_e_dev.numel() > 0) else 0
 
@@ -3128,6 +3250,7 @@ class CollateWithPrecompute:
         pl    = self.precomp["pred_levels"]
         pp    = self.precomp["pred_parents"]
         pei   = self.precomp["pred_ei"]
+        pea = self.precomp.get("pred_edge_attr", None)
         mp    = self.precomp["mask_pred"]
         ft    = self.precomp["feat_t_on_pred"]
         ftp1  = self.precomp["feat_tp1_on_pred"]
@@ -3137,10 +3260,30 @@ class CollateWithPrecompute:
         ex["pred_levels_list"]     = [pl[i]   for i in idxs]
         ex["pred_parents_list"]    = [pp[i]   for i in idxs]
         ex["pred_ei_list"]         = [pei[i]  for i in idxs]
+        if pea is not None:
+            ex["pred_edge_attr_list"] = [pea[i] for i in idxs]
+
         ex["mask_pred_list"]       = [mp[i]   for i in idxs]
 
         ex["feat_t_on_pred_list"]   = [ft[i]   for i in idxs]
         ex["feat_tp1_on_pred_list"] = [ftp1[i] for i in idxs]
+
+        if getattr(self, "_printed_dec_once", False) is False:
+            if "pred_edge_attr_list" in ex:
+                pea0 = ex["pred_edge_attr_list"][0]
+                pei0 = ex["pred_ei_list"][0]
+                print("[DEC-CHK] Collate attached pred_edge_attr_list.")
+                if torch.is_tensor(pei0):
+                    print(f"[DEC-CHK] batch pred_ei_list[0] shape={tuple(pei0.shape)} dtype={pei0.dtype} dev={pei0.device}")
+                if torch.is_tensor(pea0):
+                    print(f"[DEC-CHK] batch pred_edge_attr_list[0] shape={tuple(pea0.shape)} dtype={pea0.dtype} dev={pea0.device}")
+                    if pea0.ndim == 2 and pea0.size(1) >= 5:
+                        # quick sanity stats on tau column
+                        tau = pea0[:, 4]
+                        print(f"[DEC-CHK] tau stats: min={tau.min().item():.3e} max={tau.max().item():.3e} mean={tau.mean().item():.3e}")
+            else:
+                print("[DEC-CHK] Collate did NOT attach pred_edge_attr_list (key missing).")
+            self._printed_dec_once = True
 
         # ----- optional pred→pred IDW maps (length = K-1) -----
         pred2pred_idx = self.precomp.get("pred2pred_idx", None)

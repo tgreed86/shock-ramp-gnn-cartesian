@@ -101,24 +101,21 @@ class PrecompH5Writer:
             self.f.close()
 
 
-class _LazyPrecompSeq:
-    """List-like object: seq[t] -> tensor (or None), loaded from HDF5 on demand."""
-    def __init__(self, owner: "LazyPrecompH5", key: str):
-        self._o = owner
-        self._k = key
-
-    def __len__(self) -> int:
-        return self._o.T
-
-    def __getitem__(self, t: int):
-        return self._o._get(self._k, t)
-
-
 class LazyPrecompH5(dict):
     """
-    Dict-like drop-in replacement for the old in-memory precomp:
-      precomp["pred_centers"][t] -> torch.Tensor or None
-      precomp["pred2pred_idx"][t] -> torch.Tensor or None
+    Dict-like drop-in replacement for the old dict-of-lists precomp.
+
+    Examples:
+      precomp["pred_centers"][t]      -> Tensor [N,2] or None
+      precomp["pred_ei"][t]           -> Tensor [2,E] or None
+      precomp["pred_edge_attr"][t]    -> Tensor [E?,C] or None   (we'll fix alignment later)
+      precomp["pred_cell_wh"][t]      -> Tensor [N,2] or None
+      precomp["pred_cell_area"][t]    -> Tensor [N]   or None
+      precomp["pred2pred_idx"][t]     -> Tensor [Ndst,k] or None
+      precomp["pred2pred_w"][t]       -> Tensor [Ndst,k] or None
+
+    Non-indexed metadata:
+      precomp["pred_edge_attr_layout"] -> str or None
     """
     def __init__(self, path: str, T: int, H: int, W: int, device: str | torch.device = "cpu"):
         super().__init__()
@@ -132,22 +129,27 @@ class LazyPrecompH5(dict):
         self.device = torch.device(device)
 
         self._f = None  # lazy-open per process
+        self._meta_cache = {}  # cache scalar attrs/values
 
-        # expose the same keys as your old dict-of-lists
-        for k in [
+        # expose the same keys as your old dict-of-lists PLUS DEC keys
+        seq_keys = [
             "pred_centers", "pred_levels", "pred_parents", "pred_ei", "mask_pred",
             "feat_t_on_pred", "feat_tp1_on_pred",
             "pred2pred_idx", "pred2pred_w",
-        ]:
+            # DEC additions
+            "pred_edge_attr", "pred_cell_wh", "pred_cell_area",
+        ]
+        for k in seq_keys:
             super().__setitem__(k, _LazyPrecompSeq(self, k))
+
+        # metadata / scalar keys (not time-indexed)
+        super().__setitem__("pred_edge_attr_layout", _LazyPrecompScalar(self, "pred_edge_attr_layout"))
 
     def _open(self):
         if self._f is None:
-            # SWMR not required here; we read after writing finished.
             self._f = h5py.File(self.path, "r")
 
     def __getstate__(self):
-        # make picklable for DataLoader workers: drop file handle
         d = dict(self.__dict__)
         d["_f"] = None
         return d
@@ -182,11 +184,33 @@ class LazyPrecompH5(dict):
         return g[name][...]
 
     def _to_torch(self, arr: np.ndarray, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-        # torch.from_numpy shares memory; arr here is a new numpy array from h5py anyway
         return torch.from_numpy(arr).to(device=device, dtype=dtype)
 
+    # -------- scalar metadata --------
+    def _get_scalar(self, key: str):
+        # cache after first read
+        if key in self._meta_cache:
+            return self._meta_cache[key]
+
+        self._open()
+
+        # Prefer group attribute (t00001) if present; fallback to meta attrs
+        val = None
+        try:
+            if "t00001" in self._f and key in self._f["t00001"].attrs:
+                v = self._f["t00001"].attrs[key]
+                val = v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else str(v)
+            elif "meta" in self._f and key in self._f["meta"].attrs:
+                v = self._f["meta"].attrs[key]
+                val = v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else str(v)
+        except Exception:
+            val = None
+
+        self._meta_cache[key] = val
+        return val
+
+    # -------- time-indexed tensors --------
     def _get(self, key: str, t: int):
-        # preserve your original convention: index 0 is None for most series
         if t is None:
             return None
         t = int(t)
@@ -194,8 +218,13 @@ class LazyPrecompH5(dict):
             return None
 
         # pred meshes / mapped features exist for t=1..T-1
-        if key in ("pred_centers", "pred_levels", "pred_parents", "pred_ei", "mask_pred",
-                   "feat_t_on_pred", "feat_tp1_on_pred"):
+        pred_series = (
+            "pred_centers", "pred_levels", "pred_parents", "pred_ei", "mask_pred",
+            "feat_t_on_pred", "feat_tp1_on_pred",
+            # DEC series live in same groups
+            "pred_edge_attr", "pred_cell_wh", "pred_cell_area",
+        )
+        if key in pred_series:
             if t == 0:
                 return None
             if not self._has_group(t):
@@ -221,7 +250,6 @@ class LazyPrecompH5(dict):
                 arr = self._read_np(t, "mask_pred_parent_flat_u8")
                 if arr is None:
                     return None
-                # stored as flat uint8 (H*W)
                 m = torch.from_numpy(arr.astype(np.uint8, copy=False)).to(self.device)
                 return m.view(self.H, self.W).to(torch.bool)
 
@@ -231,6 +259,19 @@ class LazyPrecompH5(dict):
 
             if key == "feat_tp1_on_pred":
                 arr = self._read_np(t, "feat_tp1_on_pred")
+                return None if arr is None else self._to_torch(arr, dtype=torch.float32, device=self.device)
+
+            # --- DEC additions ---
+            if key == "pred_edge_attr":
+                arr = self._read_np(t, "pred_edge_attr")
+                return None if arr is None else self._to_torch(arr, dtype=torch.float32, device=self.device)
+
+            if key == "pred_cell_wh":
+                arr = self._read_np(t, "pred_cell_wh")
+                return None if arr is None else self._to_torch(arr, dtype=torch.float32, device=self.device)
+
+            if key == "pred_cell_area":
+                arr = self._read_np(t, "pred_cell_area")
                 return None if arr is None else self._to_torch(arr, dtype=torch.float32, device=self.device)
 
         # pred2pred maps exist for t=1..T-2 (stored in group t, mapping to t+1)
@@ -248,10 +289,43 @@ class LazyPrecompH5(dict):
                 arr = self._read_np(t, "pred2pred_w_to_next")
                 if arr is None:
                     return None
-                # stored float16; upcast to float32 for stable math
                 return self._to_torch(arr.astype(np.float32, copy=False), dtype=torch.float32, device=self.device)
 
         return None
+
+
+class _LazyPrecompSeq:
+    """Sequence-like wrapper: seq[t] calls LazyPrecompH5._get(key,t)."""
+    def __init__(self, owner: LazyPrecompH5, key: str):
+        self.owner = owner
+        self.key = key
+
+    def __len__(self):
+        return self.owner.T
+
+    def __getitem__(self, t: int):
+        return self.owner._get(self.key, t)
+
+
+class _LazyPrecompScalar:
+    """Scalar-like wrapper: precomp['pred_edge_attr_layout'] returns str/None."""
+    def __init__(self, owner: LazyPrecompH5, key: str):
+        self.owner = owner
+        self.key = key
+
+    def get(self):
+        return self.owner._get_scalar(self.key)
+
+    def __repr__(self):
+        return repr(self.get())
+
+    def __str__(self):
+        v = self.get()
+        return "" if v is None else str(v)
+
+    # allow direct access pattern: precomp["pred_edge_attr_layout"]
+    def __call__(self):
+        return self.get()
 
 
 def precomp_h5_is_usable(path: str, cfg: dict, expected_steps: int, verbose: bool = False) -> bool:

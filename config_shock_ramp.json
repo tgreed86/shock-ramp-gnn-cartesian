@@ -9,7 +9,7 @@
     "L_max": 3,
     "bbox": [0.0, 1.0, 0.0, 1.0],
     "pre_train_dir": "./precomp_cache",
-    "window_size": 5,
+    "window_size": 10,
     "stride": 1,
     "num_workers": 0
   },
@@ -23,9 +23,9 @@
   "split": { "train": 0.85, "val": 0.1, "test": 0.05 },
 
   "train": {
-    "precomp_cache_path": "./cache/all/shock_ramp_precomp_pLow85_pHigh95_faceAdj.h5",
-    "precomp_force_recompute": true,
-    "epochs": 2,
+    "precomp_cache_path": "./cache/all/shock_ramp_precomp_pLow85_pHigh95_faceAdj_DEC.h5",
+    "precomp_force_recompute": false,
+    "epochs": 25,
     "batch_size": 1,
     "lr": 0.0001,
     "weight_decay": 0.0,
@@ -91,7 +91,21 @@
     "interp_k": 8,
     "primary_weight": 1.0,
     "laplacian_weight": 0.0,
-    "temporal_weight": 0.0
+    "temporal_weight": 0.0,
+    "dec": true,
+    "parc": true,
+    "parc_detach_ops": true,
+    "parc_include_adv": false,
+    "parc_include_diff": true,
+
+    "mode": "diffusion",
+    "channels": ["density", "energy"],
+    "adv_weight": 0.0,
+    "diff_weight": 1.0,
+    "nu": 0.0001,
+
+    "blend_weight": 1.0,
+    "residual_weight": 1e-6
   },
 
   "eval": {
@@ -116,7 +130,11 @@
     "plot_gradients": true,
     "profile": false,
     "plot_precomp_max_cells":  "250_000",
-    "plot_precomp_linewidth": 0.05
+    "plot_precomp_linewidth": 0.05,
+    "print_dec_checks": false,
+    "print_loss_components": false,
+    "nan_watch": false,
+    "nan_first_only": false
   },
   "speed": {
     "interp_chunk": 4096

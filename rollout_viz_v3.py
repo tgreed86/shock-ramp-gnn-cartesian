@@ -904,6 +904,10 @@ def make_rollout_gifs_raster(
             if raster_lmax is not None:
                 step_lmax = min(int(step_lmax), int(raster_lmax))
 
+            if not hasattr(make_rollout_gifs_raster, "_printed_keys"):
+                make_rollout_gifs_raster._printed_keys = True
+                print("[ROLLOUT-CHK] ex keys:", sorted(list(ex.keys())))
+
             # Pull GT(t) and GT(t+1) for TOP + GTΔ clims
             A_cent = ex["centers_t"]
             B_cent = ex["centers_tp1"]
