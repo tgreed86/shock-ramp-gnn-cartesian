@@ -18,12 +18,14 @@ Also produces qualitative PDFs of feature fields per sample using
 """
 
 from __future__ import annotations
+print("[train.py] module import started", flush=True)
 from typing import Dict, Any, List, Tuple
 import os, io, json, time, zipfile, random, hashlib
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, Subset
 from torch import optim
+from torch.amp import autocast
 from contextlib import nullcontext, contextmanager
 import matplotlib.pyplot as plt
 import numpy as np
@@ -1012,6 +1014,7 @@ def train_one_epoch_multi_step(
 
                 # ----- add Variant-B baseline in model units -----
                 y_pred = y_corr
+                '''
                 if need_phy and (dec_blend_w != 0.0) and (r_phy_abs is not None):
                     phy_units = dec.physics_to_model_units(
                         r_phy_abs.to(dtype=y_corr.dtype),
@@ -1023,6 +1026,30 @@ def train_one_epoch_multi_step(
                     # mask baseline to selected channels
                     phy_units = phy_units * ch_mask.view(1, -1).to(dtype=y_corr.dtype)
                     y_pred = y_corr + dec_blend_w * phy_units
+                '''
+                if need_phy and (dec_blend_w != 0.0) and (r_phy_abs is not None):
+                    # --- compute baseline in fp32 to avoid fp16 NaNs on CUDA ---
+                    with autocast("cuda", enabled=False):
+                        r_phy_f32 = r_phy_abs.to(dtype=torch.float32)
+                        
+                        sigma_f32 = None
+                        if sigma is not None and torch.is_tensor(sigma):
+                            sigma_f32 = sigma.to(device, dtype=torch.float32)
+                            
+                            phy_units_f32 = dec.physics_to_model_units(
+                                r_phy_f32,
+                                dt_phys=dt_phys,
+                                dt_ref=dt_ref_t,
+                                sigma=sigma_f32,
+                                predict_type=predict_type,
+                            )
+
+                            # mask baseline to selected channels (still fp32)
+                            phy_units_f32 = phy_units_f32 * ch_mask.view(1, -1).to(dtype=torch.float32)
+
+                        # Cast back to model dtype for the model arithmetic
+                        phy_units = phy_units_f32.to(dtype=y_corr.dtype)
+                        y_pred = y_corr + dec_blend_w * phy_units
 
                     if need_phy and (dec_blend_w != 0.0) and (r_phy_abs is not None):
                         if _should_print():
@@ -1446,7 +1473,7 @@ def evaluate_one_epoch_multi_step(
                             x_in = torch.cat([x_in, parc_extra], dim=1)
 
                     y_corr = _forward_main_head_with_edge_attr(model, x_in, pei, edge_attr=pea)
-
+                    '''
                     y_pred = y_corr
                     if need_phy and (dec_blend_w != 0.0) and (r_phy_abs is not None):
                         phy_units = dec.physics_to_model_units(
@@ -1458,7 +1485,23 @@ def evaluate_one_epoch_multi_step(
                         )
                         phy_units = phy_units * ch_mask.view(1, -1).to(dtype=y_corr.dtype)
                         y_pred = y_corr + dec_blend_w * phy_units
+                    '''
+                    y_pred = y_corr
+                    if need_phy and (dec_blend_w != 0.0) and (r_phy_abs is not None):
+                        # ---- compute baseline in fp32 to avoid fp16 inf/NaN during eval rollouts ----
+                        with torch.autocast(device_type=device.type, enabled=False):
+                            phy_units_f32 = dec.physics_to_model_units(
+                                r_phy_abs.to(dtype=torch.float32),
+                                dt_phys=(dt_phys.to(dtype=torch.float32) if torch.is_tensor(dt_phys) else dt_phys),
+                                dt_ref=(dt_ref_t.to(dtype=torch.float32) if (dt_ref_t is not None and torch.is_tensor(dt_ref_t)) else dt_ref_t),
+                                sigma=(sigma.to(device, dtype=torch.float32) if (sigma is not None and torch.is_tensor(sigma)) else None),
+                                predict_type=predict_type,
+                            )
+                            phy_units_f32 = phy_units_f32 * ch_mask.view(1, -1).to(dtype=torch.float32)
 
+                        phy_units = phy_units_f32.to(dtype=y_corr.dtype)
+                        y_pred = y_corr + dec_blend_w * phy_units
+                    '''
                     delta_target = norm_tgt - norm_in
                     rate_target = delta_target / dt_hat.clamp_min(1e-12)
 
@@ -1466,6 +1509,21 @@ def evaluate_one_epoch_multi_step(
                                    if use_huber else F.l1_loss(y_pred, rate_target))
 
                     y_pred_abs = _maybe_denorm(norm_in + y_pred * dt_hat, mu, sigma)
+                    '''
+                    with torch.autocast(device_type=device.type, enabled=False):
+                        delta_target_f32 = (norm_tgt - norm_in).to(dtype=torch.float32)
+                        dt_hat_f32 = dt_hat.to(dtype=torch.float32)
+                        rate_target_f32 = delta_target_f32 / dt_hat_f32.clamp_min(1e-12)
+                        
+                        # compare in fp32 (more stable), then cast loss back if you want
+                        y_pred_f32 = y_pred.to(dtype=torch.float32)
+                        center_loss = (F.huber_loss(y_pred_f32, rate_target_f32, delta=huber_delta)
+                                       if use_huber else F.l1_loss(y_pred_f32, rate_target_f32))
+
+                        y_pred_abs = _maybe_denorm(
+                            norm_in.to(dtype=torch.float32) + y_pred_f32 * dt_hat_f32,
+                            mu, sigma
+                        )
 
                     lap_loss = (laplacian_smoothness(y_pred, pei) if lap_w > 0 else y_pred.new_zeros(()))
                     tmp_loss = (temporal_consistency(x_in, norm_tgt) if tmp_w > 0 else y_pred.new_zeros(()))
@@ -2831,6 +2889,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, default=None, help="Path to JSON config")
     args = ap.parse_args()
+    print("Running main...", flush=True)
     main(args.config)
 
 

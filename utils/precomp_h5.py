@@ -9,6 +9,25 @@ except ImportError as e:
     raise ImportError("Option B.2 requires h5py (pip install h5py).") from e
 
 
+def _normalize_device(dev: Any) -> torch.device:
+    """
+    Make serialized devices portable across machines.
+
+    If an object was saved with device='cuda:0' on an HPC node, but we are loading
+    on a machine where CUDA is not available (e.g., macOS), fall back to CPU.
+    """
+    d = torch.device(dev) if not isinstance(dev, torch.device) else dev
+
+    if d.type == "cuda" and not torch.cuda.is_available():
+        return torch.device("cpu")
+
+    if d.type == "mps":
+        mps_ok = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        if not mps_ok:
+            return torch.device("cpu")
+
+    return d
+
 def _cfg_sha1(cfg: dict) -> str:
     s = json.dumps(cfg, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha1(s).hexdigest()
@@ -126,7 +145,8 @@ class LazyPrecompH5(dict):
         self.T = int(T)
         self.H = int(H)
         self.W = int(W)
-        self.device = torch.device(device)
+        #self.device = torch.device(device)
+        self.device = _normalize_device(device)
 
         self._f = None  # lazy-open per process
         self._meta_cache = {}  # cache scalar attrs/values
@@ -157,6 +177,8 @@ class LazyPrecompH5(dict):
     def __setstate__(self, state):
         self.__dict__.update(state)
         self._f = None
+        # Important: if this was pickled with device='cuda:0', fix it on machines without CUDA.
+        self.device = _normalize_device(getattr(self, "device", "cpu"))
 
     def close(self):
         if self._f is not None:
@@ -184,7 +206,8 @@ class LazyPrecompH5(dict):
         return g[name][...]
 
     def _to_torch(self, arr: np.ndarray, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-        return torch.from_numpy(arr).to(device=device, dtype=dtype)
+        dev = _normalize_device(device)
+        return torch.from_numpy(arr).to(device=dev, dtype=dtype)
 
     # -------- scalar metadata --------
     def _get_scalar(self, key: str):
