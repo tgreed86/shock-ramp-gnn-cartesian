@@ -25,7 +25,7 @@
   "train": {
     "precomp_cache_path": "./cache/all/shock_ramp_precomp_pLow85_pHigh95_faceAdj_DEC.h5",
     "precomp_force_recompute": false,
-    "epochs": 25,
+    "epochs": 5,
     "batch_size": 1,
     "lr": 0.0001,
     "weight_decay": 0.0,
@@ -95,17 +95,20 @@
     "dec": true,
     "parc": true,
     "parc_detach_ops": true,
-    "parc_include_adv": false,
+    "parc_include_adv": true,
     "parc_include_diff": true,
 
     "mode": "diffusion",
     "channels": ["density", "energy"],
-    "adv_weight": 0.0,
+    "adv_weight": 1.0,
     "diff_weight": 1.0,
     "nu": 0.0001,
 
-    "blend_weight": 1.0,
-    "residual_weight": 1e-6
+    "blend_weight": 0.0,
+    "residual_weight": 1e-6,
+
+    "rho_floor": 1e-6,
+    "u_clip": 1000.0
   },
 
   "eval": {
@@ -134,7 +137,8 @@
     "print_dec_checks": false,
     "print_loss_components": false,
     "nan_watch": false,
-    "nan_first_only": false
+    "nan_first_only": false,
+    "dbg_dec_ops": false
   },
   "speed": {
     "interp_chunk": 4096

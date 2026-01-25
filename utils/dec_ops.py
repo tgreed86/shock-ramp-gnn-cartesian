@@ -9,6 +9,63 @@ def _get_feature_name_list(cfg: dict) -> list[str] | None:
             return [str(x) for x in v]
     return None
 
+def _tstats(name: str, t: torch.Tensor, max_elems: int = 0):
+    if t is None:
+        print(f"[NAN-DBG] {name}: None")
+        return
+    if not torch.is_tensor(t):
+        print(f"[NAN-DBG] {name}: (non-tensor) {type(t)} = {t}")
+        return
+
+    tt = t.detach()
+    finite = torch.isfinite(tt) if tt.dtype.is_floating_point or tt.dtype.is_complex else None
+
+    n = tt.numel()
+    msg = f"[NAN-DBG] {name}: shape={tuple(tt.shape)} dtype={tt.dtype} dev={tt.device} "
+
+    # For float/complex: report finiteness and summary stats on finite values
+    if tt.dtype.is_floating_point or tt.dtype.is_complex:
+        nf = int(finite.sum().item())
+        msg += f"finite={nf}/{n} "
+        if nf > 0:
+            v = tt[finite]
+            msg += (
+                f"min={v.min().item():.3e} max={v.max().item():.3e} "
+                f"mean={v.mean().item():.3e} absmax={v.abs().max().item():.3e}"
+            )
+        else:
+            msg += "ALL_NONFINITE"
+        print(msg)
+
+        if max_elems > 0 and nf < n:
+            bad = torch.nonzero(~finite, as_tuple=False)
+            bad = bad[:max_elems]
+            print(f"[NAN-DBG] {name}: first nonfinite indices (up to {max_elems}): {bad.tolist()}")
+        return
+
+    # For non-float: no finiteness concept; report integer/bool stats
+    # Always safe: min/max
+    try:
+        tmin = tt.min().item()
+        tmax = tt.max().item()
+        msg += f"min={tmin} max={tmax} "
+    except Exception as e:
+        msg += f"(min/max failed: {repr(e)}) "
+        print(msg)
+        return
+
+    # If integer, report mean/absmax by casting to float FOR REPORTING ONLY
+    if tt.dtype in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8, torch.long):
+        v = tt.to(torch.float32)
+        msg += f"mean={v.mean().item():.3e} absmax={v.abs().max().item():.3e}"
+    elif tt.dtype == torch.bool:
+        msg += f"true_count={int(tt.sum().item())}/{n}"
+    else:
+        # fallback
+        pass
+
+    print(msg)
+
 def infer_feature_indices(cfg: dict, Fdim: int):
     """
     Returns indices for density, momx, momy, energy.
@@ -67,40 +124,116 @@ def dec_advdiff_terms_abs(
       r_adv_abs  = -div(u*phi)      [N,F]
       r_diff_abs =  nu * Lap(phi)   [N,F]   (per-channel nu)
       area       = cell area        [N]
-    These are unweighted by adv_weight/diff_weight; you apply weights outside.
 
-    Uses the same geometry unpacking & conventions as dec_advdiff_rate.
+    This version computes advection + diffusion ONLY for channels listed in:
+        cfg["loss"]["channels"]  (e.g., ["density","energy"])
+    and fills other channels with zeros.
     """
     loss = cfg.get("loss", {}) or {}
-    scheme = str(loss.get("advection_scheme", "upwind")).lower()
+    scheme  = str(loss.get("advection_scheme", "upwind")).lower()
     rho_eps = float(loss.get("rho_eps", 1e-8))
 
+    # Geometry
     nx, ny, face_len, _dual_len, tau = edge_attr_unpack(pred_ea)
-    area = cell_area_from_levels(levels, dx0=dx0, dy0=dy0, dtype=x_abs.dtype, device=x_abs.device)  # [N]
+    area = cell_area_from_levels(
+        levels, dx0=dx0, dy0=dy0, dtype=x_abs.dtype, device=x_abs.device
+    )  # [N]
 
-    # ----- advection component -----
+    N, Fdim = x_abs.shape
+
+    # ---- infer indices from feature names ----
+    # Expect infer_feature_indices(cfg, F) to return something like {"rho":0,"mx":1,"my":2,"E":3}
+    idx_map = infer_feature_indices(cfg, Fdim)
+
+    # Names users might put into cfg["loss"]["channels"]
+    # Map them to keys that idx_map contains.
+    name_to_key = {
+        "density": "rho",
+        "rho": "rho",
+        "mass": "rho",
+
+        "x_momentum": "mx",
+        "mx": "mx",
+        "momx": "mx",
+
+        "y_momentum": "my",
+        "my": "my",
+        "momy": "my",
+
+        "energy": "E",
+        "e": "E",
+        "total_energy": "E",
+    }
+
+    channels = loss.get("channels", None)
+    if channels is None:
+        # default consistent with your intent
+        channels = ["density", "energy"]
+
+    sel = []
+    for ch in channels:
+        ch_norm = str(ch).strip().lower()
+        if ch_norm not in name_to_key:
+            raise ValueError(
+                f"Unknown channel name '{ch}'. Expected one of: {sorted(name_to_key.keys())}"
+            )
+        key = name_to_key[ch_norm]
+        if key not in idx_map:
+            raise ValueError(
+                f"infer_feature_indices did not return key '{key}'. Got keys: {sorted(idx_map.keys())}"
+            )
+        sel.append(int(idx_map[key]))
+
+    # de-duplicate while preserving order
+    seen = set()
+    sel = [i for i in sel if not (i in seen or seen.add(i))]
+
+    # If user config accidentally empties channels, just return zeros
+    r_adv = torch.zeros_like(x_abs)
+    r_diff = torch.zeros_like(x_abs)
+    if len(sel) == 0:
+        return r_adv, r_diff, area
+
+    phi_sel = x_abs[:, sel]  # [N, Csel]
+
+    # ----- advection component (only for selected channels) -----
     if compute_adv:
+        # Velocity is still computed from full state (needs rho,mx,my).
         vel = compute_velocity_from_state(x_abs, cfg, eps=rho_eps)  # [N,2]
-        div_adv = dec_divergence_advective_flux(
-            phi=x_abs,
+        div_adv_sel = dec_divergence_advective_flux(
+            phi=phi_sel,
             vel=vel,
             edge_index=edge_index,
             nx=nx, ny=ny,
             face_len=face_len,
             area=area,
             scheme=scheme,
-        )
-        r_adv = -div_adv
-    else:
-        r_adv = torch.zeros_like(x_abs)
+        )  # [N, Csel]
+        r_adv[:, sel] = -div_adv_sel
 
-    # ----- diffusion component -----
+    dbg = bool(cfg.get("debug", {}).get("dbg_dec_ops", False))
+    if dbg:
+        idx = infer_feature_indices(cfg, x_abs.size(1))
+        rho = x_abs[:, idx["rho"]]
+        mx  = x_abs[:, idx["mx"]]
+        my  = x_abs[:, idx["my"]]
+        print("\n[DEC-DBG] velocity inputs")
+        print("  rho<=0 count:", int((rho <= 0).sum().item()))
+        print("  |rho|<1e-8 count:", int((rho.abs() < 1e-8).sum().item()))
+        _tstats("rho", rho)
+        _tstats("mx", mx)
+        _tstats("my", my)
+        _tstats("vel(ux,uy)", vel)
+        if not torch.isfinite(vel).all():
+            bad = (~torch.isfinite(vel)).any(dim=1).nonzero(as_tuple=False).view(-1)
+            print("[DEC-DBG] nonfinite vel rows (first 10):", bad[:10].tolist())
+
+    # ----- diffusion component (only for selected channels) -----
     if compute_diff:
-        nu = as_nu_tensor(loss.get("nu", 0.0), x_abs.size(1), device=x_abs.device, dtype=x_abs.dtype)  # [F]
-        lap = dec_laplacian(x_abs, edge_index=edge_index, tau=tau, area=area)  # [N,F]
-        r_diff = lap * nu.view(1, -1)
-    else:
-        r_diff = torch.zeros_like(x_abs)
+        nu_full = as_nu_tensor(loss.get("nu", 0.0), Fdim, device=x_abs.device, dtype=x_abs.dtype)  # [F]
+        nu_sel = nu_full[sel]  # [Csel]
+        lap_sel = dec_laplacian(phi_sel, edge_index=edge_index, tau=tau, area=area)  # [N, Csel]
+        r_diff[:, sel] = lap_sel * nu_sel.view(1, -1)
 
     return r_adv, r_diff, area
 
@@ -335,17 +468,35 @@ def dec_divergence_advective_flux(
 
 def compute_velocity_from_state(x_abs: torch.Tensor, cfg: dict, eps: float = 1e-8):
     """
-    Derives velocity from conserved variables using u = (mx/rho, my/rho).
-    x_abs: [N,F] absolute units
+    Derives velocity from conserved variables using u = (mx/rho, my/rho),
+    with robust clipping to prevent advection overflow when rho is floored.
     """
+    loss = cfg.get("loss", {}) or {}
+
+    # floors / clips (tune as needed)
+    rho_floor = float(loss.get("rho_floor", 1e-6))
+    u_clip    = float(loss.get("u_clip", 1e3))   # start generous; your normal |u| is ~O(10-40)
+
     Fdim = x_abs.size(1)
     idx = infer_feature_indices(cfg, Fdim)
-    rho = x_abs[:, idx["rho"]].clamp_min(eps)
+
+    rho = x_abs[:, idx["rho"]]
     mx  = x_abs[:, idx["mx"]]
     my  = x_abs[:, idx["my"]]
-    ux = mx / rho
-    uy = my / rho
+
+    # avoid division by tiny/negative rho
+    rho_safe = rho.clamp_min(max(eps, rho_floor))
+
+    ux = mx / rho_safe
+    uy = my / rho_safe
+
+    # Smooth clip (preferred) to avoid hard kinks
+    if u_clip > 0:
+        ux = u_clip * torch.tanh(ux / u_clip)
+        uy = u_clip * torch.tanh(uy / u_clip)
+
     return torch.stack([ux, uy], dim=1)  # [N,2]
+
 
 def as_nu_tensor(nu, Fdim: int, *, device, dtype):
     """

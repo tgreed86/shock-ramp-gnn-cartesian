@@ -651,6 +651,37 @@ def _assert_finite(name: str, t: torch.Tensor, crash: bool = True):
             raise RuntimeError(f"Non-finite detected in {name}")
     return ok
 
+def sanitize_state_for_ops(x_abs: torch.Tensor, cfg: dict, rho_floor=1e-6, E_floor=1e-6):
+    loss = cfg.get("loss", {}) or {}
+    u_clip = float(loss.get("u_clip", 1e3))
+
+    idx = dec.infer_feature_indices(cfg, x_abs.size(1))
+    out = x_abs.clone()
+
+    rho = out[:, idx["rho"]].clamp_min(rho_floor)
+    E   = out[:, idx["E"]].clamp_min(E_floor)
+
+    mx = out[:, idx["mx"]]
+    my = out[:, idx["my"]]
+
+    # enforce |u| <= u_clip by clamping momenta given rho
+    if u_clip > 0:
+        mx = mx.clamp(-u_clip * rho, u_clip * rho)
+        my = my.clamp(-u_clip * rho, u_clip * rho)
+
+    out[:, idx["rho"]] = rho
+    out[:, idx["E"]]   = E
+    out[:, idx["mx"]]  = mx
+    out[:, idx["my"]]  = my
+    return out
+
+def _enforce_physical_state(x_abs: torch.Tensor, rho_floor=1e-6, E_floor=1e-6):
+    # assumes [rho, mx, my, E]
+    x = x_abs.clone()
+    x[:, 0] = x[:, 0].clamp_min(rho_floor)   # rho
+    x[:, 3] = x[:, 3].clamp_min(E_floor)     # E (optional, but strongly recommended)
+    return x
+
 def train_one_epoch_multi_step(
     model,
     loader,
@@ -696,6 +727,30 @@ def train_one_epoch_multi_step(
 
     def _mark_printed():
         train_one_epoch_multi_step._nan_printed = True
+
+    def _dump_state(tag, x):
+        # expects channels [rho,mx,my,E] in first 4 or via infer_feature_indices
+        idx_map = dec.infer_feature_indices(cfg, x.size(1))
+        rho = x[:, idx_map["rho"]]
+        mx  = x[:, idx_map["mx"]]
+        my  = x[:, idx_map["my"]]
+        E   = x[:, idx_map["E"]]
+        rho_abs = rho.abs()
+
+        print(f"\n[NAN-DBG][{tag}] x stats")
+        _tstats("x", x)
+        _tstats("rho", rho)
+        print("  rho<=0 count:", int((rho <= 0).sum().item()))
+        print("  |rho|<1e-6 count:", int((rho_abs < 1e-6).sum().item()))
+        _tstats("mx", mx)
+        _tstats("my", my)
+        _tstats("E", E)
+
+        rho_safe = rho_abs.clamp_min(1e-12)  # diagnostic only
+        ux = mx / rho_safe
+        uy = my / rho_safe
+        _tstats("ux=mx/|rho|", ux)
+        _tstats("uy=my/|rho|", uy)
 
     # ---- dx,dy ----
     if dx is None or dy is None:
@@ -818,6 +873,21 @@ def train_one_epoch_multi_step(
                     _tstats("sigma", sigma)
                 if mu is not None and torch.is_tensor(mu):
                     _tstats("mu", mu)
+
+                # assumes channels [rho, mx, my, E] in x_in_abs
+                rho = x_in_abs[:, 0]
+                mx  = x_in_abs[:, 1]
+                my  = x_in_abs[:, 2]
+
+                rho_safe = rho.abs().clamp_min(1e-12)
+                ux = mx / rho_safe
+                uy = my / rho_safe
+
+                _tstats("rho", rho)
+                print(f"[NAN-debug] |rho|<1e-6 count: {(rho.abs() < 1e-6).sum().item()} / {rho.numel()}")
+                _tstats("ux(mx/rho_safe)", ux)
+                _tstats("uy(my/rho_safe)", uy)
+
                 _mark_printed()
 
             _assert_finite("norm_in", norm_in)
@@ -910,10 +980,33 @@ def train_one_epoch_multi_step(
                         # Only compute what you need (PARC may still want both; we handle that explicitly below)
                         need_adv  = (abs(adv_w) > 0.0) or bool(loss_cfg.get("parc_use_adv", True))
                         need_diff = (abs(diff_w) > 0.0) or bool(loss_cfg.get("parc_use_diff", True))
+                        #x_for_ops = _enforce_physical_state(x_in_abs, rho_floor=1e-6, E_floor=1e-6)
+                        x_for_ops = sanitize_state_for_ops(x_in_abs, cfg, rho_floor=1e-6, E_floor=1e-6)
+
+                        # Triggered dump: only when state is already “dangerous”
+                        if torch.is_tensor(x_in_abs):
+                            danger = (
+                                (~torch.isfinite(x_in_abs)).any()
+                                or (x_in_abs.abs().max() > 1e6)          # tune threshold
+                            )
+                            if danger:
+                                print(f"\n[NAN-DBG] step={step_k} TRIGGER: x_in_abs looks dangerous before ops")
+                                _dump_state("x_in_abs", x_in_abs)
+
+                        # after enforce_physical_state
+                        if torch.is_tensor(x_for_ops):
+                            danger2 = (
+                                (~torch.isfinite(x_for_ops)).any()
+                                or (x_for_ops.abs().max() > 1e6)
+                            )
+                            if danger2:
+                                print(f"\n[NAN-DBG] step={step_k} TRIGGER: x_for_ops looks dangerous after enforce")
+                                _dump_state("x_for_ops", x_for_ops)
 
                         with torch.autocast(device_type=device.type, enabled=False):
                             r_adv_abs, r_diff_abs, area = dec.dec_advdiff_terms_abs(
-                                x_abs=x_in_abs.float(),
+                                #x_abs=x_in_abs.float(),
+                                x_abs=x_for_ops.float(),
                                 edge_index=pei.long(),
                                 pred_ea=pea.float(),
                                 levels=pred_levels.long().to(device),
@@ -931,12 +1024,47 @@ def train_one_epoch_multi_step(
                                 raise RuntimeError("dec_advdiff_terms_abs returned r_diff_abs=None but need_diff=True")
 
                             # Build baseline in a way that NEVER does 0*inf
+                            '''
                             r_phy_abs = torch.zeros_like(x_in_abs.float())
                             if abs(diff_w) > 0.0:
                                 r_phy_abs = r_phy_abs + diff_w * r_diff_abs
                             if abs(adv_w) > 0.0:
                                 r_phy_abs = r_phy_abs + adv_w * r_adv_abs
+                            '''
+                            r_phy_abs = None
+                            
+                            if (dec_blend_w != 0.0) or (dec_resid_w != 0.0):
+                                base = None
+                                if (diff_w != 0.0) and (r_diff_abs is not None):
+                                    base = diff_w * r_diff_abs
+                                else:
+                                    # need a correctly-shaped zero tensor
+                                    ref = r_diff_abs if r_diff_abs is not None else r_adv_abs
+                                    base = torch.zeros_like(ref)
 
+                                if (adv_w != 0.0) and (r_adv_abs is not None):
+                                    base = base + adv_w * r_adv_abs
+
+                                r_phy_abs = base
+                            '''
+                            # Build baseline in a way that NEVER overflows float32 during the sum
+                            phy_clip = float(loss_cfg.get("phy_clip_abs", 1e20))  # pick something generous first
+
+                            base64 = None
+                            if (diff_w != 0.0) and (r_diff_abs is not None):
+                                base64 = (diff_w * r_diff_abs).double()
+                            else:
+                                ref = r_diff_abs if r_diff_abs is not None else r_adv_abs
+                                base64 = torch.zeros_like(ref).double()
+
+                            if (adv_w != 0.0) and (r_adv_abs is not None):
+                                base64 = base64 + (adv_w * r_adv_abs).double()
+
+                            # clamp in float64 to avoid inf when casting back
+                            base64 = base64.clamp(min=-phy_clip, max=phy_clip)
+
+                            r_phy_abs = base64.to(dtype=torch.float32)
+                            '''
                         # channel mask: apply baseline only to configured physics channels
                         ch_mask = dec.build_channel_mask_from_loss(
                             cfg, x_in_abs.size(1), device=device, dtype=torch.float32
@@ -963,7 +1091,10 @@ def train_one_epoch_multi_step(
                     _assert_finite("r_adv_abs", r_adv_abs, crash=False)
                     _assert_finite("r_diff_abs", r_diff_abs, crash=False)
                     _assert_finite("area", area)
-                    _assert_finite("r_phy_abs", r_phy_abs)
+                    #_assert_finite("r_adv_abs", r_adv_abs)
+                    if r_phy_abs is not None:
+                        _assert_finite("r_phy_abs", r_phy_abs)
+
 
                 # ----- build node input X (PARC appends operator inputs) -----
                 x_in = _build_X(norm_in, pred_centers, pred_levels, cfg)
@@ -1640,7 +1771,8 @@ def evaluate_one_epoch_multi_step(
                     batch=batch,
                 )
 
-                pred_feats_k = y_pred_abs_k
+                #pred_feats_k = y_pred_abs_k
+                pred_feats_k = _enforce_physical_state(y_pred_abs_k, rho_floor=1e-6, E_floor=1e-6)
 
     # ---- finalize metrics ----
     eps = 1e-12

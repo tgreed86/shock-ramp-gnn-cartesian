@@ -72,6 +72,7 @@ from train import (
     evaluate_one_epoch_multi_step,
     _get_bbox,
 )
+from utils_geom import build_idw_map, apply_idw_map
 
 
 # ----------------- Logging helpers ----------------- #
@@ -702,6 +703,40 @@ def plot_rollout_metrics_maew_rell2w(
         "paths": paths,
     }
 
+def _fill_internal_nans_nearest(img_flat: torch.Tensor, HH: int, WW: int) -> torch.Tensor:
+    """
+    Fill only NaN 'holes' that are enclosed by valid pixels (i.e., interior gaps),
+    leaving the exterior/background (connected to boundary) untouched.
+    """
+
+    try:
+        from scipy import ndimage as ndi
+    except ImportError as e:
+        raise ImportError("This hole-filling helper requires scipy (scipy.ndimage).") from e
+
+    arr = img_flat.view(HH, WW, -1).cpu().numpy()  # (HH,WW,C)
+    out = arr.copy()
+
+    # A pixel is "valid" if it has finite values (use any channel; or require all channels)
+    valid = np.isfinite(arr[..., 0])
+
+    # Fill holes *inside* the valid region; does NOT fill exterior/background.
+    filled = ndi.binary_fill_holes(valid)
+    holes = filled & (~valid)
+    if not holes.any():
+        return img_flat  # nothing to do
+
+    # Nearest-neighbor indices to the closest valid pixel for every location
+    # distance_transform_edt works on True=background; we want background = invalid
+    _, (iy, ix) = ndi.distance_transform_edt(~valid, return_indices=True)
+
+    # Copy nearest valid pixel values into hole pixels (for every channel)
+    for c in range(out.shape[2]):
+        chan = out[..., c]
+        chan[holes] = chan[iy[holes], ix[holes]]
+        out[..., c] = chan
+
+    return torch.from_numpy(out.reshape(-1, out.shape[2])).to(dtype=img_flat.dtype)
 
 @torch.inference_mode()
 def make_rollout_gifs_raster(
@@ -931,6 +966,9 @@ def make_rollout_gifs_raster(
                 A_img, HH, WW = _rasterize_block_common(A_cent, A_lev, A_val, H, W, bbox, step_lmax)
                 B_img, _,  _  = _rasterize_block_common(B_cent, B_lev, B_val, H, W, bbox, step_lmax)
 
+            A_img = _fill_internal_nans_nearest(A_img, HH, WW)
+            B_img = _fill_internal_nans_nearest(B_img, HH, WW)
+
             # TOP clims from GT(t+1) ONLY
             global_top_min_f = torch.minimum(global_top_min_f, _nanmin_per_feature(B_img))
             global_top_max_f = torch.maximum(global_top_max_f, _nanmax_per_feature(B_img))
@@ -1010,7 +1048,7 @@ def make_rollout_gifs_raster(
             else:
                 print(f"[MESH] step={step} t={t} N={n} sum10={s10:.6e} (ΔN={n-prev_n:+d}, Δsum10={s10-prev_s:+.3e})")
             prev_n, prev_s = n, s10
-
+            
             # rasterize three “top-row” fields onto a common grid
             if raster_mode.lower() == "idw":
                 A_img, HH, WW = _rasterize_idw(A_cent, A_val, raster_bins, raster_k, bbox, raster_chunk)
@@ -1024,14 +1062,48 @@ def make_rollout_gifs_raster(
                 B_img, _,  _  = _rasterize_block_common(B_cent, B_lev, B_val, H, W, bbox, step_lmax)
                 P_img, _,  _  = _rasterize_block_common(P_cent, P_lev, P_val, H, W, bbox, step_lmax)
                 mesh_label = f"(block @ {HH}×{WW}, Lmax={step_lmax})"
+            
+            A_img = _fill_internal_nans_nearest(A_img, HH, WW)
+            B_img = _fill_internal_nans_nearest(B_img, HH, WW)
 
             # Diagnostic: rasterized level map (what refinement is actually present)
             P_level_img, HH, WW = _rasterize_block_common(P_cent, P_lev, P_lev.to(torch.float32)[:, None], H, W, bbox, step_lmax)
             B_level_img, B_HH, B_WW = _rasterize_block_common(B_cent, B_lev, B_lev.to(torch.float32)[:, None], H, W, bbox, step_lmax)
 
             # deltas on the same raster grid
+            #Dgt = (B_img - A_img)  # GT(t+1)-GT(t)
+            #Dpg = (P_img - B_img)  # Pred(t+1)-GT(t+1)
+            #Dpt = (P_img - A_img)  # Pred(t+1)-GT(t)
+
+            # deltas on the same raster grid
             Dgt = (B_img - A_img)  # GT(t+1)-GT(t)
-            Dpg = (P_img - B_img)  # Pred(t+1)-GT(t+1)
+
+            if raster_mode.lower() == "block":
+                # Map GT(t+1) features onto Pred(t+1) centers (IDW on centers)
+                idx_tp1, w_tp1 = build_idw_map(
+                    dst_xy=P_cent.to(dtype=torch.float32, device="cpu"),
+                    src_xy=B_cent.to(dtype=torch.float32, device="cpu"),
+                    k=raster_k,          # or choose a separate map_k if desired
+                    chunk=raster_chunk,  # keep consistent with raster settings
+                )
+                gt_tp1_on_pred = apply_idw_map(
+                    idx_tp1, w_tp1, B_val.to(dtype=torch.float32, device="cpu")
+                )  # (N_pred, F)
+
+                # Rasterize that mapped GT(t+1) using the *Pred mesh geometry*
+                B_on_pred_img, _, _ = _rasterize_block_common(
+                    centers=P_cent,
+                    levels=P_lev,
+                    values=gt_tp1_on_pred,
+                    H=H, W=W, bbox=bbox, Lmax=step_lmax,
+                )
+
+                # Δ₂ on Pred mesh (rasterized)
+                Dpg = (P_img - B_on_pred_img)
+            else:
+                # IDW raster already yields dense grids; the direct diff is fine
+                Dpg = (P_img - B_img)
+
             Dpt = (P_img - A_img)  # Pred(t+1)-GT(t)
 
             # per-feature frames
@@ -1269,12 +1341,14 @@ def main():
 
     # ----- Precomp -----
     precomp = None
+    print("args.precomp_path:", args.precomp_path)
     if args.precomp_path is not None:
         log(f"[INFO] Loading precomp from {args.precomp_path}")
-        precomp = torch.load(args.precomp_path, map_location="cpu")
+        precomp = torch.load(args.precomp_path, map_location="cpu", weights_only=False)
     elif (not args.recompute_precomp) and ("precomp" in ckpt):
         log("[INFO] Using precomp from checkpoint.")
         precomp = ckpt["precomp"]
+    print("precomp:", precomp)
 
     if precomp is None:
         steps = getattr(full_ds, "steps", None)
