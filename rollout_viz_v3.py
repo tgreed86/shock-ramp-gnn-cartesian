@@ -771,8 +771,7 @@ def make_rollout_gifs_raster(
       - raster_mode="block" uses AMR block replication to a fine uniform grid; fast and memory-safe.
       - raster_mode="idw" is expensive for large N (uses cdist to all centers); generally avoid for big meshes.
     """
-    import os
-    import numpy as np
+
     import imageio
     import matplotlib.pyplot as plt
 
@@ -1398,6 +1397,16 @@ def main():
     model.to(device)
     model.eval()
 
+    # Output dir
+    if args.out_dir is not None:
+        out_dir = args.out_dir
+    else:
+        save_dir = cfg.get("train", {}).get("save_dir", ".")
+        out_dir = os.path.join(save_dir, f"rollout_t{start_t}_H{horizon}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    budget_csv_path = os.path.join(out_dir, "rollout_budgets.csv")
+
     # Norm stats
     norm_stats = ckpt.get("norm_stats", None)
     if norm_stats is not None and norm_stats.get("mu") is not None:
@@ -1422,6 +1431,8 @@ def main():
             mu=mu,
             sigma=sigma,
             collect_examples=True,
+            budget_csv_path=budget_csv_path, 
+            write_budgets=True,
         )
     #log(f"[TEST] loss={test_loss:.4e}, MAE={test_mae:.4e}")
     log(f"[TEST] loss={test_loss:.4e}")
@@ -1439,14 +1450,6 @@ def main():
         if "bbox" not in ex:
             xmin, xmax, ymin, ymax = _get_bbox(cfg)
             ex["bbox"] = (float(xmin), float(xmax), float(ymin), float(ymax))
-
-    # Output dir
-    if args.out_dir is not None:
-        out_dir = args.out_dir
-    else:
-        save_dir = cfg.get("train", {}).get("save_dir", ".")
-        out_dir = os.path.join(save_dir, f"rollout_t{start_t}_H{horizon}")
-    os.makedirs(out_dir, exist_ok=True)
 
     feat_names = cfg.get("features", {}).get("names", None)
 

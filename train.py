@@ -20,7 +20,7 @@ Also produces qualitative PDFs of feature fields per sample using
 from __future__ import annotations
 print("[train.py] module import started", flush=True)
 from typing import Dict, Any, List, Tuple
-import os, io, json, time, zipfile, random, hashlib
+import os, io, json, time, zipfile, random, hashlib, sys, csv
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, Subset
@@ -134,6 +134,12 @@ def _compute_norm_stats_from_loader(loader, device):
     # Keep them on the same device; _maybe_norm moves them to x.device later.
     return mean, std
 
+def save_config(run_dir: str, cfg: dict, argv=None):
+    argv = list(sys.argv) if argv is None else argv
+
+    # 1) resolved config                                                                                                                                                      
+    with open(os.path.join(run_dir, "config.json"), "w") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True)
 
 def _maybe_norm(x: torch.Tensor, mu, sigma):
     """
@@ -249,6 +255,75 @@ def move_precomp_to_device(precomp, device):
 
     return out
 
+def _budget_feature_indices(cfg: dict, Fdim: int):
+    # Use your existing helper (same one used in dec_ops ensures correct mapping)
+    return dec.infer_feature_indices(cfg, Fdim)
+
+def _compute_budget_row(*, x_abs: torch.Tensor, levels: torch.Tensor, dx0: float, dy0: float, cfg: dict):
+    """
+    Compute global integrals on the mesh defined by `levels`.
+    x_abs: (N,F) absolute conserved variables on THAT mesh.
+    levels: (N,) refinement levels for that same mesh.
+    Returns: area, mass, mom_x, mom_y, energy  (floats)
+    """
+    # Keep everything in float32 for MPS safety
+    x = x_abs.detach().to(device="cpu", dtype=torch.float32)
+    lev = levels.detach().to(device="cpu", dtype=torch.int64).view(-1)
+
+    w = dec.cell_area_from_levels(lev, dx0=float(dx0), dy0=float(dy0),
+                                  dtype=torch.float32, device=torch.device("cpu"))  # (N,)
+
+    idx = _budget_feature_indices(cfg, int(x.shape[1]))
+    rho = x[:, idx["rho"]]
+    mx  = x[:, idx["mx"]]
+    my  = x[:, idx["my"]]
+    E   = x[:, idx["E"]]
+
+    area   = float(w.sum().item())
+    mass   = float((w * rho).sum().item())
+    mom_x  = float((w * mx ).sum().item())
+    mom_y  = float((w * my ).sum().item())
+    energy = float((w * E  ).sum().item())
+    return area, mass, mom_x, mom_y, energy
+
+def _global_integrals_on_mesh(x_abs: torch.Tensor, area: torch.Tensor, cfg: dict):
+    """
+    x_abs: [N,F] absolute units (rho, mx, my, E assumed by infer_feature_indices)
+    area:  [N]   cell area in physical units
+    Returns python floats computed on CPU in float64 for stability (works on MPS).
+    """
+    idx = dec.infer_feature_indices(cfg, x_abs.size(1))
+    rho = x_abs[:, idx["rho"]]
+    mx  = x_abs[:, idx["mx"]]
+    my  = x_abs[:, idx["my"]]
+    E   = x_abs[:, idx["E"]]
+
+    # compute on CPU/float64 to avoid MPS float64 limitations on-tensor ops
+    a_cpu   = area.detach().cpu().double()
+    rho_cpu = rho.detach().cpu().double()
+    mx_cpu  = mx.detach().cpu().double()
+    my_cpu  = my.detach().cpu().double()
+    E_cpu   = E.detach().cpu().double()
+
+    M  = (rho_cpu * a_cpu).sum().item()
+    Px = (mx_cpu  * a_cpu).sum().item()
+    Py = (my_cpu  * a_cpu).sum().item()
+    Et = (E_cpu   * a_cpu).sum().item()
+
+    return {"M": M, "Px": Px, "Py": Py, "E": Et}
+
+
+def _budget_row(tag: str, step_k: int, dt_phys: float, budgets: dict):
+    # flatten into a simple dict suitable for logging / CSV
+    return {
+        "tag": tag,
+        "step_k": int(step_k),
+        "dt_phys": float(dt_phys),
+        "M": float(budgets["M"]),
+        "Px": float(budgets["Px"]),
+        "Py": float(budgets["Py"]),
+        "E": float(budgets["E"]),
+    }
 
 # -------------------- Fast kNN‑IDW interpolation (vectorized) --------------------
 # This replaces expensive Python loops and can be cached per sample.
@@ -565,6 +640,13 @@ def _require_list(batch, name):
         )
     return batch[name]
 
+def _as_stat_tensor(v, *, device, dtype):
+                    if v is None:
+                        return None
+                    if torch.is_tensor(v):
+                        return v.to(device=device, dtype=dtype)
+                    return torch.as_tensor(v, device=device, dtype=dtype)
+
 def _pred_mesh_for_step_strict(k_idx, *, pred_lists):
     """
     Return predicted geometry for the DESTINATION step (k_idx+1).
@@ -714,6 +796,8 @@ def train_one_epoch_multi_step(
     dbg = cfg.get("debug", {})
     nan_watch = bool(dbg.get("nan_watch", True))          # turn on/off
     nan_watch_first_only = bool(dbg.get("nan_first_only", True))
+
+    budget_rows = []
 
     if not hasattr(train_one_epoch_multi_step, "_nan_printed"):
         train_one_epoch_multi_step._nan_printed = False
@@ -923,6 +1007,29 @@ def train_one_epoch_multi_step(
                 if (dt_hat <= 0).any():
                     print("[NAN-DBG][WARN] dt_hat has non-positive values")
 
+            # area on the pred mesh for THIS step
+            # (use float32 on device; we move to CPU in the integrals function anyway)
+            area_pred = dec.cell_area_from_levels(
+                pred_levels.long().to(device),
+                dx0=float(dx),
+                dy0=float(dy),
+                dtype=torch.float32,
+                device=device,
+            )  # [N]
+
+            dbg_cfg = cfg.get("debug", {}) or {}
+            budget_watch = bool(dbg_cfg.get("budget_watch", True))
+            budget_every = int(dbg_cfg.get("budget_every", 1))  # set to >1 to reduce spam
+
+            sigma_f32 = _as_stat_tensor(sigma, device=device, dtype=torch.float32)
+            mu_f32    = _as_stat_tensor(mu,    device=device, dtype=torch.float32)  # if you ever need it here
+
+            if sigma_f32 is not None:
+                sigma_f32 = sigma_f32.clamp_min(1e-12)
+
+            dt_phys_f32 = dt_phys.to(device=device, dtype=torch.float32)
+            dt_ref_f32  = (dt_ref_t.to(device=device, dtype=torch.float32) if dt_ref_t is not None else None)
+
             with amp_ctx():
                 pei = pred_ei.to(device) if torch.is_tensor(pred_ei) else pred_ei
                 pea = pred_ea.to(device) if (pred_ea is not None and torch.is_tensor(pred_ea)) else pred_ea
@@ -974,12 +1081,21 @@ def train_one_epoch_multi_step(
 
                 if need_phy:
                     with torch.autocast(device_type=device.type, enabled=False):
+
+                        # Only apply advection physics at step 0
+                        adv_step_gate = (step_k == 0)
+
                         adv_w  = float(loss_cfg.get("adv_weight", 1.0))
                         diff_w = float(loss_cfg.get("diff_weight", 1.0))
 
-                        # Only compute what you need (PARC may still want both; we handle that explicitly below)
-                        need_adv  = (abs(adv_w) > 0.0) or bool(loss_cfg.get("parc_use_adv", True))
-                        need_diff = (abs(diff_w) > 0.0) or bool(loss_cfg.get("parc_use_diff", True))
+                        # Use your real keys (parc_include_adv/diff), defaulting True only if you want that behavior.
+                        include_adv_cfg  = bool(loss_cfg.get("parc_include_adv", True))
+                        include_diff_cfg = bool(loss_cfg.get("parc_include_diff", True))
+
+                        # Compute flags for DEC operator evaluation this step
+                        need_adv  = (adv_step_gate and include_adv_cfg  and (adv_w != 0.0))
+                        need_diff = (include_diff_cfg and (diff_w != 0.0))
+
                         #x_for_ops = _enforce_physical_state(x_in_abs, rho_floor=1e-6, E_floor=1e-6)
                         x_for_ops = sanitize_state_for_ops(x_in_abs, cfg, rho_floor=1e-6, E_floor=1e-6)
 
@@ -1023,58 +1139,32 @@ def train_one_epoch_multi_step(
                             if (r_diff_abs is None) and need_diff:
                                 raise RuntimeError("dec_advdiff_terms_abs returned r_diff_abs=None but need_diff=True")
 
-                            # Build baseline in a way that NEVER does 0*inf
-                            '''
-                            r_phy_abs = torch.zeros_like(x_in_abs.float())
-                            if abs(diff_w) > 0.0:
-                                r_phy_abs = r_phy_abs + diff_w * r_diff_abs
-                            if abs(adv_w) > 0.0:
-                                r_phy_abs = r_phy_abs + adv_w * r_adv_abs
-                            '''
+                            if not adv_step_gate:
+                                r_adv_abs = None
+
                             r_phy_abs = None
-                            
                             if (dec_blend_w != 0.0) or (dec_resid_w != 0.0):
-                                base = None
-                                if (diff_w != 0.0) and (r_diff_abs is not None):
+                                # Start from diffusion baseline (or zeros)
+                                if need_diff and (r_diff_abs is not None):
                                     base = diff_w * r_diff_abs
                                 else:
                                     # need a correctly-shaped zero tensor
-                                    ref = r_diff_abs if r_diff_abs is not None else r_adv_abs
+                                    ref = r_diff_abs if (r_diff_abs is not None) else r_adv_abs
+                                    if ref is None:
+                                        # Shouldn't happen if need_phy, but keep safe
+                                        ref = x_in_abs.float()
                                     base = torch.zeros_like(ref)
 
-                                if (adv_w != 0.0) and (r_adv_abs is not None):
+                                # Add advection only at step 0 (because need_adv includes adv_step_gate)
+                                if need_adv and (r_adv_abs is not None):
                                     base = base + adv_w * r_adv_abs
 
                                 r_phy_abs = base
-                            '''
-                            # Build baseline in a way that NEVER overflows float32 during the sum
-                            phy_clip = float(loss_cfg.get("phy_clip_abs", 1e20))  # pick something generous first
 
-                            base64 = None
-                            if (diff_w != 0.0) and (r_diff_abs is not None):
-                                base64 = (diff_w * r_diff_abs).double()
-                            else:
-                                ref = r_diff_abs if r_diff_abs is not None else r_adv_abs
-                                base64 = torch.zeros_like(ref).double()
-
-                            if (adv_w != 0.0) and (r_adv_abs is not None):
-                                base64 = base64 + (adv_w * r_adv_abs).double()
-
-                            # clamp in float64 to avoid inf when casting back
-                            base64 = base64.clamp(min=-phy_clip, max=phy_clip)
-
-                            r_phy_abs = base64.to(dtype=torch.float32)
-                            '''
-                        # channel mask: apply baseline only to configured physics channels
-                        ch_mask = dec.build_channel_mask_from_loss(
-                            cfg, x_in_abs.size(1), device=device, dtype=torch.float32
-                        )
-                        if ch_mask is None:
-                            # default to rho + E (your intent) if not provided
-                            idx_map = dec.infer_feature_indices(cfg, x_in_abs.size(1))
-                            ch_mask = torch.zeros((x_in_abs.size(1),), device=device, dtype=torch.float32)
-                            ch_mask[idx_map["rho"]] = 1.0
-                            ch_mask[idx_map["E"]] = 1.0
+                        # Channel mask: use the same selection logic as PARC inputs
+                        sel = dec.parc_select_feature_indices(cfg, x_in_abs.size(1))  # list[int]
+                        ch_mask = torch.zeros((x_in_abs.size(1),), device=device, dtype=torch.float32)
+                        ch_mask[torch.as_tensor(sel, device=device)] = 1.0
 
                     # ---------------------------
                     # NAN DEBUG: physics operator outputs
@@ -1095,7 +1185,7 @@ def train_one_epoch_multi_step(
                     if r_phy_abs is not None:
                         _assert_finite("r_phy_abs", r_phy_abs)
 
-
+                """
                 # ----- build node input X (PARC appends operator inputs) -----
                 x_in = _build_X(norm_in, pred_centers, pred_levels, cfg)
 
@@ -1113,6 +1203,48 @@ def train_one_epoch_multi_step(
                     )
                     if parc_extra.numel() > 0:
                         x_in = torch.cat([x_in, parc_extra], dim=1)
+                """
+                # ----- build node input X (PARC appends operator inputs) -----
+                x_in = _build_X(norm_in, pred_centers, pred_levels, cfg)
+
+                # Allow diffusion-only or advection-only PARC inputs:
+                # If one operator term is missing (None), substitute a correctly-shaped zero tensor.
+                parc_extra = None
+                if parc_use:
+                    if (r_adv_abs is None) and (r_diff_abs is None):
+                        parc_extra = None
+                    else:
+                        # Pick a reference tensor to define shape/device
+                        ref = r_diff_abs if (r_diff_abs is not None) else r_adv_abs
+                        assert ref is not None, "Internal: ref should not be None here."
+
+                        r_adv_in  = r_adv_abs  if (r_adv_abs  is not None) else torch.zeros_like(ref)
+                        r_diff_in = r_diff_abs if (r_diff_abs is not None) else torch.zeros_like(ref)
+
+                        # Optional: if you have a channel mask (e.g., rho+E only), apply it consistently
+                        # so PARC inputs don't inject junk into channels you don't trust.
+                        if ch_mask is not None:
+                            cm = ch_mask.to(device=device, dtype=torch.float32).view(1, -1)
+                            r_adv_in  = r_adv_in  * cm
+                            r_diff_in = r_diff_in * cm
+
+                        parc_extra = dec.parc_terms_to_node_inputs(
+                            r_adv_in.to(device=device, dtype=torch.float32),
+                            r_diff_in.to(device=device, dtype=torch.float32),
+                            dt_phys=dt_phys.to(device=device, dtype=torch.float32),
+                            dt_ref=(dt_ref_t.to(device=device, dtype=torch.float32) if dt_ref_t is not None else None),
+                            #sigma=(sigma.to(device, dtype=torch.float32) if (sigma is not None and torch.is_tensor(sigma)) else None),
+                            sigma=sigma_f32,
+                            predict_type=predict_type,
+                            cfg=cfg,
+                            dtype=x_in.dtype,
+                            detach=True,
+                        )
+
+                    if (parc_extra is not None) and (parc_extra.numel() > 0):
+                        # parc_extra should already be dtype=x_in.dtype per your call, but keep this safe
+                        x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
+
 
                     # ---------------------------
                     # NAN DEBUG: PARC inputs
@@ -1145,58 +1277,43 @@ def train_one_epoch_multi_step(
 
                 # ----- add Variant-B baseline in model units -----
                 y_pred = y_corr
-                '''
+
                 if need_phy and (dec_blend_w != 0.0) and (r_phy_abs is not None):
-                    phy_units = dec.physics_to_model_units(
-                        r_phy_abs.to(dtype=y_corr.dtype),
-                        dt_phys=dt_phys,
-                        dt_ref=dt_ref_t,
-                        sigma=(sigma.to(device, dtype=y_corr.dtype) if (sigma is not None and torch.is_tensor(sigma)) else None),
-                        predict_type=predict_type,
-                    )
-                    # mask baseline to selected channels
-                    phy_units = phy_units * ch_mask.view(1, -1).to(dtype=y_corr.dtype)
+                    # compute baseline in fp32 (and without autocast) for stability
+                    with torch.autocast(device_type=device.type, enabled=False):
+                        r_phy_f32 = r_phy_abs.to(device=device, dtype=torch.float32)
+
+                        phy_units_f32 = dec.physics_to_model_units(
+                            r_phy_f32,
+                            dt_phys=dt_phys_f32,
+                            dt_ref=dt_ref_f32,
+                            sigma=sigma_f32,              # robust: tensor or None
+                            predict_type=predict_type,
+                        )
+
+                        # Mask baseline to selected channels
+                        if ch_mask is not None:
+                            phy_units_f32 = phy_units_f32 * ch_mask.view(1, -1).to(device=device, dtype=torch.float32)
+
+                    # Cast back to model dtype and add
+                    phy_units = phy_units_f32.to(dtype=y_corr.dtype)
                     y_pred = y_corr + dec_blend_w * phy_units
-                '''
-                if need_phy and (dec_blend_w != 0.0) and (r_phy_abs is not None):
-                    # --- compute baseline in fp32 to avoid fp16 NaNs on CUDA ---
-                    with autocast("cuda", enabled=False):
-                        r_phy_f32 = r_phy_abs.to(dtype=torch.float32)
-                        
-                        sigma_f32 = None
-                        if sigma is not None and torch.is_tensor(sigma):
-                            sigma_f32 = sigma.to(device, dtype=torch.float32)
-                            
-                            phy_units_f32 = dec.physics_to_model_units(
-                                r_phy_f32,
-                                dt_phys=dt_phys,
-                                dt_ref=dt_ref_t,
-                                sigma=sigma_f32,
-                                predict_type=predict_type,
-                            )
 
-                            # mask baseline to selected channels (still fp32)
-                            phy_units_f32 = phy_units_f32 * ch_mask.view(1, -1).to(dtype=torch.float32)
+                    if _should_print():
+                        print(f"[NAN-DBG] step={step_k} ---- baseline unit checks ----")
+                        _tstats("phy_units", phy_units)
+                        _tstats("y_pred", y_pred)
+                        _mark_printed()
 
-                        # Cast back to model dtype for the model arithmetic
-                        phy_units = phy_units_f32.to(dtype=y_corr.dtype)
-                        y_pred = y_corr + dec_blend_w * phy_units
+                    _assert_finite("phy_units", phy_units)
+                    _assert_finite("y_pred", y_pred)
+                else:
+                    if _should_print():
+                        print(f"[NAN-DBG] step={step_k} ---- y_pred (no baseline) ----")
+                        _tstats("y_pred", y_pred)
+                        _mark_printed()
+                    _assert_finite("y_pred", y_pred)
 
-                    if need_phy and (dec_blend_w != 0.0) and (r_phy_abs is not None):
-                        if _should_print():
-                            print(f"[NAN-DBG] step={step_k} ---- baseline unit checks ----")
-                            _tstats("phy_units", phy_units)
-                            _tstats("y_pred", y_pred)
-                            _mark_printed()
-
-                        _assert_finite("phy_units", phy_units)
-                        _assert_finite("y_pred", y_pred)
-                    else:
-                        if _should_print():
-                            print(f"[NAN-DBG] step={step_k} ---- y_pred (no baseline) ----")
-                            _tstats("y_pred", y_pred)
-                            _mark_printed()
-                        _assert_finite("y_pred", y_pred)
 
                 # ----- supervision target -----
                 delta_target = norm_tgt - norm_in
@@ -1229,7 +1346,8 @@ def train_one_epoch_multi_step(
                             dt_phys=dt_phys.float(),          # <-- correct dt for this step
                             r_phy_abs=r_phy_abs.float(),
                             area=area.float(),
-                            sigma=(sigma.to(device, dtype=torch.float32) if (sigma is not None and torch.is_tensor(sigma)) else None),
+                            #sigma=(sigma.to(device, dtype=torch.float32) if (sigma is not None and torch.is_tensor(sigma)) else None),
+                            sigma=sigma_f32,
                             channel_mask=ch_mask,
                         ).to(dtype=y_pred.dtype)
 
@@ -1344,10 +1462,685 @@ def train_one_epoch_multi_step(
         total_loss_accum += window_loss
         mae_accum        += window_mae
 
+    out_dir = cfg["train"]["save_dir"]
+    budget_path = os.path.join(out_dir, "train_budgets.csv")
+
     denom = max(n_steps, 1)
     return total_loss_accum / denom, mae_accum / denom, {"num_windows": len(loader), "num_steps": n_steps}
 
+def evaluate_one_epoch_multi_step(
+    model,
+    loader,
+    cfg,
+    device,
+    *,
+    H: int,
+    W: int,
+    dx=None,
+    dy=None,
+    mu=None,
+    sigma=None,
+    collect_examples: bool = False,
+    budget_csv_path: str | None = None,
+    write_budgets: bool = False,
+):
 
+    model.eval()
+
+    budget_rows = []  
+    idx_map = None
+
+    # ---- dx,dy ----
+    if dx is None or dy is None:
+        bbox = cfg.get("data", {}).get("bbox", None)
+        if bbox is None:
+            raise ValueError("dx/dy not provided and cfg['data']['bbox'] missing; cannot compute area weights.")
+        x0, x1, y0, y1 = map(float, bbox)
+        dx = (x1 - x0) / float(W)
+        dy = (y1 - y0) / float(H)
+
+    speed = cfg.get("speed", {})
+    use_amp = bool(speed.get("amp", True)) and device.type == "cuda"
+
+    huber_delta = float(cfg["loss"].get("huber_delta", 0.05))
+    lap_w  = float(cfg["loss"].get("laplacian_weight", 0.0))
+    tmp_w  = float(cfg["loss"].get("temporal_weight", 0.0))
+    use_huber = bool(cfg["loss"].get("interp_use_huber", True))
+
+    predict_type = str(cfg.get("model", {}).get("predict_type", "rate")).lower()
+    if predict_type != "rate":
+        raise RuntimeError(f"PARC/Variant-B implementation below assumes predict_type='rate', got '{predict_type}'")
+
+    loss_cfg = cfg.get("loss", {}) or {}
+    dec_use = bool(loss_cfg.get("dec", False))
+    parc_use = bool(loss_cfg.get("parc", False) or loss_cfg.get("parc_inputs", False))
+
+    dec_blend_w = float(loss_cfg.get("blend_weight", 0.0))
+    dec_resid_w = float(loss_cfg.get("residual_weight", 0.0))
+
+    need_phy = parc_use or (dec_use and (dec_blend_w != 0.0 or dec_resid_w != 0.0))
+
+    amp_ctx = (torch.cuda.amp.autocast if use_amp and device.type == "cuda"
+               else (lambda **kw: torch.autocast("cpu", enabled=False)))
+
+    # ---- metric accumulators (weighted by cell area) ----
+    step_wsum = []
+    step_mae_num = []
+    step_mse_num = []
+    step_gt2_num = []
+    by_t = {}
+
+    total_loss_accum = 0.0
+    n_steps_total = 0
+    examples = [] if collect_examples else None
+
+    # ---- budgets (CSV) ----
+    budget_rows = []
+    budget_cfg = cfg.get("eval", {}) or {}
+    save_budgets = bool(budget_cfg.get("save_budgets_csv", True))
+
+    # Where to save:
+    # - In training runs you probably use train.save_dir
+    # - In rollout script you can override via cfg["eval"]["budgets_csv_path"]
+    budgets_csv_path = budget_cfg.get("budgets_csv_path", None)
+    if budgets_csv_path is None:
+        save_dir = cfg.get("train", {}).get("save_dir", ".")
+        budgets_csv_path = os.path.join(save_dir, "rollout_budgets.csv")
+
+    def _ensure_step_capacity(k: int, Fdim: int):
+        while len(step_wsum) <= k:
+            step_wsum.append(0.0)
+            step_mae_num.append(torch.zeros(Fdim, dtype=torch.float64))
+            step_mse_num.append(torch.zeros(Fdim, dtype=torch.float64))
+            step_gt2_num.append(torch.zeros(Fdim, dtype=torch.float64))
+
+    def _accumulate_metrics(*, k: int, t_abs: int | None, pred_abs: torch.Tensor, gt_abs: torch.Tensor, pred_levels: torch.Tensor):
+        if pred_abs.ndim == 1: pred_abs_ = pred_abs[:, None]
+        else: pred_abs_ = pred_abs
+        if gt_abs.ndim == 1: gt_abs_ = gt_abs[:, None]
+        else: gt_abs_ = gt_abs
+        if pred_abs_.shape != gt_abs_.shape:
+            raise RuntimeError(f"Metric shape mismatch: pred {pred_abs_.shape} vs gt {gt_abs_.shape}")
+        N, Fdim = pred_abs_.shape
+        _ensure_step_capacity(k, Fdim)
+
+        dtype = pred_abs_.dtype
+        dev = pred_abs_.device
+        w = dec.cell_area_from_levels(pred_levels, dx0=float(dx), dy0=float(dy), dtype=dtype, device=dev)  # [N]
+        wsum_add = float(w.sum().detach().cpu())
+
+        diff = (pred_abs_ - gt_abs_)
+        mae_add = (w[:, None] * diff.abs()).sum(dim=0).detach().cpu().to(torch.float64)
+        mse_add = (w[:, None] * diff.pow(2)).sum(dim=0).detach().cpu().to(torch.float64)
+        gt2_add = (w[:, None] * gt_abs_.pow(2)).sum(dim=0).detach().cpu().to(torch.float64)
+
+        step_wsum[k] += wsum_add
+        step_mae_num[k] += mae_add
+        step_mse_num[k] += mse_add
+        step_gt2_num[k] += gt2_add
+
+        if t_abs is not None:
+            rec = by_t.get(int(t_abs), None)
+            if rec is None:
+                by_t[int(t_abs)] = {"wsum": wsum_add, "mae": mae_add.clone(), "mse": mse_add.clone(), "gt2": gt2_add.clone()}
+            else:
+                rec["wsum"] += wsum_add
+                rec["mae"]  += mae_add
+                rec["mse"]  += mse_add
+                rec["gt2"]  += gt2_add
+
+    def _append_example_step(
+        *,
+        step_idx: int,
+        pred_centers,
+        pred_levels,
+        pred_parents,
+        y_pred_step_abs,
+        centers_list,
+        feat_list,
+        level_list,
+        parents_list,
+        batch,
+    ):
+        if not collect_examples:
+            return
+        idx_tp1 = step_idx + 1
+        t_indices = batch.get("t_indices", None)
+        t_idx = int(t_indices[idx_tp1].item()) if (t_indices is not None and torch.is_tensor(t_indices)) else (int(t_indices[idx_tp1]) if t_indices is not None else int(idx_tp1))
+        bbox = tuple(cfg.get("data", {}).get("bbox", (0.0, 1.0, 0.0, 1.0)))
+        examples.append({
+            "pred_centers": pred_centers.detach().cpu(),
+            "pred_levels":  pred_levels.detach().cpu(),
+            "pred_parents": pred_parents.detach().cpu(),
+            "gt_t":         feat_list[step_idx].detach().cpu(),
+            "gt_tp1":       feat_list[idx_tp1].detach().cpu(),
+            "pred_tp1":     y_pred_step_abs.detach().cpu(),
+            "H": H, "W": W, "bbox": bbox,
+            "t": int(t_idx),
+
+            # True-mesh geometry for plotting
+            "centers_t":    centers_list[step_idx].detach().cpu(),
+            "level_t":      level_list[step_idx].detach().cpu(),
+            "parents_t":    parents_list[step_idx].detach().cpu(),
+            "feat_t":       feat_list[step_idx].detach().cpu(),
+
+            "centers_tp1":  centers_list[idx_tp1].detach().cpu(),
+            "level_tp1":    level_list[idx_tp1].detach().cpu(),
+            "parents_tp1":  parents_list[idx_tp1].detach().cpu(),
+            "feat_tp1":     feat_list[idx_tp1].detach().cpu(),
+        })
+
+    def _budget_integrals(x_abs: torch.Tensor, pred_levels: torch.Tensor):
+        """
+        x_abs: [N,F] absolute units on pred mesh at t+1
+        pred_levels: [N] levels for pred mesh (for area weights)
+        Returns dict of global integrals.
+        """
+        nonlocal idx_map
+        if x_abs.ndim != 2:
+            raise RuntimeError(f"x_abs must be [N,F], got {tuple(x_abs.shape)}")
+        N, Fdim = x_abs.shape
+        if idx_map is None:
+            idx_map = dec.infer_feature_indices(cfg, Fdim)  # expects keys like rho,mx,my,E
+
+        # area weights on pred mesh
+        w = dec.cell_area_from_levels(
+            pred_levels, dx0=float(dx), dy0=float(dy),
+            dtype=x_abs.dtype, device=x_abs.device
+        )  # [N]
+
+        rho = x_abs[:, idx_map["rho"]]
+        mx  = x_abs[:, idx_map["mx"]]
+        my  = x_abs[:, idx_map["my"]]
+        E   = x_abs[:, idx_map["E"]]
+
+        # global integrals over domain (pred mesh)
+        out = {
+            "mass":   (w * rho).sum(),
+            "mom_x":  (w * mx ).sum(),
+            "mom_y":  (w * my ).sum(),
+            "energy": (w * E  ).sum(),
+            "area":   w.sum(),
+        }
+        # move to python floats
+        return {k: float(v.detach().cpu().item()) for k, v in out.items()}
+
+    def _append_budget_row(*, t_abs: int, step_k: int, kind: str, x_abs: torch.Tensor, pred_levels: torch.Tensor):
+        d = _budget_integrals(x_abs, pred_levels)
+        budget_rows.append({
+            "t_abs": int(t_abs),
+            "step_k": int(step_k),
+            "kind": str(kind),  # "gt" or "pred"
+            **d,
+        })
+
+
+    # ==========================================================
+    # Main eval loop
+    # ==========================================================
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(loader):
+            dt_list = batch.get("dt_list", None)
+            if dt_list is None:
+                raise RuntimeError("Missing dt_list in batch. Ensure CollateWithPrecompute attaches dt_list.")
+
+            centers_list  = _require_list(batch, "centers_list")
+            feat_list     = _require_list(batch, "feat_list")
+            level_list    = _require_list(batch, "level_list")
+            ij_list       = _require_list(batch, "ij_list")
+            ei_list       = _require_list(batch, "ei_list")
+            parents_list  = _require_list(batch, "parents_list")
+            mask_list     = _require_list(batch, "mask_list")
+
+            pred_centers_list  = _require_list(batch, "pred_centers_list")
+            pred_levels_list   = _require_list(batch, "pred_levels_list")
+            pred_parents_list  = _require_list(batch, "pred_parents_list")
+            pred_ei_list       = _require_list(batch, "pred_ei_list")
+            mask_pred_list     = _require_list(batch, "mask_pred_list")
+
+            pred_ea_list = batch.get("pred_ea_list", None) or batch.get("pred_edge_attr_list", None)
+
+            feat_t_on_pred_list   = _require_list(batch, "feat_t_on_pred_list")
+            feat_tp1_on_pred_list = _require_list(batch, "feat_tp1_on_pred_list")
+
+            pred2pred_idx_list = batch.get("pred2pred_idx_list", None)
+            pred2pred_w_list   = batch.get("pred2pred_w_list", None)
+
+            t_indices = batch.get("t_indices", None)
+
+            K = len(centers_list)
+            if K < 2:
+                raise RuntimeError("window_size must be ≥ 2")
+
+            if need_phy and pred_ea_list is None:
+                raise RuntimeError(
+                    "PARC/DEC enabled but batch is missing pred_ea_list / pred_edge_attr_list."
+                )
+
+            pred_lists = (pred_centers_list, pred_levels_list, pred_parents_list, pred_ei_list, mask_pred_list)
+            dt_ref_scalar = batch.get("dt_ref", None)
+
+            # helper closure for one step (mirrors train)
+            def _run_step_eval(
+                *,
+                step_k: int,
+                pred_centers,
+                pred_levels,
+                pred_parents,
+                pred_ei,
+                pred_ea,
+                x_in_abs,
+                x_tgt_abs,
+                dt_phys,
+            ):
+                norm_in  = _maybe_norm(x_in_abs,  mu, sigma)
+                norm_tgt = _maybe_norm(x_tgt_abs, mu, sigma)
+
+                dt_ref_t = (torch.tensor(float(dt_ref_scalar), device=device, dtype=norm_in.dtype)
+                            if dt_ref_scalar is not None else None)
+                dt_hat = (dt_phys / dt_ref_t) if dt_ref_t is not None else dt_phys
+
+                sigma_f32 = _as_stat_tensor(sigma, device=device, dtype=torch.float32)
+                if sigma_f32 is not None:
+                    sigma_f32 = sigma_f32.clamp_min(1e-12)
+
+                dt_phys_f32 = dt_phys.to(device=device, dtype=torch.float32)
+                dt_ref_f32  = (dt_ref_t.to(device=device, dtype=torch.float32) if dt_ref_t is not None else None)
+
+                with amp_ctx():
+                    pei = pred_ei.to(device) if torch.is_tensor(pred_ei) else pred_ei
+                    pea = pred_ea.to(device) if (pred_ea is not None and torch.is_tensor(pred_ea)) else pred_ea
+
+                    r_adv_abs = r_diff_abs = r_phy_abs = area = None
+                    ch_mask = None
+
+                    if need_phy:
+                        with torch.autocast(device_type=device.type, enabled=False):
+
+                            # Option A: advection physics only at step 0
+                            adv_step_gate = (step_k == 0)
+
+                            adv_w  = float(loss_cfg.get("adv_weight", 1.0))
+                            diff_w = float(loss_cfg.get("diff_weight", 1.0))
+
+                            include_adv_cfg  = bool(loss_cfg.get("parc_include_adv", True))
+                            include_diff_cfg = bool(loss_cfg.get("parc_include_diff", True))
+
+                            # Compute flags for DEC evaluation
+                            need_adv  = (adv_step_gate and include_adv_cfg and (adv_w != 0.0))
+                            need_diff = (include_diff_cfg and (diff_w != 0.0))
+
+                            # If you have the sanitize helper in eval too, use it (recommended)
+                            # x_for_ops = sanitize_state_for_ops(x_in_abs, cfg, rho_floor=1e-6, E_floor=1e-6)
+                            x_for_ops = x_in_abs
+
+                            r_adv_abs, r_diff_abs, area = dec.dec_advdiff_terms_abs(
+                                x_abs=x_for_ops.float(),
+                                edge_index=pei.long(),
+                                pred_ea=pea.float(),
+                                levels=pred_levels.long().to(device),
+                                dx0=float(dx),
+                                dy0=float(dy),
+                                cfg=cfg,
+                                compute_adv=need_adv,
+                                compute_diff=need_diff,
+                            )
+
+                            # Belt-and-suspenders: ensure adv absent for k>0
+                            if not adv_step_gate:
+                                r_adv_abs = None
+
+                            # Build channel mask from the SAME selector used for PARC inputs
+                            sel = dec.parc_select_feature_indices(cfg, x_in_abs.size(1))
+                            ch_mask = torch.zeros((x_in_abs.size(1),), device=device, dtype=torch.float32)
+                            ch_mask[torch.as_tensor(sel, device=device)] = 1.0
+
+                            # Build r_phy_abs safely (never 0*inf / None arithmetic)
+                            r_phy_abs = None
+                            if (dec_blend_w != 0.0) or (dec_resid_w != 0.0):
+                                if need_diff and (r_diff_abs is not None):
+                                    base = diff_w * r_diff_abs
+                                else:
+                                    ref = r_diff_abs if (r_diff_abs is not None) else r_adv_abs
+                                    if ref is None:
+                                        ref = x_in_abs.float()
+                                    base = torch.zeros_like(ref)
+
+                                if need_adv and (r_adv_abs is not None):
+                                    base = base + adv_w * r_adv_abs
+
+                                r_phy_abs = base
+
+                    # Build node inputs
+                    x_in = _build_X(norm_in, pred_centers, pred_levels, cfg)
+
+                    parc_extra = None
+                    if parc_use:
+                        if (r_adv_abs is None) and (r_diff_abs is None):
+                            parc_extra = None
+                        else:
+                            ref = r_diff_abs if (r_diff_abs is not None) else r_adv_abs
+                            assert ref is not None
+
+                            r_adv_in  = r_adv_abs  if (r_adv_abs  is not None) else torch.zeros_like(ref)
+                            r_diff_in = r_diff_abs if (r_diff_abs is not None) else torch.zeros_like(ref)
+
+                            # keep PARC channels consistent with baseline/residual
+                            if ch_mask is not None:
+                                cm = ch_mask.view(1, -1).to(device=device, dtype=torch.float32)
+                                r_adv_in  = r_adv_in  * cm
+                                r_diff_in = r_diff_in * cm
+
+                            parc_extra = dec.parc_terms_to_node_inputs(
+                                r_adv_in.to(device=device, dtype=torch.float32),
+                                r_diff_in.to(device=device, dtype=torch.float32),
+                                dt_phys=dt_phys_f32,
+                                dt_ref=dt_ref_f32,
+                                sigma=sigma_f32,
+                                predict_type=predict_type,
+                                cfg=cfg,
+                                dtype=x_in.dtype,
+                                detach=True,
+                            )
+
+                        if (parc_extra is not None) and (parc_extra.numel() > 0):
+                            x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
+
+                    y_corr = _forward_main_head_with_edge_attr(model, x_in, pei, edge_attr=pea)
+
+                    y_pred = y_corr
+                    if need_phy and (dec_blend_w != 0.0) and (r_phy_abs is not None):
+                        # baseline in fp32 for stability
+                        with torch.autocast(device_type=device.type, enabled=False):
+                            phy_units_f32 = dec.physics_to_model_units(
+                                r_phy_abs.to(dtype=torch.float32),
+                                dt_phys=(dt_phys.to(dtype=torch.float32) if torch.is_tensor(dt_phys) else dt_phys),
+                                dt_ref=(dt_ref_t.to(dtype=torch.float32) if (dt_ref_t is not None and torch.is_tensor(dt_ref_t)) else dt_ref_t),
+                                #sigma=(sigma.to(device, dtype=torch.float32) if (sigma is not None and torch.is_tensor(sigma)) else None),
+                                sigma=sigma_f32,
+                                predict_type=predict_type,
+                            )
+                            phy_units_f32 = phy_units_f32 * ch_mask.view(1, -1).to(dtype=torch.float32)
+                        phy_units = phy_units_f32.to(dtype=y_corr.dtype)
+                        y_pred = y_corr + dec_blend_w * phy_units
+
+                    # targets / loss in fp32 for stability
+                    with torch.autocast(device_type=device.type, enabled=False):
+                        delta_target_f32 = (norm_tgt - norm_in).to(dtype=torch.float32)
+                        dt_hat_f32 = dt_hat.to(dtype=torch.float32)
+                        rate_target_f32 = delta_target_f32 / dt_hat_f32.clamp_min(1e-12)
+
+                        y_pred_f32 = y_pred.to(dtype=torch.float32)
+                        center_loss = (F.huber_loss(y_pred_f32, rate_target_f32, delta=huber_delta)
+                                        if use_huber else F.l1_loss(y_pred_f32, rate_target_f32))
+
+                        y_pred_abs = _maybe_denorm(
+                            norm_in.to(dtype=torch.float32) + y_pred_f32 * dt_hat_f32,
+                            mu, sigma
+                        )
+
+                    lap_loss = (laplacian_smoothness(y_pred, pei) if lap_w > 0 else y_pred.new_zeros(()))
+                    tmp_loss = (temporal_consistency(x_in, norm_tgt) if tmp_w > 0 else y_pred.new_zeros(()))
+
+                    phy_loss = y_pred.new_zeros(())
+                    if need_phy and dec_resid_w > 0.0 and (r_phy_abs is not None):
+                        with torch.autocast(device_type=device.type, enabled=False):
+                            phy_loss = dec.physics_residual_loss_delta(
+                                y_pred_abs=y_pred_abs.float(),
+                                x_in_abs=x_in_abs.float(),
+                                dt_phys=dt_phys.float(),
+                                r_phy_abs=r_phy_abs.float(),
+                                area=area.float(),
+                                #sigma=(sigma.to(device, dtype=torch.float32) if (sigma is not None and torch.is_tensor(sigma)) else None),
+                                sigma=sigma_f32,
+                                channel_mask=ch_mask,
+                            ).to(dtype=y_pred.dtype)
+
+                    loss_step = center_loss + lap_w * lap_loss + tmp_w * tmp_loss + dec_resid_w * phy_loss
+
+                return loss_step, y_pred_abs
+
+            # ===== STEP 0 =====
+            k = 0
+            pred_centers_1, pred_levels_1, pred_parents_1, pred_ei_1, mask_pred_1 = _pred_mesh_for_step_strict(k, pred_lists=pred_lists)
+            pred_ea_1 = pred_ea_list[k + 1] if pred_ea_list is not None else None
+
+            x_in_abs0  = feat_t_on_pred_list[k + 1].to(device)
+            x_tgt_abs0 = feat_tp1_on_pred_list[k + 1].to(device)
+
+            dt0 = dt_list[0]
+            dt0 = dt0.to(device=device, dtype=x_in_abs0.dtype) if torch.is_tensor(dt0) else torch.tensor(float(dt0), device=device, dtype=x_in_abs0.dtype)
+
+            loss0, y_pred_abs0 = _run_step_eval(
+                step_k=0,
+                pred_centers=pred_centers_1,
+                pred_levels=pred_levels_1,
+                pred_parents=pred_parents_1,
+                pred_ei=pred_ei_1,
+                pred_ea=pred_ea_1,
+                x_in_abs=x_in_abs0,
+                x_tgt_abs=x_tgt_abs0,
+                dt_phys=dt0,
+            )
+
+            total_loss_accum += float(loss0.detach().cpu())
+            n_steps_total += 1
+
+            t_abs0 = None
+            if t_indices is not None:
+                t_abs0 = int(t_indices[1].item()) if torch.is_tensor(t_indices) else int(t_indices[1])
+
+            _accumulate_metrics(k=0, t_abs=t_abs0, pred_abs=y_pred_abs0, gt_abs=x_tgt_abs0, pred_levels=pred_levels_1)
+
+            if write_budgets and (t_abs0 is not None):
+                # GT(t+1) on GT mesh
+                gt_tp1_abs = feat_list[1].to(device)
+                gt_tp1_lev = level_list[1].to(device)
+
+                area, mass, mom_x, mom_y, energy = _compute_budget_row(
+                    x_abs=gt_tp1_abs, levels=gt_tp1_lev,
+                    dx0=float(dx), dy0=float(dy), cfg=cfg
+                )
+                budget_rows.append({
+                    "t_abs": int(t_abs0),
+                    "step_k": 0,
+                    "kind": "gt_on_gt_mesh_tp1",
+                    "mass": mass, "mom_x": mom_x, "mom_y": mom_y, "energy": energy, "area": area,
+                })
+
+                # (optional) GT(t) on GT mesh
+                t_abs_t = int(t_indices[0].item()) if (t_indices is not None and torch.is_tensor(t_indices)) else (int(t_indices[0]) if t_indices is not None else None)
+                if t_abs_t is not None:
+                    gt_t_abs = feat_list[0].to(device)
+                    gt_t_lev = level_list[0].to(device)
+
+                    area, mass, mom_x, mom_y, energy = _compute_budget_row(
+                        x_abs=gt_t_abs, levels=gt_t_lev,
+                        dx0=float(dx), dy0=float(dy), cfg=cfg
+                    )
+                    budget_rows.append({
+                        "t_abs": int(t_abs_t),
+                        "step_k": -1,  # label GT(t) as "pre-step"
+                        "kind": "gt_on_gt_mesh_t",
+                        "mass": mass, "mom_x": mom_x, "mom_y": mom_y, "energy": energy, "area": area,
+                    })
+
+
+            _append_example_step(
+                step_idx=0,
+                pred_centers=pred_centers_1,
+                pred_levels=pred_levels_1,
+                pred_parents=pred_parents_1,
+                y_pred_step_abs=y_pred_abs0,
+                centers_list=centers_list,
+                feat_list=feat_list,
+                level_list=level_list,
+                parents_list=parents_list,
+                batch=batch,
+            )
+
+            if write_budgets and (t_abs0 is not None):
+                _append_budget_row(t_abs=t_abs0, step_k=0, kind="gt_on_pred_mesh_tp1",   x_abs=x_tgt_abs0,  pred_levels=pred_levels_1)
+                _append_budget_row(t_abs=t_abs0, step_k=0, kind="pred_on_pred_mesh_tp1", x_abs=y_pred_abs0, pred_levels=pred_levels_1)
+
+
+            pred_feats_k = y_pred_abs0
+
+            # ===== STEPS 1..K-2 =====
+            for k in range(1, K - 1):
+                pred_centers_next, pred_levels_next, pred_parents_next, pred_ei_next, mask_pred_next = _pred_mesh_for_step_strict(k, pred_lists=pred_lists)
+                pred_ea_next = pred_ea_list[k + 1] if pred_ea_list is not None else None
+
+                idx_km1 = pred2pred_idx_list[k-1].to(device)
+                w_km1   = pred2pred_w_list[k-1].to(device)
+                x_in_abs = apply_precomputed_idw_map(idx_km1, w_km1, pred_feats_k).to(device)
+
+                x_tgt_abs = feat_tp1_on_pred_list[k + 1].to(device)
+
+                dtk = dt_list[k]
+                dtk = dtk.to(device=device, dtype=x_in_abs.dtype) if torch.is_tensor(dtk) else torch.tensor(float(dtk), device=device, dtype=x_in_abs.dtype)
+
+                loss_k, y_pred_abs_k = _run_step_eval(
+                    step_k=k,
+                    pred_centers=pred_centers_next,
+                    pred_levels=pred_levels_next,
+                    pred_parents=pred_parents_next,
+                    pred_ei=pred_ei_next,
+                    pred_ea=pred_ea_next,
+                    x_in_abs=x_in_abs,
+                    x_tgt_abs=x_tgt_abs,
+                    dt_phys=dtk,
+                )
+
+                total_loss_accum += float(loss_k.detach().cpu())
+                n_steps_total += 1
+
+                t_absk = None
+                if t_indices is not None:
+                    t_absk = int(t_indices[k + 1].item()) if torch.is_tensor(t_indices) else int(t_indices[k + 1])
+
+                _accumulate_metrics(k=k, t_abs=t_absk, pred_abs=y_pred_abs_k, gt_abs=x_tgt_abs, pred_levels=pred_levels_next)
+
+                if write_budgets and (t_absk is not None):
+                    gt_tp1_abs = feat_list[k + 1].to(device)
+                    gt_tp1_lev = level_list[k + 1].to(device)
+
+                    area, mass, mom_x, mom_y, energy = _compute_budget_row(
+                        x_abs=gt_tp1_abs, levels=gt_tp1_lev,
+                        dx0=float(dx), dy0=float(dy), cfg=cfg
+                    )
+                    budget_rows.append({
+                        "t_abs": int(t_absk),
+                        "step_k": int(k),
+                        "kind": "gt_on_gt_mesh_tp1",
+                        "mass": mass, "mom_x": mom_x, "mom_y": mom_y, "energy": energy, "area": area,
+                    })
+
+
+                _append_example_step(
+                    step_idx=k,
+                    pred_centers=pred_centers_next,
+                    pred_levels=pred_levels_next,
+                    pred_parents=pred_parents_next,
+                    y_pred_step_abs=y_pred_abs_k,
+                    centers_list=centers_list,
+                    feat_list=feat_list,
+                    level_list=level_list,
+                    parents_list=parents_list,
+                    batch=batch,
+                )
+
+                if write_budgets and (t_absk is not None):
+                    _append_budget_row(t_abs=t_absk, step_k=k, kind="gt_on_pred_mesh_tp1",   x_abs=x_tgt_abs,   pred_levels=pred_levels_next)
+                    _append_budget_row(t_abs=t_absk, step_k=k, kind="pred_on_pred_mesh_tp1", x_abs=y_pred_abs_k, pred_levels=pred_levels_next)
+
+                # keep your existing propagation behavior
+                pred_feats_k = _enforce_physical_state(y_pred_abs_k, rho_floor=1e-6, E_floor=1e-6)
+
+
+    # ---- finalize metrics ----
+    eps = 1e-12
+    S = len(step_wsum)
+    if S == 0:
+        raise RuntimeError("No steps accumulated; check loader/window_size.")
+
+    Fdim = step_mae_num[0].numel()
+    maew_feat_by_step = torch.zeros((S, Fdim), dtype=torch.float64)
+    rell2w_feat_by_step = torch.zeros((S, Fdim), dtype=torch.float64)
+    maew_by_step = []
+    rell2w_by_step = []
+
+    for k in range(S):
+        wsum = step_wsum[k]
+        if wsum <= 0:
+            maew_feat = torch.full((Fdim,), float("nan"), dtype=torch.float64)
+            rell2w_feat = torch.full((Fdim,), float("nan"), dtype=torch.float64)
+        else:
+            maew_feat = step_mae_num[k] / wsum
+            rell2w_feat = torch.sqrt(step_mse_num[k] / (step_gt2_num[k] + eps))
+        maew_feat_by_step[k] = maew_feat
+        rell2w_feat_by_step[k] = rell2w_feat
+        maew_by_step.append(float(maew_feat.mean().item()))
+        rell2w_by_step.append(float(rell2w_feat.mean().item()))
+
+    t_values = sorted(by_t.keys())
+    if len(t_values) > 0:
+        maew_feat_by_t = torch.zeros((len(t_values), Fdim), dtype=torch.float64)
+        rell2w_feat_by_t = torch.zeros((len(t_values), Fdim), dtype=torch.float64)
+        maew_by_t = []
+        rell2w_by_t = []
+        for i, t_abs in enumerate(t_values):
+            rec = by_t[t_abs]
+            wsum = rec["wsum"]
+            if wsum <= 0:
+                maew_feat = torch.full((Fdim,), float("nan"), dtype=torch.float64)
+                rell2w_feat = torch.full((Fdim,), float("nan"), dtype=torch.float64)
+            else:
+                maew_feat = rec["mae"] / wsum
+                rell2w_feat = torch.sqrt(rec["mse"] / (rec["gt2"] + eps))
+            maew_feat_by_t[i] = maew_feat
+            rell2w_feat_by_t[i] = rell2w_feat
+            maew_by_t.append(float(maew_feat.mean().item()))
+            rell2w_by_t.append(float(rell2w_feat.mean().item()))
+    else:
+        maew_feat_by_t = None
+        rell2w_feat_by_t = None
+        maew_by_t = None
+        rell2w_by_t = None
+
+    avg_loss = total_loss_accum / max(n_steps_total, 1)
+
+    # -----------------------------
+    # Write budgets CSV (once per eval call)
+    # -----------------------------
+    
+    if write_budgets and (budget_csv_path is not None):
+        os.makedirs(os.path.dirname(budget_csv_path) or ".", exist_ok=True)
+        fieldnames = ["t_abs", "step_k", "kind", "mass", "mom_x", "mom_y", "energy", "area"]
+        with open(budget_csv_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            w.writerows(budget_rows)
+
+    stats = {
+        "num_windows": len(loader),
+        "num_steps": n_steps_total,
+        "maew_by_rollout_step": maew_by_step,
+        "rell2w_by_rollout_step": rell2w_by_step,
+        "maew_feat_by_rollout_step": maew_feat_by_step,
+        "rell2w_feat_by_rollout_step": rell2w_feat_by_step,
+        "t_values": t_values,
+        "maew_by_t": maew_by_t,
+        "rell2w_by_t": rell2w_by_t,
+        "maew_feat_by_t": maew_feat_by_t,
+        "rell2w_feat_by_t": rell2w_feat_by_t,
+    }
+    if collect_examples:
+        stats["examples"] = examples
+    return avg_loss, stats
+
+'''
 def evaluate_one_epoch_multi_step(
     model,
     loader,
@@ -1604,7 +2397,7 @@ def evaluate_one_epoch_multi_step(
                             x_in = torch.cat([x_in, parc_extra], dim=1)
 
                     y_corr = _forward_main_head_with_edge_attr(model, x_in, pei, edge_attr=pea)
-                    '''
+                    """
                     y_pred = y_corr
                     if need_phy and (dec_blend_w != 0.0) and (r_phy_abs is not None):
                         phy_units = dec.physics_to_model_units(
@@ -1616,7 +2409,7 @@ def evaluate_one_epoch_multi_step(
                         )
                         phy_units = phy_units * ch_mask.view(1, -1).to(dtype=y_corr.dtype)
                         y_pred = y_corr + dec_blend_w * phy_units
-                    '''
+                    """
                     y_pred = y_corr
                     if need_phy and (dec_blend_w != 0.0) and (r_phy_abs is not None):
                         # ---- compute baseline in fp32 to avoid fp16 inf/NaN during eval rollouts ----
@@ -1632,7 +2425,7 @@ def evaluate_one_epoch_multi_step(
 
                         phy_units = phy_units_f32.to(dtype=y_corr.dtype)
                         y_pred = y_corr + dec_blend_w * phy_units
-                    '''
+                    """
                     delta_target = norm_tgt - norm_in
                     rate_target = delta_target / dt_hat.clamp_min(1e-12)
 
@@ -1640,7 +2433,7 @@ def evaluate_one_epoch_multi_step(
                                    if use_huber else F.l1_loss(y_pred, rate_target))
 
                     y_pred_abs = _maybe_denorm(norm_in + y_pred * dt_hat, mu, sigma)
-                    '''
+                    """
                     with torch.autocast(device_type=device.type, enabled=False):
                         delta_target_f32 = (norm_tgt - norm_in).to(dtype=torch.float32)
                         dt_hat_f32 = dt_hat.to(dtype=torch.float32)
@@ -1842,7 +2635,7 @@ def evaluate_one_epoch_multi_step(
     if collect_examples:
         stats["examples"] = examples
     return avg_loss, stats
-
+'''
 
 def parent_mask_from_selected(pred_parents: torch.Tensor,
                               pred_levels: torch.Tensor,
@@ -2442,580 +3235,10 @@ def main(config_path: str | None = None):
         max_features=3
     )
     """
-'''
-def main(config_path: str | None = None):
-    import os, io, json, time, zipfile
-    import numpy as np
-    import torch
-    from torch import optim
-    from torch.utils.data import DataLoader, Subset, RandomSampler
 
-    # -------- load & normalize config --------
-    if config_path is None:
-        config_path = os.path.join(os.path.dirname(__file__), "config_feature_first.json")
-    with open(config_path, "r") as f:
-        cfg = json.load(f)
-
-    # Speed defaults (non-breaking):
-    cfg.setdefault("speed", {}).setdefault("amp", True)
-    cfg.setdefault("speed", {}).setdefault("interp_chunk", 8192)
-    cfg.setdefault("speed", {}).setdefault("knn_k", 8)
-    cfg.setdefault("speed", {}).setdefault("cache_interps", True)
-
-    # Default mesh mode is the current behavior
-    #   "predicted" => EXACT existing precomputed non-uniform mesh pipeline
-    #   "uniform"   => constant uniform mesh test
-    mesh_mode = str(cfg.get("train", {}).get("mesh_mode", "predicted")).lower()
-
-    # Uniform mesh dims (only used in uniform mode)
-    uniform_H = int(cfg.get("train", {}).get("uniform_H", 256))
-    uniform_W = int(cfg.get("train", {}).get("uniform_W", 256))
-    uniform_teacher_forcing = bool(cfg.get("train", {}).get("teacher_forcing_uniform", False))
-    uniform_diag_edges = bool(cfg.get("train", {}).get("uniform_diag_edges", False))
-
-    # Ensure dataset sees the intended columns
-    if cfg.get("data", {}).get("feature_idx") and not cfg.get("features", {}).get("use_columns"):
-        cfg.setdefault("features", {}).setdefault("use_columns", cfg["data"]["feature_idx"])
-
-    raw_dev = cfg.get("device", "cpu")
-    device = torch.device(raw_dev)
-    pre_device = torch.device("cpu")  # kept to match your current structure
-
-    set_seed(int(cfg.get("train", {}).get("seed", 42)))
-
-    H = int(cfg["data"].get("H", 64))
-    W = int(cfg["data"].get("W", 64))
-    xmin, xmax, ymin, ymax = _get_bbox(cfg)
-    dx = (xmax - xmin) / W
-    dy = (ymax - ymin) / H
-
-    # -------- dataset loading --------
-    pt_path = cfg["data"]["pt_path"]
-    if pt_path.endswith(".zip"):
-        with zipfile.ZipFile(pt_path, "r") as zf:
-            member = next(m for m in zf.namelist() if m.endswith(".pt") or m.endswith(".pth"))
-            with zf.open(member, "r") as fh:
-                buf = io.BytesIO(fh.read())
-        data_list = torch.load(buf)
-    else:
-        data_list = torch.load(pt_path)
-
-    model = build_model_from_cfg(cfg, device)
-
-    def _get_lr(optimizer):
-        return optimizer.param_groups[0]["lr"]
-
-    # -------- optimizer / scheduler (UNCHANGED) --------
-    opt_groups = [{"params": model.parameters(), "lr": float(cfg["train"]["lr"])}]
-
-    if cfg.get("train", {}).get("interp_type", "standard") == "gnn":
-        D      = int(cfg["features"].get("num_dynamic_feats", 3))
-        phid   = int(cfg.get("interp_nn", {}).get("hidden", 256))
-        pdepth = int(cfg.get("interp_nn", {}).get("depth", 2))
-
-        prolong_head     = ProlongationHead(D, hidden=phid, depth=pdepth).to(device)
-        restriction_head = RestrictionHead(D, hidden=phid, depth=pdepth).to(device)
-        N4 = build_coarse_n4(H, W, device=device)
-
-        base_lr = float(cfg.get("interp_nn", {}).get("lr", cfg.get("optim", {}).get("lr", 1e-3)))
-        opt_groups.append({"params": prolong_head.parameters(), "lr": base_lr})
-        opt_groups.append({"params": restriction_head.parameters(), "lr": base_lr})
-
-    opt = optim.AdamW(opt_groups, weight_decay=float(cfg["train"].get("weight_decay", 0.0)))
-
-    sch_cfg   = cfg.get("scheduler", {})
-    use_sched = bool(sch_cfg.get("use", True))
-    scheduler = None
-    if use_sched:
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            opt,
-            mode=sch_cfg.get("mode", "min"),
-            factor=float(sch_cfg.get("factor", 0.5)),
-            patience=int(sch_cfg.get("patience", 5)),
-            threshold=float(sch_cfg.get("threshold", 1e-4)),
-            threshold_mode=sch_cfg.get("threshold_mode", "rel"),
-            cooldown=int(sch_cfg.get("cooldown", 0)),
-            min_lr=float(sch_cfg.get("min_lr", 1e-6)),
-            verbose=bool(sch_cfg.get("verbose", True)),
-        )
-
-    # -------- windows dataset (UNCHANGED) --------
-    K      = int(cfg["data"].get("window_size", 2))
-    stride = int(cfg["data"].get("stride", 1))
-
-    min_T = None
-    max_T = None
-    if min_T is not None or max_T is not None:
-        n_total = len(data_list)
-        start = 0 if min_T is None else int(min_T)
-        end   = n_total if max_T is None else int(max_T)
-
-        start = max(0, min(start, n_total))
-        end   = max(start, min(end, n_total))
-        data_list = data_list[start:end]
-
-        if len(data_list) == 0:
-            raise ValueError(
-                f"Selected empty time range: start={start}, end={end}, n_total={n_total}"
-            )
-
-    # -------------------------------
-    # Build dt transitions from raw snapshots (UNCHANGED)
-    # -------------------------------
-    times = torch.stack([
-        (snap["time"].detach().cpu().float() if torch.is_tensor(snap["time"]) else torch.tensor(float(snap["time"])))
-        for snap in data_list
-    ]).view(-1)
-
-    if torch.any(times[1:] < times[:-1]):
-        raise RuntimeError("Snapshot times are not monotonically increasing; cannot form dt reliably.")
-
-    dt_transitions = (times[1:] - times[:-1]).contiguous()  # (T-1,)
-    eps_dt = 1e-12
-    if torch.any(dt_transitions <= 0):
-        dt_transitions = dt_transitions.clamp_min(eps_dt)
-
-    dt_ref = dt_transitions.median()  # scalar
-
-    full_ds = CellRefineWindowDataset(
-        series=data_list,
-        cfg=cfg,
-        window_size=K,
-        stride=stride,
-        H=H, W=W, device=str(device),
-    )
-
-    N = len(full_ds)
-    train_frac = float(cfg["split"].get("train", 0.8))
-    val_frac = float(cfg["split"].get("val_frac", 0.1))
-    test_frac = float(cfg["split"].get("test_frac", 0.1))
-    nv = max(1, int(round(val_frac * N)))
-    nt = max(1, int(round(test_frac * N)))
-    ntr = max(1, N - nv - nt)
-
-    T = len(full_ds)
-    idxs = np.arange(T)
-
-    seed = int(cfg.get("seed", 1337))
-    rng = np.random.default_rng(seed)
-    perm = rng.permutation(T)
-    idxs = idxs[perm]
-
-    train_frac = cfg["split"].get("train", 0.8)
-    val_frac   = cfg["split"].get("val", 0.1)
-    test_frac  = cfg["split"].get("test", 0.1)
-
-    n_train = int(round(train_frac * T))
-    n_val   = int(round(val_frac   * T))
-    n_test  = T - n_train - n_val
-
-    train_idx = idxs[:n_train]
-    val_idx   = idxs[n_train:n_train + n_val]
-    test_idx  = idxs[n_train + n_val:]
-
-    train_ds = Subset(full_ds, train_idx.tolist())
-    val_ds   = Subset(full_ds, val_idx.tolist())
-    test_ds  = Subset(full_ds, test_idx.tolist())
-
-    # -------- collate + loaders (BRANCHED, but predicted path is identical) --------
-    class CollateWithDTOnly:
-        """
-        Minimal collate for uniform-mesh testing:
-          - preserves dataset keys
-          - attaches dt_list + dt_ref exactly like CollateWithPrecompute does conceptually
-        Expects batch_size=1 windows (same as your current loaders).
-        """
-        def __init__(self, dt_transitions: torch.Tensor, dt_ref: torch.Tensor | float | None):
-            self.dt_transitions = dt_transitions.detach().cpu()
-            self.dt_ref = float(dt_ref) if dt_ref is not None else None
-
-        def __call__(self, batch_list):
-            if len(batch_list) != 1:
-                raise RuntimeError("This collate expects batch_size=1 (one window per batch).")
-            batch = batch_list[0]
-
-            t_indices = batch.get("t_indices", None)
-            if t_indices is None:
-                raise RuntimeError(
-                    "Uniform-mesh mode requires batch['t_indices'] so dt_list can be formed."
-                )
-
-            if torch.is_tensor(t_indices):
-                t_idx_list = t_indices.detach().cpu().long().tolist()
-            else:
-                t_idx_list = [int(x) for x in t_indices]
-
-            dt_list = []
-            for i in range(len(t_idx_list) - 1):
-                t0 = int(t_idx_list[i])
-                if t0 < 0 or t0 >= int(self.dt_transitions.numel()):
-                    raise RuntimeError(
-                        f"t_indices[{i}]={t0} out of range for dt_transitions (len={int(self.dt_transitions.numel())})."
-                    )
-                dt_list.append(self.dt_transitions[t0])
-
-            batch["dt_list"] = dt_list
-            if self.dt_ref is not None:
-                batch["dt_ref"] = float(self.dt_ref)
-
-            return batch
-
-    if mesh_mode in ("predicted", "precomputed", "nonuniform", "amr"):
-        # ----- EXACT existing precompute path -----
-        cache_path = cfg["train"].get("precomp_cache_path", None)
-        force_recompute = bool(cfg["train"].get("precomp_force_recompute", False))
-
-        precomp = precompute_pred_mesh_and_interps_for_rollout(
-            full_ds.steps,
-            cfg,
-            H,
-            W,
-            dx,
-            dy,
-            device=device,
-            progress=True,
-            cache_path=cache_path,
-            force_recompute=force_recompute,
-        )
-        precomp = move_precomp_to_device(precomp, device)
-
-        collate = CollateWithPrecompute(precomp, dt_transitions=dt_transitions, dt_ref=dt_ref)
-
-        train_loader = DataLoader(
-            train_ds, batch_size=1, sampler=RandomSampler(train_ds),
-            num_workers=0, pin_memory=False, collate_fn=collate
-        )
-        val_loader = DataLoader(
-            val_ds, batch_size=1, sampler=RandomSampler(val_ds),
-            num_workers=0, pin_memory=False, collate_fn=collate
-        )
-        test_loader = DataLoader(
-            test_ds, batch_size=1, sampler=RandomSampler(test_ds),
-            num_workers=0, pin_memory=False, collate_fn=collate
-        )
-
-    elif mesh_mode in ("uniform", "uniform_mesh", "constant_uniform"):
-        precomp = None  # explicitly absent
-
-        collate = CollateWithDTOnly(dt_transitions=dt_transitions, dt_ref=dt_ref)
-
-        train_loader = DataLoader(
-            train_ds, batch_size=1, sampler=RandomSampler(train_ds),
-            num_workers=0, pin_memory=False, collate_fn=collate
-        )
-        val_loader = DataLoader(
-            val_ds, batch_size=1, sampler=RandomSampler(val_ds),
-            num_workers=0, pin_memory=False, collate_fn=collate
-        )
-        test_loader = DataLoader(
-            test_ds, batch_size=1, sampler=RandomSampler(test_ds),
-            num_workers=0, pin_memory=False, collate_fn=collate
-        )
-    else:
-        raise ValueError(f"Unknown mesh_mode='{mesh_mode}'. Use 'predicted' or 'uniform'.")
-
-    # -------- Normalization stats (predicted path unchanged; uniform path computes consistent stats) --------
-    feats_cfg = cfg.get("features", {})
-    do_norm = bool(feats_cfg.get("normalize", True))
-    mu = sigma = None
-
-    # uniform helper for stats
-    @torch.no_grad()
-    def _compute_norm_stats_uniform_from_loader(engine, loader, device, max_batches: int | None = None):
-        """
-        MPS-safe norm stats computation.
-
-        Strategy:
-        1) Get uniform-mapped GT on engine.device (may be MPS).
-        2) Move to CPU in float32 FIRST (MPS cannot do float64).
-        3) Accumulate sums on CPU (float32 is fine; avoids MPS float64 entirely).
-        """
-        sum_x = None
-        sum_x2 = None
-        count = 0.0
-
-        nb = 0
-        for b in loader:
-            gt_u, mask_u = engine.map_window_gt_to_uniform(b)  # list length K
-
-            for k in range(len(gt_u)):
-                x = gt_u[k]          # [Nu, F], on engine.device
-                m = mask_u[k]        # [Nu] or None
-
-                if m is not None:
-                    # make boolean mask on same device as x
-                    m_bool = m.to(device=x.device, dtype=torch.bool)
-                    x_sel = x[m_bool]
-                else:
-                    x_sel = x
-
-                if x_sel.numel() == 0:
-                    continue
-
-                # CRITICAL: move to CPU in float32 FIRST (MPS-safe), then accumulate
-                x_cpu = x_sel.detach().to(device="cpu", dtype=torch.float32)
-
-                if sum_x is None:
-                    Fdim = int(x_cpu.shape[1])
-                    sum_x = torch.zeros((Fdim,), dtype=torch.float32, device="cpu")
-                    sum_x2 = torch.zeros((Fdim,), dtype=torch.float32, device="cpu")
-
-                sum_x += x_cpu.sum(dim=0)
-                sum_x2 += (x_cpu * x_cpu).sum(dim=0)
-                count += float(x_cpu.shape[0])
-
-            nb += 1
-            if (max_batches is not None) and (nb >= int(max_batches)):
-                break
-
-        if sum_x is None or count <= 0:
-            raise RuntimeError("Could not compute uniform-mesh norm stats (no samples).")
-
-        mu_ = (sum_x / count).to(dtype=torch.float32)
-        var = (sum_x2 / count) - (mu_ * mu_)
-        var = torch.clamp(var, min=1e-12)
-        sigma_ = torch.sqrt(var).to(dtype=torch.float32)
-
-        return mu_.to(device), sigma_.to(device)
-
-
-    # Build uniform engine early if needed (for norm stats + train/eval)
-    uniform_engine = None
-    if mesh_mode in ("uniform", "uniform_mesh", "constant_uniform"):
-        from utils.uniform_mesh_engine import UniformMeshEngine  # helper file you created
-
-        # Hooks come from your existing codebase (these names already exist in your file)
-        #   _build_X, _forward_main_head, coarse_aggregate_from_dynamic, laplacian_smoothness, temporal_consistency
-        lap_w = float(cfg["loss"].get("laplacian_weight", 0.0))
-        tmp_w = float(cfg["loss"].get("temporal_weight", 0.0))
-
-        uniform_engine = UniformMeshEngine(
-            cfg=cfg,
-            device=device,
-            H0=H,
-            W0=W,
-            Hu=uniform_H,
-            Wu=uniform_W,
-            bbox=tuple(cfg.get("data", {}).get("bbox", (0.0, 1.0, 0.0, 1.0))),
-            build_X_fn=_build_X,
-            forward_fn=_forward_main_head,
-            coarse_agg_fn=coarse_aggregate_from_dynamic,
-            lap_fn=laplacian_smoothness if lap_w > 0 else None,
-            tmp_fn=temporal_consistency if tmp_w > 0 else None,
-            teacher_forcing=uniform_teacher_forcing,
-            diag_edges=uniform_diag_edges,
-        )
-
-    if do_norm and (mu is None or sigma is None):
-        if mesh_mode in ("predicted", "precomputed", "nonuniform", "amr"):
-            # EXACT current behavior
-            mu, sigma = _compute_norm_stats_from_loader(train_loader, device)
-            cfg.setdefault("features", {}).setdefault("norm_stats", {})
-            cfg["features"]["norm_stats"]["mu"] = mu.tolist()
-            cfg["features"]["norm_stats"]["sigma"] = sigma.tolist()
-            mu = mu.to(device)
-            sigma = sigma.to(device)
-        else:
-            # uniform mode: compute stats on the actual uniform-mapped GT used by training
-            max_batches = feats_cfg.get("norm_max_batches", None)  # optional; None => full loader
-            mu, sigma = _compute_norm_stats_uniform_from_loader(uniform_engine, train_loader, device, max_batches=max_batches)
-            cfg.setdefault("features", {}).setdefault("norm_stats", {})
-            cfg["features"]["norm_stats"]["mu"] = mu.detach().cpu().tolist()
-            cfg["features"]["norm_stats"]["sigma"] = sigma.detach().cpu().tolist()
-    elif do_norm:
-        mu = mu.to(device)
-        sigma = sigma.to(device)
-    else:
-        mu = sigma = None
-
-    # -------- training loop (branched; predicted path unchanged) --------
-    os.makedirs(cfg["train"]["save_dir"], exist_ok=True)
-    log_csv = os.path.join(cfg["train"]["save_dir"], "train_log.csv")
-    with open(log_csv, "w") as f:
-        f.write("epoch,split,loss,mae\n")
-
-    print(f"[INFO] Starting training (mesh_mode={mesh_mode})...")
-    best_val = float("inf")
-    TR, VL = [], []
-
-    for epoch in range(1, int(cfg["train"]["epochs"]) + 1):
-        t0 = time.time()
-
-        # (kept from your current code; harmless)
-        _ = next(iter(train_loader))
-
-        if mesh_mode in ("predicted", "precomputed", "nonuniform", "amr"):
-            tr_loss, tr_mae, tr_stats = train_one_epoch_multi_step(
-                model, train_loader, opt, cfg, device,
-                H=H, W=W, dx=dx, dy=dy, mu=mu, sigma=sigma
-            )
-            vl_loss, vl_stats = evaluate_one_epoch_multi_step(
-                model, val_loader, cfg, device,
-                H=H, W=W, dx=dx, dy=dy, mu=mu, sigma=sigma,
-                collect_examples=False
-            )
-        else:
-            tr_loss, tr_mae, tr_stats = uniform_engine.train_one_epoch(
-                model, train_loader, opt, mu=mu, sigma=sigma, scaler=None
-            )
-            vl_loss, vl_stats = uniform_engine.evaluate_one_epoch(
-                model, val_loader, mu=mu, sigma=sigma, collect_examples=False
-            )
-
-        TR.append(tr_loss)
-        VL.append(vl_loss)
-
-        with open(log_csv, "a") as f:
-            f.write(f"{epoch},train,{tr_loss:.10f},{tr_mae:.10f}\n")
-            f.write(f"{epoch},val,{vl_loss:.6f}\n")
-
-        if vl_loss < best_val:
-            best_val = vl_loss
-            torch.save(model.state_dict(), os.path.join(cfg["train"]["save_dir"], "best_model.pt"))
-
-        dt = time.time() - t0
-
-        # keep ReduceLROnPlateau param-groups safe (UNCHANGED)
-        if scheduler is not None and hasattr(scheduler, "min_lrs"):
-            if len(scheduler.min_lrs) != len(opt.param_groups):
-                base_min = scheduler.min_lrs[0] if scheduler.min_lrs else float(
-                    cfg.get("scheduler", {}).get("min_lr", 1e-6)
-                )
-                scheduler.min_lrs = [base_min] * len(opt.param_groups)
-
-        if scheduler is not None:
-            scheduler.step(vl_loss)
-
-        print(
-            f"[INFO] Epoch {epoch:03d}: "
-            f"train {tr_loss:.6f} (MAE {tr_mae:.6f}) | "
-            f"val {vl_loss:.6f} | "
-            f"{dt:.1f}s | lr={_get_lr(opt):.3e}"
-        )
-
-    # -------- save last bundle (predicted path includes precomp EXACTLY; uniform stores no precomp) --------
-    def _precomp_to_cpu(precomp_obj):
-        out = {}
-        for key, lst in precomp_obj.items():
-            if isinstance(lst, list):
-                new_lst = []
-                for v in lst:
-                    if torch.is_tensor(v):
-                        new_lst.append(v.detach().cpu())
-                    elif isinstance(v, tuple):
-                        new_lst.append(tuple(x.detach().cpu() if torch.is_tensor(x) else x for x in v))
-                    else:
-                        new_lst.append(v)
-                out[key] = new_lst
-            else:
-                out[key] = lst
-        return out
-
-    save_dict = {
-        "model": model.state_dict(),
-        "norm_stats": {
-            "mu": None if mu is None else mu.detach().cpu().tolist(),
-            "sigma": None if sigma is None else sigma.detach().cpu().tolist(),
-        },
-        "cfg": cfg,
-    }
-
-    if mesh_mode in ("predicted", "precomputed", "nonuniform", "amr"):
-        precomp_cpu = _precomp_to_cpu(precomp)
-        save_dict["precomp"] = precomp_cpu
-    else:
-        save_dict["precomp"] = None
-        save_dict["uniform_mesh"] = {
-            "Hu": int(uniform_H),
-            "Wu": int(uniform_W),
-            "teacher_forcing": bool(uniform_teacher_forcing),
-            "diag_edges": bool(uniform_diag_edges),
-            "bbox": tuple(cfg.get("data", {}).get("bbox", (0.0, 1.0, 0.0, 1.0))),
-        }
-
-    torch.save(save_dict, os.path.join(cfg["train"]["save_dir"], "last_model.pt"))
-
-    plot_loss_curves(
-        os.path.join(cfg["train"]["save_dir"], "loss_curves.png"),
-        list(range(1, len(TR) + 1)),
-        TR, VL
-    )
-
-    # -------- test evaluation --------
-    print("test_loader length:", len(test_loader))
-    print("=== Running test evaluation ===")
-
-    if mesh_mode in ("predicted", "precomputed", "nonuniform", "amr"):
-        test_loss, test_stats = evaluate_one_epoch_multi_step(
-            model,
-            test_loader,
-            cfg,
-            device,
-            H=H,
-            W=W,
-            dx=dx,
-            dy=dy,
-            mu=mu,
-            sigma=sigma,
-            collect_examples=True,
-        )
-
-        print(f"[TEST] loss={test_loss:.4e}")
-
-        # Preserve your existing qualitative pipeline exactly as before:
-        # (If you have additional plotting blocks below in your file, keep them unchanged.)
-        test_examples = test_stats["examples"]
-
-        out_pdf = os.path.join(cfg["train"]["save_dir"], "qual_with_deltas.pdf")
-        feature_names = cfg.get("features", {}).get("names", ["U", "V", "E"])
-        print(f"[INFO] Generating qualitative PDF with deltas: {out_pdf}")
-
-        plot_qual_pdf(
-            examples=test_examples,
-            cfg=cfg,
-            out_pdf_path=out_pdf,
-            feature_names=feature_names,
-            unify_clims=False,
-            dpi=150,
-            rasterize=True,
-            colorbars="row",
-        )
-
-    else:
-        test_loss, test_stats = uniform_engine.evaluate_one_epoch(
-            model,
-            test_loader,
-            mu=mu,
-            sigma=sigma,
-            collect_examples=True,
-        )
-
-        print(f"[UNIFORM TEST] loss={test_loss:.4e}")
-        # Save test metrics/examples for later inspection (plotting differs from AMR pipeline)
-        torch.save(
-            {"loss": float(test_loss), "stats": test_stats},
-            os.path.join(cfg["train"]["save_dir"], "uniform_test_stats.pt")
-        )
-        print("[INFO] Saved uniform test stats to uniform_test_stats.pt")
-
-        test_examples = test_stats["examples"]
-
-        out_pdf = os.path.join(cfg["train"]["save_dir"], "qual_with_deltas_uniform.pdf")
-        feature_names = cfg.get("features", {}).get("names", ["U", "V", "E"])
-        print(f"[INFO] Generating qualitative PDF with deltas: {out_pdf}")
-
-        plot_qual_pdf(
-            examples=test_examples,
-            cfg=cfg,
-            out_pdf_path=out_pdf,
-            feature_names=feature_names,
-            unify_clims=False,
-            dpi=150,
-            rasterize=True,
-            colorbars="row",
-        )
-'''
-
+    # Save config file                                                                                                                                                        
+    save_config(os.path.join(cfg["train"]["save_dir"]), cfg)
+                
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()

@@ -138,7 +138,8 @@
     "print_loss_components": false,
     "nan_watch": false,
     "nan_first_only": false,
-    "dbg_dec_ops": false
+    "dbg_dec_ops": false,
+    "budget_watch": true
   },
   "speed": {
     "interp_chunk": 4096
