@@ -48,7 +48,7 @@ from pretrain import make_collate_with_precompute, \
 
 from utils.precomp_h5 import LazyPrecompH5
 from utils.uniform_mesh_engine import UniformMeshEngine
-import utils.dec_ops as dec
+import utils.dec_ops_modified as dec
 
 
 debug_once = False
@@ -1162,9 +1162,18 @@ def train_one_epoch_multi_step(
                                 r_phy_abs = base
 
                         # Channel mask: use the same selection logic as PARC inputs
-                        sel = dec.parc_select_feature_indices(cfg, x_in_abs.size(1))  # list[int]
-                        ch_mask = torch.zeros((x_in_abs.size(1),), device=device, dtype=torch.float32)
-                        ch_mask[torch.as_tensor(sel, device=device)] = 1.0
+                        #sel = dec.parc_select_feature_indices(cfg, x_in_abs.size(1))  # list[int]
+                        #ch_mask = torch.zeros((x_in_abs.size(1),), device=device, dtype=torch.float32)
+                        #ch_mask[torch.as_tensor(sel, device=device)] = 1.0
+
+                        Fdim = x_in_abs.size(1)
+                        sel_adv  = dec.parc_select_feature_indices_adv(cfg, Fdim)
+                        sel_diff = dec.parc_select_feature_indices_diff(cfg, Fdim)
+                        sel = sorted(set(sel_adv + sel_diff))
+
+                        ch_mask = torch.zeros((Fdim,), device=device, dtype=torch.float32)
+                        if len(sel) > 0:
+                            ch_mask[torch.as_tensor(sel, device=device)] = 1.0
 
                     # ---------------------------
                     # NAN DEBUG: physics operator outputs
@@ -1261,6 +1270,130 @@ def train_one_epoch_multi_step(
                     if parc_extra is not None:
                         _assert_finite("parc_extra", parc_extra)
                     _assert_finite("x_in (final)", x_in)
+
+                # one-time print guard
+                if not hasattr(train_one_epoch_multi_step, "_printed_input_contract"):
+                    train_one_epoch_multi_step._printed_input_contract = False
+
+                if (not train_one_epoch_multi_step._printed_input_contract):
+                    Fdim = x_in_abs.size(1)
+
+                    # Base X is built from norm_in + geometry (pos, level, etc.)
+                    base_X = _build_X(norm_in, pred_centers, pred_levels, cfg)
+
+                    print("\n[BASE_X BREAKDOWN]")
+                    print("  base_X shape:", tuple(base_X.shape))
+
+                    # 1) state part (should be 4 channels when Fdim=4)
+                    print("  assuming first Fdim columns are state:", Fdim)
+
+                    state_block = base_X[:, :Fdim]
+                    _tstats("  state_block(base_X[:, :Fdim])", state_block)
+
+                    # label state channels using your infer_feature_indices mapping
+                    idx = dec.infer_feature_indices(cfg, Fdim)
+                    inv = {v: k for k, v in idx.items()}
+                    for j in range(Fdim):
+                        _tstats(f"  state[{j}]={inv.get(j, f'idx{j}')}", state_block[:, j])
+
+                    # 2) the remainder (geometry / extras)
+                    extra_block = base_X[:, Fdim:]
+                    print("  extra_block dim:", int(extra_block.size(1)))
+                    _tstats("  extra_block(base_X[:, Fdim:])", extra_block)
+
+                    # 3) try to interpret extras as [pos(x,y?) , level?] based on tensors you have
+                    # pred_centers is typically [N,2]
+                    if torch.is_tensor(pred_centers):
+                        print("  pred_centers shape:", tuple(pred_centers.shape))
+                        _tstats("  pred_centers[:,0]", pred_centers[:, 0])
+                        if pred_centers.size(1) > 1:
+                            _tstats("  pred_centers[:,1]", pred_centers[:, 1])
+
+                    if torch.is_tensor(pred_levels):
+                        print("  pred_levels shape:", tuple(pred_levels.shape))
+                        _tstats("  pred_levels", pred_levels.to(dtype=base_X.dtype))
+
+                    # 4) correlation check: see if any extra column matches x, y, or level (up to scaling)
+                    def _corr(a, b, eps=1e-12):
+                        a = a.flatten().to(torch.float32)
+                        b = b.flatten().to(torch.float32)
+                        a = a - a.mean()
+                        b = b - b.mean()
+                        denom = (a.std() * b.std()).clamp_min(eps)
+                        return float((a*b).mean() / denom)
+
+                    if extra_block.numel() > 0:
+                        for kcol in range(extra_block.size(1)):
+                            col = extra_block[:, kcol]
+                            msg = f"  extra_col[{kcol}] stats:"
+                            print(msg, "min/max =", float(col.min().cpu()), float(col.max().cpu()))
+                            if torch.is_tensor(pred_centers):
+                                cx = pred_centers[:, 0].to(device=col.device, dtype=col.dtype)
+                                print(f"    corr(extra[{kcol}], center_x) =", _corr(col, cx))
+                                if pred_centers.size(1) > 1:
+                                    cy = pred_centers[:, 1].to(device=col.device, dtype=col.dtype)
+                                    print(f"    corr(extra[{kcol}], center_y) =", _corr(col, cy))
+                            if torch.is_tensor(pred_levels):
+                                lv = pred_levels.to(device=col.device, dtype=col.dtype)
+                                print(f"    corr(extra[{kcol}], level)    =", _corr(col, lv))
+
+                    base_dim = base_X.size(1)
+                    total_dim = x_in.size(1)
+
+                    # Selections used for PARC inputs
+                    sel_adv  = dec.parc_select_feature_indices_adv(cfg, Fdim)
+                    sel_diff = dec.parc_select_feature_indices_diff(cfg, Fdim)
+
+                    idx = dec.infer_feature_indices(cfg, Fdim)
+                    inv = {v: k for k, v in idx.items()}  # index->name
+
+                    def _names(sel):
+                        return [inv.get(int(i), f"idx{i}") for i in sel]
+
+                    print("\n[INPUT-CONTRACT]")
+                    print("  Fdim(state channels):", Fdim)
+                    print("  base_X dim:", base_dim)
+                    print("  parc_extra dim:", 0 if parc_extra is None else int(parc_extra.size(1)))
+                    print("  total x_in dim:", total_dim)
+                    print("  adv sel idx:", sel_adv, "names:", _names(sel_adv))
+                    print("  diff sel idx:", sel_diff, "names:", _names(sel_diff))
+
+                    # sanity: expected parc dim = len(sel_adv)+len(sel_diff) (given include flags)
+                    loss = cfg.get("loss", {}) or {}
+                    inc_adv = bool(loss.get("parc_include_adv", True))
+                    inc_diff = bool(loss.get("parc_include_diff", True))
+                    expected_parc = (len(sel_adv) if inc_adv else 0) + (len(sel_diff) if inc_diff else 0)
+                    got_parc = 0 if parc_extra is None else int(parc_extra.size(1))
+                    print("  expected parc_extra dim:", expected_parc, "got:", got_parc)
+
+                    # check model expected input dim (FeatureNet first layer)
+                    try:
+                        # For SAGEConv, lin_l has in_channels = model.in_channels
+                        # but FeatureNet might store it differently; try both:
+                        model_in = getattr(model, "in_channels", None)
+                        if model_in is None and hasattr(model, "convs") and len(model.convs) > 0 and hasattr(model.convs[0], "lin_l"):
+                            model_in = model.convs[0].lin_l.in_features
+                        print("  model expects in_channels:", model_in)
+                    except Exception as e:
+                        print("  [WARN] couldn't infer model in_channels:", repr(e))
+
+                    train_one_epoch_multi_step._printed_input_contract = True
+
+                    if parc_extra is not None and parc_extra.numel() > 0:
+                        print("[INPUT-CONTRACT] parc_extra stats:")
+                        _tstats("parc_extra", parc_extra)
+
+                        # split the block into adv and diff pieces to confirm ordering
+                        la = len(dec.parc_select_feature_indices_adv(cfg, x_in_abs.size(1)))
+                        ld = len(dec.parc_select_feature_indices_diff(cfg, x_in_abs.size(1)))
+
+                        off = 0
+                        if la > 0:
+                            _tstats("parc_adv_block", parc_extra[:, off:off+la])
+                            off += la
+                        if ld > 0:
+                            _tstats("parc_diff_block", parc_extra[:, off:off+ld])
+
 
                 # ----- network outputs correction rate in model units -----
                 y_corr = _forward_main_head_with_edge_attr(model, x_in, pei, edge_attr=pea)
@@ -2660,7 +2793,7 @@ def identity_collate(batch):
     # batch is a list of length == batch_size; we use batch_size=1
     return batch[0]
 
-
+'''
 def build_model_from_cfg(cfg, device):
 
     # match how you did it in main():
@@ -2690,6 +2823,32 @@ def build_model_from_cfg(cfg, device):
     ).to(device)
     
     return model
+'''
+def build_model_from_cfg(cfg, device):
+    use_cols = cfg.get("features", {}).get("use_columns", [0, 1, 2, 3])
+    Fdim = int(cfg.get("features", {}).get("num_features", len(use_cols)))
+
+    b = cfg.get("features", {}).get("build", {})
+    in_ch = Fdim + (2 if b.get("use_pos", True) else 0) + (1 if b.get("use_level", True) else 0)
+
+    loss = cfg.get("loss", {}) or {}
+    parc_on = bool(loss.get("parc", False) or loss.get("parc_inputs", False))
+    if parc_on:
+        in_ch += dec.parc_extra_in_channels(cfg, Fdim)  # <-- now returns len(adv)+len(diff)
+
+    out_ch = Fdim  # predict rate for all state channels
+
+    model = FeatureNet(
+        in_channels=in_ch,
+        out_channels=out_ch,
+        hidden=int(cfg.get("model", {}).get("hidden", 128)),
+        layers=int(cfg.get("model", {}).get("layers", 3)),
+        dropout=float(cfg.get("model", {}).get("dropout", 0.1)),
+        make_score_head=True,
+    ).to(device)
+
+    return model
+
 
 # ------------------------------ Main ------------------------------
 
@@ -2726,7 +2885,7 @@ def main(config_path: str | None = None):
     if bool(loss.get("parc", False)):
         loss["dec"] = True
         loss.setdefault("blend_weight", 1.0)       # Variant-B baseline strength (1.0 recommended)
-        loss.setdefault("channels", ["rho", "E"])  # default physics channels
+        loss.setdefault("channels", ["rho", "x_momentum", "y_momentum", "E"])  # default physics channels
 
     mode = str(loss.get("mode", "diffusion")).lower()
 

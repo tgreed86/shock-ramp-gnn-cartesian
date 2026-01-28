@@ -108,10 +108,10 @@ def infer_feature_indices(cfg: dict, Fdim: int):
 # -----------------------------
 
 def dec_advdiff_terms_abs(
-    x_abs: torch.Tensor,          # [N,F] absolute state at time t on pred mesh
-    edge_index: torch.Tensor,     # [2,E]
-    pred_ea: torch.Tensor,        # [E,5]
-    levels: torch.Tensor,         # [N]
+    x_abs: torch.Tensor,         # [N,F] absolute state on the pred mesh at this step
+    edge_index: torch.Tensor,    # [2,E]
+    pred_ea: torch.Tensor,       # [E,>=5] includes tau in last col
+    levels: torch.Tensor,        # [N]
     *,
     dx0: float,
     dy0: float,
@@ -120,161 +120,262 @@ def dec_advdiff_terms_abs(
     compute_diff: bool = True,
 ):
     """
-    Returns the *components* (absolute units):
-      r_adv_abs  = -div(u*phi)      [N,F]
-      r_diff_abs =  nu * Lap(phi)   [N,F]   (per-channel nu)
-      area       = cell area        [N]
+    Compute operator terms in ABSOLUTE physical units:
+      r_adv_abs  ≈ -div( u * phi )      (same units as dphi/dt)
+      r_diff_abs ≈  nu * Laplacian(phi) (same units as dphi/dt)
 
-    This version computes advection + diffusion ONLY for channels listed in:
-        cfg["loss"]["channels"]  (e.g., ["density","energy"])
-    and fills other channels with zeros.
+    Channel selection (cfg["loss"]):
+      - adv_channels / dec_adv_channels: channels that receive advection term
+      - diff_channels / dec_diff_channels: channels that receive diffusion term
+      - channels (legacy fallback)
     """
-    loss = cfg.get("loss", {}) or {}
-    scheme  = str(loss.get("advection_scheme", "upwind")).lower()
-    rho_eps = float(loss.get("rho_eps", 1e-8))
-
-    # Geometry
-    nx, ny, face_len, _dual_len, tau = edge_attr_unpack(pred_ea)
-    area = cell_area_from_levels(
-        levels, dx0=dx0, dy0=dy0, dtype=x_abs.dtype, device=x_abs.device
-    )  # [N]
-
+    if x_abs.ndim != 2:
+        raise ValueError(f"x_abs must be [N,F], got {tuple(x_abs.shape)}")
     N, Fdim = x_abs.shape
 
-    # ---- infer indices from feature names ----
-    # Expect infer_feature_indices(cfg, F) to return something like {"rho":0,"mx":1,"my":2,"E":3}
-    idx_map = infer_feature_indices(cfg, Fdim)
+    loss = cfg.get("loss", {}) or {}
+    idx = infer_feature_indices(cfg, Fdim)
 
-    # Names users might put into cfg["loss"]["channels"]
-    # Map them to keys that idx_map contains.
-    name_to_key = {
-        "density": "rho",
-        "rho": "rho",
-        "mass": "rho",
+    # --- helpers ---
+    def _names_to_indices(names, *, default):
+        if not names:
+            return list(default)
+        out = []
+        seen = set()
+        for name in names:
+            n = str(name).lower()
+            if ("dens" in n) or (n == "rho"):
+                j = idx["rho"]
+            elif ("ener" in n) or (n == "e"):
+                j = idx["E"]
+            elif ("x" in n and "mom" in n) or (n in ("mx", "x_momentum", "mom_x")):
+                j = idx["mx"]
+            elif ("y" in n and "mom" in n) or (n in ("my", "y_momentum", "mom_y")):
+                j = idx["my"]
+            else:
+                continue
+            if j not in seen:
+                out.append(j)
+                seen.add(j)
+        return out if len(out) > 0 else list(default)
 
-        "x_momentum": "mx",
-        "mx": "mx",
-        "momx": "mx",
+    # --- geometry / weights ---
+    area = cell_area_from_levels(levels, dx0=dx0, dy0=dy0, dtype=x_abs.dtype, device=x_abs.device)  # [N]
 
-        "y_momentum": "my",
-        "my": "my",
-        "momy": "my",
+    # --- edge geometry ---
+    # pred_ea layout: [nx, ny, face_len, dual_len, tau]
+    nx, ny, face_len, _dual_len, tau = edge_attr_unpack(pred_ea)
+    nx = nx.to(dtype=x_abs.dtype)
+    ny = ny.to(dtype=x_abs.dtype)
+    face_len = face_len.to(dtype=x_abs.dtype)
+    tau = tau.to(dtype=x_abs.dtype)
 
-        "energy": "E",
-        "e": "E",
-        "total_energy": "E",
-    }
+    # --- velocity from FULL conserved state (uses rho,mx,my) ---
+    rho_eps = float(loss.get("rho_eps", 1e-8))
+    vel = compute_velocity_from_state(x_abs, cfg, eps=rho_eps)  # [N,2]
 
-    channels = loss.get("channels", None)
-    if channels is None:
-        # default consistent with your intent
-        channels = ["density", "energy"]
+    if not hasattr(dec_advdiff_terms_abs, "_printed_vel"):
+        dec_advdiff_terms_abs._printed_vel = False
 
-    sel = []
-    for ch in channels:
-        ch_norm = str(ch).strip().lower()
-        if ch_norm not in name_to_key:
-            raise ValueError(
-                f"Unknown channel name '{ch}'. Expected one of: {sorted(name_to_key.keys())}"
-            )
-        key = name_to_key[ch_norm]
-        if key not in idx_map:
-            raise ValueError(
-                f"infer_feature_indices did not return key '{key}'. Got keys: {sorted(idx_map.keys())}"
-            )
-        sel.append(int(idx_map[key]))
+    if not dec_advdiff_terms_abs._printed_vel:
+        print("[DEC] vel stats:")
+        print("  vel shape:", tuple(vel.shape))
+        print("  vel abs max:", float(vel.abs().max().detach().cpu()))
+        dec_advdiff_terms_abs._printed_vel = True
 
-    # de-duplicate while preserving order
-    seen = set()
-    sel = [i for i in sel if not (i in seen or seen.add(i))]
+    # --- channel selections ---
+    legacy = loss.get("channels", None)
+    adv_names  = (loss.get("adv_channels", None)
+                  or loss.get("dec_adv_channels", None)
+                  or legacy)
+    diff_names = (loss.get("diff_channels", None)
+                  or loss.get("dec_diff_channels", None)
+                  or legacy)
 
-    # If user config accidentally empties channels, just return zeros
-    r_adv = torch.zeros_like(x_abs)
-    r_diff = torch.zeros_like(x_abs)
-    if len(sel) == 0:
-        return r_adv, r_diff, area
+    default = [idx["rho"], idx["E"]]  # legacy default if nothing provided
+    sel_adv  = _names_to_indices(adv_names,  default=default)
+    sel_diff = _names_to_indices(diff_names, default=default)
 
-    phi_sel = x_abs[:, sel]  # [N, Csel]
+    # allocate full-sized outputs (fill selected columns only)
+    r_adv  = x_abs.new_zeros((N, Fdim))
+    r_diff = x_abs.new_zeros((N, Fdim))
 
-    # ----- advection component (only for selected channels) -----
-    if compute_adv:
-        # Velocity is still computed from full state (needs rho,mx,my).
-        vel = compute_velocity_from_state(x_abs, cfg, eps=rho_eps)  # [N,2]
-        div_adv_sel = dec_divergence_advective_flux(
-            phi=phi_sel,
+    # ----- advection component -----
+    if compute_adv and (len(sel_adv) > 0):
+        phi_adv = x_abs[:, sel_adv]  # [N,Ca]
+        scheme = str(loss.get("advection_scheme", "upwind")).lower()
+
+        div_adv = dec_divergence_advective_flux(
+            phi=phi_adv,
             vel=vel,
             edge_index=edge_index,
             nx=nx, ny=ny,
             face_len=face_len,
             area=area,
             scheme=scheme,
-        )  # [N, Csel]
-        r_adv[:, sel] = -div_adv_sel
+        )  # [N,Ca]
 
-    dbg = bool(cfg.get("debug", {}).get("dbg_dec_ops", False))
-    if dbg:
-        idx = infer_feature_indices(cfg, x_abs.size(1))
-        rho = x_abs[:, idx["rho"]]
-        mx  = x_abs[:, idx["mx"]]
-        my  = x_abs[:, idx["my"]]
-        print("\n[DEC-DBG] velocity inputs")
-        print("  rho<=0 count:", int((rho <= 0).sum().item()))
-        print("  |rho|<1e-8 count:", int((rho.abs() < 1e-8).sum().item()))
-        _tstats("rho", rho)
-        _tstats("mx", mx)
-        _tstats("my", my)
-        _tstats("vel(ux,uy)", vel)
-        if not torch.isfinite(vel).all():
-            bad = (~torch.isfinite(vel)).any(dim=1).nonzero(as_tuple=False).view(-1)
-            print("[DEC-DBG] nonfinite vel rows (first 10):", bad[:10].tolist())
+        r_adv[:, sel_adv] = -div_adv
 
-    # ----- diffusion component (only for selected channels) -----
-    if compute_diff:
+    # ----- diffusion component -----
+    if compute_diff and (len(sel_diff) > 0):
+        # nu is scalar or length-F; build full then slice
         nu_full = as_nu_tensor(loss.get("nu", 0.0), Fdim, device=x_abs.device, dtype=x_abs.dtype)  # [F]
-        nu_sel = nu_full[sel]  # [Csel]
-        lap_sel = dec_laplacian(phi_sel, edge_index=edge_index, tau=tau, area=area)  # [N, Csel]
-        r_diff[:, sel] = lap_sel * nu_sel.view(1, -1)
+        nu_sel  = nu_full[torch.as_tensor(sel_diff, device=x_abs.device)].view(1, -1)              # [1,Cd]
 
-    return r_adv, r_diff, area
+        phi_diff = x_abs[:, sel_diff]  # [N,Cd]
+        lap = dec_laplacian(phi_diff, edge_index=edge_index, tau=tau, area=area)  # [N,Cd]
+        r_diff[:, sel_diff] = lap * nu_sel
+
+    return (r_adv if compute_adv else None), (r_diff if compute_diff else None), area
+
+
+def _channels_to_indices(cfg: dict, Fdim: int, names, *, default: list[int]) -> list[int]:
+    """Map a list of human-readable channel names to integer indices."""
+    idx = infer_feature_indices(cfg, Fdim)
+    if not names:
+        return list(default)
+
+    out: list[int] = []
+    for name in names:
+        n = str(name).lower()
+        if ("dens" in n) or (n == "rho"):
+            out.append(idx["rho"])
+        elif ("ener" in n) or (n == "e"):
+            out.append(idx["E"])
+        elif (("x" in n) and ("mom" in n)) or (n in ("mx", "momx", "mom_x", "xmom", "x_momentum")):
+            out.append(idx["mx"])
+        elif (("y" in n) and ("mom" in n)) or (n in ("my", "momy", "mom_y", "ymom", "y_momentum")):
+            out.append(idx["my"])
+
+    # fallback if user provided something unusable
+    if len(out) == 0:
+        out = list(default)
+
+    # de-dup while preserving order
+    seen = set()
+    out2 = []
+    for i in out:
+        if i not in seen:
+            out2.append(int(i))
+            seen.add(i)
+    return out2
+
+def _names_to_indices(cfg: dict, Fdim: int, names, default: list[int]) -> list[int]:
+    """
+    Map channel-name strings to indices using infer_feature_indices().
+    Preserves order and removes duplicates.
+    """
+    idx = infer_feature_indices(cfg, Fdim)
+    if not names:
+        return list(default)
+
+    out = []
+    for name in names:
+        n = str(name).lower()
+        if ("dens" in n) or (n == "rho") or (n == "density"):
+            out.append(idx["rho"])
+        elif ("ener" in n) or (n == "e") or (n == "energy"):
+            out.append(idx["E"])
+        elif (("x" in n) and ("mom" in n)) or (n in ("mx", "mom_x", "x_momentum")):
+            out.append(idx["mx"])
+        elif (("y" in n) and ("mom" in n)) or (n in ("my", "mom_y", "y_momentum")):
+            out.append(idx["my"])
+
+    # de-dup, keep order
+    seen = set()
+    out2 = []
+    for i in out:
+        if i not in seen:
+            seen.add(i)
+            out2.append(i)
+
+    return out2 if len(out2) > 0 else list(default)
+
+
+def parc_select_feature_indices_adv(cfg: dict, Fdim: int) -> list[int]:
+    """
+    Which state channels get *advection* operator-term inputs.
+
+    Priority:
+      1) loss.parc_input_channels_adv (list[str])
+      2) loss.adv_channels / loss.dec_adv_channels (list[str])
+      3) loss.parc_input_channels (list[str])
+      4) loss.channels (list[str])
+      5) default [rho, E]
+    """
+    loss = cfg.get("loss", {}) or {}
+    idx = infer_feature_indices(cfg, Fdim)
+    default = [idx["rho"], idx["E"]]
+
+    names = (loss.get("parc_input_channels_adv", None)
+             or loss.get("adv_channels", None)
+             or loss.get("dec_adv_channels", None)
+             or loss.get("parc_input_channels", None)
+             or loss.get("channels", None))
+
+    return _channels_to_indices(cfg, Fdim, names, default=default)
+
+
+def parc_select_feature_indices_diff(cfg: dict, Fdim: int) -> list[int]:
+    """
+    Which state channels get *diffusion* operator-term inputs.
+
+    Priority:
+      1) loss.parc_input_channels_diff (list[str])
+      2) loss.diff_channels / loss.dec_diff_channels (list[str])
+      3) loss.parc_input_channels (list[str])
+      4) loss.channels (list[str])
+      5) default [rho, E]
+    """
+    loss = cfg.get("loss", {}) or {}
+    idx = infer_feature_indices(cfg, Fdim)
+    default = [idx["rho"], idx["E"]]
+
+    names = (loss.get("parc_input_channels_diff", None)
+             or loss.get("diff_channels", None)
+             or loss.get("dec_diff_channels", None)
+             or loss.get("parc_input_channels", None)
+             or loss.get("channels", None))
+
+    return _channels_to_indices(cfg, Fdim, names, default=default)
 
 
 def parc_select_feature_indices(cfg: dict, Fdim: int) -> list[int]:
     """
     Which state channels get operator-term inputs.
-    Defaults to rho + E unless overridden.
 
-    Priority:
-      1) loss.parc_input_channels (list of strings)
-      2) loss.channels (list of strings)
-      3) default [rho, E]
+    Backwards compatible:
+      - If you don't specify any split adv/diff channel keys, this behaves like the
+        original implementation (defaults to rho + E unless overridden).
+
+    If you *do* specify split keys (adv_channels/diff_channels or parc_input_channels_*),
+    this returns the UNION of the adv+diff selections. This is useful for building masks
+    that should cover all physics-touched channels (baseline/residual).
     """
     loss = cfg.get("loss", {}) or {}
+
+    has_split = any(
+        k in loss and loss.get(k, None)
+        for k in ("parc_input_channels_adv", "parc_input_channels_diff",
+                  "adv_channels", "diff_channels", "dec_adv_channels", "dec_diff_channels")
+    )
+    if has_split:
+        sel_adv = parc_select_feature_indices_adv(cfg, Fdim)
+        sel_diff = parc_select_feature_indices_diff(cfg, Fdim)
+        return sorted(set(sel_adv + sel_diff))
+
+    # ---- original behavior ----
     names = loss.get("parc_input_channels", None)
     if not names:
         names = loss.get("channels", None)
 
     idx = infer_feature_indices(cfg, Fdim)
-
     if not names:
         return [idx["rho"], idx["E"]]
 
-    out: list[int] = []
-    for name in names:
-        n = str(name).lower()
-        if "dens" in n or n == "rho":
-            out.append(idx["rho"])
-        elif "ener" in n or n == "e":
-            out.append(idx["E"])
-        elif "x" in n and "mom" in n:
-            out.append(idx["mx"])
-        elif "y" in n and "mom" in n:
-            out.append(idx["my"])
-
-    # fallback if user provided something unusable
-    if len(out) == 0:
-        out = [idx["rho"], idx["E"]]
-    return out
-
+    default = [idx["rho"], idx["E"]]
+    return _channels_to_indices(cfg, Fdim, names, default=default)
 
 def parc_terms_to_node_inputs(
     r_adv_abs: torch.Tensor | None,     # [N,F] absolute or None
@@ -298,6 +399,11 @@ def parc_terms_to_node_inputs(
       parc_input_weighted: bool (default False)
       parc_detach_inputs: bool (default True)
 
+      --- channel selection ---
+      parc_input_channels_adv / parc_input_channels_diff (list[str])  # inputs-only
+      adv_channels / diff_channels (list[str])                        # ops + inputs (default fallback)
+      channels (list[str])                                            # legacy fallback
+
     Returns: node_inputs [N, Cextra]
     """
     loss = cfg.get("loss", {}) or {}
@@ -314,7 +420,10 @@ def parc_terms_to_node_inputs(
         raise ValueError("parc_terms_to_node_inputs: both r_adv_abs and r_diff_abs are None")
 
     Fdim = base.size(1)
-    sel = parc_select_feature_indices(cfg, Fdim)
+
+    # Channel subsets for adv/diff inputs (can be different)
+    sel_adv = parc_select_feature_indices_adv(cfg, Fdim)
+    sel_diff = parc_select_feature_indices_diff(cfg, Fdim)
 
     # optional weighting (usually keep False; let NN learn mixing)
     adv_abs = None
@@ -350,9 +459,9 @@ def parc_terms_to_node_inputs(
 
     blocks = []
     if include_adv and (adv_u is not None):
-        blocks.append(adv_u[:, sel])
+        blocks.append(adv_u[:, sel_adv])
     if include_diff and (diff_u is not None):
-        blocks.append(diff_u[:, sel])
+        blocks.append(diff_u[:, sel_diff])
 
     if len(blocks) == 0:
         out = base.new_zeros((base.size(0), 0), dtype=dtype)
@@ -364,20 +473,26 @@ def parc_terms_to_node_inputs(
         out = out.detach()
     return out
 
-
 def parc_extra_in_channels(cfg: dict, Fdim: int) -> int:
     """
-    Convenience: how many extra node channels are appended when PARC inputs are enabled.
+    How many PARC operator-derived channels are concatenated onto X.
+    With adv/diff having independent channel sets:
+      extra = (include_adv ? len(sel_adv) : 0) + (include_diff ? len(sel_diff) : 0)
     """
     loss = cfg.get("loss", {}) or {}
     include_adv = bool(loss.get("parc_include_adv", True))
     include_diff = bool(loss.get("parc_include_diff", True))
-    sel = parc_select_feature_indices(cfg, Fdim)
-    m = len(sel)
+
+    sel_adv = parc_select_feature_indices_adv(cfg, Fdim)
+    sel_diff = parc_select_feature_indices_diff(cfg, Fdim)
+
     extra = 0
-    if include_adv:  extra += m
-    if include_diff: extra += m
-    return extra
+    if include_adv:
+        extra += len(sel_adv)
+    if include_diff:
+        extra += len(sel_diff)
+    return int(extra)
+
 
 def edge_attr_unpack(pred_ea: torch.Tensor):
     """
