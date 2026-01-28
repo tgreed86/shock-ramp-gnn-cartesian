@@ -98,8 +98,8 @@
     "parc_include_adv": true,
     "parc_include_diff": true,
 
-    "mode": "diffusion",
-    "channels": ["density", "energy"],
+    "diff_channels": ["density", "energy"],
+    "adv_channels": ["x_momentum", "y_momentum"],
     "adv_weight": 1.0,
     "diff_weight": 1.0,
     "nu": 0.0001,
