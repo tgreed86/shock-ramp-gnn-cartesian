@@ -48,11 +48,10 @@ from pretrain import make_collate_with_precompute, \
 
 from utils.precomp_h5 import LazyPrecompH5
 from utils.uniform_mesh_engine import UniformMeshEngine
-import utils.dec_ops_modified as dec
+import utils.dec_ops as dec
 
 
 debug_once = False
-
 
 @torch.no_grad()
 def _compute_norm_stats_from_loader(loader, device):

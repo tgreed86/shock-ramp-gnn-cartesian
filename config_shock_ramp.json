@@ -95,13 +95,19 @@
     "dec": true,
     "parc": true,
     "parc_detach_ops": true,
-    "parc_include_adv": true,
+    
     "parc_include_diff": true,
-
     "diff_channels": ["density", "energy"],
-    "adv_channels": ["x_momentum", "y_momentum"],
-    "adv_weight": 1.0,
     "diff_weight": 1.0,
+
+    "parc_include_adv": true,
+    "advection_type": "euler",
+    "euler_flux_scheme": "rusanov",
+    "gamma": 1.4,
+    "p_floor": 0.0,
+    "adv_channels": ["density", "x_momentum", "y_momentum", "energy"],
+    "adv_weight": 1.0,
+  
     "nu": 0.0001,
 
     "blend_weight": 0.0,

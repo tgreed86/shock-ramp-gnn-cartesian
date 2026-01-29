@@ -66,6 +66,137 @@ def _tstats(name: str, t: torch.Tensor, max_elems: int = 0):
 
     print(msg)
 
+def pressure_from_conservative_state(
+    x_abs: torch.Tensor,  # [N,F] with channels rho,mx,my,E
+    cfg: dict,
+    *,
+    eps: float = 1e-12,
+    clamp_min: float = 0.0,
+) -> torch.Tensor:
+    """
+    Ideal-gas pressure from conservative variables:
+      p = (gamma - 1) * (E - 0.5*(mx^2+my^2)/rho)
+
+    Assumes E is total energy density.
+    """
+    idx = infer_feature_indices(cfg, x_abs.size(1))
+    rho = x_abs[:, idx["rho"]]
+    mx  = x_abs[:, idx["mx"]]
+    my  = x_abs[:, idx["my"]]
+    E   = x_abs[:, idx["E"]]
+
+    # where to read gamma from cfg (with a safe default)
+    gamma = float(cfg.get("physics", {}).get("gamma",
+                 cfg.get("eos", {}).get("gamma", 1.4)))
+
+    rho_safe = rho.abs().clamp_min(eps)
+    kinetic = 0.5 * (mx * mx + my * my) / rho_safe
+    p = (gamma - 1.0) * (E - kinetic)
+
+    if clamp_min is not None:
+        p = p.clamp_min(float(clamp_min))
+    return p
+
+def dec_divergence_euler_flux(
+    x_abs: torch.Tensor,       # [N,F] (expects conservative channels exist)
+    edge_index: torch.Tensor,  # [2,E] (directed edges: src->dst)
+    nx: torch.Tensor,          # [E]
+    ny: torch.Tensor,          # [E]
+    face_len: torch.Tensor,    # [E]
+    area: torch.Tensor,        # [N]
+    cfg: dict,
+    *,
+    scheme: str = "rusanov",
+    eps: float = 1e-8,
+):
+    """
+    Returns div(F) in conservative ordering [rho, mx, my, E] as [N,4],
+    where F is the Euler flux dotted with the edge normal.
+    Uses a Rusanov (local LF) numerical flux by default.
+
+    IMPORTANT: Assumes edge normals (nx,ny) point outward from src toward dst,
+    matching how your scalar div uses directed edges.
+    """
+    loss = cfg.get("loss", {}) or {}
+    gamma = float(loss.get("gamma", 1.4))
+
+    N, Fdim = x_abs.shape
+    idx = infer_feature_indices(cfg, Fdim)
+    euler_idx = [idx["rho"], idx["mx"], idx["my"], idx["E"]]
+
+    # per-node fields
+    rho = x_abs[:, idx["rho"]].abs().clamp_min(eps)
+    mx  = x_abs[:, idx["mx"]]
+    my  = x_abs[:, idx["my"]]
+    E   = x_abs[:, idx["E"]]
+
+    # velocity (reuses your clip logic etc.)
+    vel = compute_velocity_from_state(x_abs, cfg=cfg, eps=eps)  # [N,2]
+    u = vel[:, 0]
+    v = vel[:, 1]
+
+    # pressure & sound speed
+    p = pressure_from_conservative_state(x_abs, cfg=cfg, eps=eps)  # [N]
+    c = torch.sqrt((gamma * p / rho).clamp_min(0.0))               # [N]
+
+    src = edge_index[0].long()
+    dst = edge_index[1].long()
+
+    # gather left/right states and speeds
+    rho_L = rho[src]; mx_L = mx[src]; my_L = my[src]; E_L = E[src]
+    rho_R = rho[dst]; mx_R = mx[dst]; my_R = my[dst]; E_R = E[dst]
+
+    u_L = u[src]; v_L = v[src]
+    u_R = u[dst]; v_R = v[dst]
+
+    p_L = p[src]; p_R = p[dst]
+    c_L = c[src]; c_R = c[dst]
+
+    # normal velocity
+    un_L = u_L * nx + v_L * ny
+    un_R = u_R * nx + v_R * ny
+
+    # physical flux dotted with n, per side: [E,4]
+    # F_n(U) = [ rho*un,
+    #            mx*un + p*nx,
+    #            my*un + p*ny,
+    #            (E+p)*un ]
+    F_L = torch.stack(
+        [
+            rho_L * un_L,
+            mx_L  * un_L + p_L * nx,
+            my_L  * un_L + p_L * ny,
+            (E_L + p_L) * un_L,
+        ],
+        dim=1,
+    )
+    F_R = torch.stack(
+        [
+            rho_R * un_R,
+            mx_R  * un_R + p_R * nx,
+            my_R  * un_R + p_R * ny,
+            (E_R + p_R) * un_R,
+        ],
+        dim=1,
+    )
+
+    scheme = str(scheme).lower()
+    if scheme in ("central", "avg", "average"):
+        F_star = 0.5 * (F_L + F_R)
+    else:
+        # Rusanov / local LF
+        smax = torch.maximum(un_L.abs() + c_L, un_R.abs() + c_R)  # [E]
+        U_L = torch.stack([rho_L, mx_L, my_L, E_L], dim=1)
+        U_R = torch.stack([rho_R, mx_R, my_R, E_R], dim=1)
+        F_star = 0.5 * (F_L + F_R) - 0.5 * smax[:, None] * (U_R - U_L)
+
+    # accumulate divergence on src (directed outward normals)
+    div = x_abs.new_zeros((N, 4))
+    div.index_add_(0, src, face_len[:, None] * F_star)
+    div = div / area.clamp_min(1e-12)[:, None]
+
+    return div
+
 def infer_feature_indices(cfg: dict, Fdim: int):
     """
     Returns indices for density, momx, momy, energy.
@@ -121,13 +252,13 @@ def dec_advdiff_terms_abs(
 ):
     """
     Compute operator terms in ABSOLUTE physical units:
-      r_adv_abs  ≈ -div( u * phi )      (same units as dphi/dt)
-      r_diff_abs ≈  nu * Laplacian(phi) (same units as dphi/dt)
+      r_adv_abs  ≈ -div(F_adv)        (same units as dphi/dt)
+      r_diff_abs ≈  nu * Laplacian(phi)
 
-    Channel selection (cfg["loss"]):
-      - adv_channels / dec_adv_channels: channels that receive advection term
-      - diff_channels / dec_diff_channels: channels that receive diffusion term
-      - channels (legacy fallback)
+    - Advection can be:
+        * "scalar" : -div(u * phi) using dec_divergence_advective_flux
+        * "euler"  : conservative Euler flux divergence on [rho,mx,my,E]
+    - Diffusion stays scalar Laplacian on selected channels (e.g. rho,E).
     """
     if x_abs.ndim != 2:
         raise ValueError(f"x_abs must be [N,F], got {tuple(x_abs.shape)}")
@@ -170,19 +301,6 @@ def dec_advdiff_terms_abs(
     face_len = face_len.to(dtype=x_abs.dtype)
     tau = tau.to(dtype=x_abs.dtype)
 
-    # --- velocity from FULL conserved state (uses rho,mx,my) ---
-    rho_eps = float(loss.get("rho_eps", 1e-8))
-    vel = compute_velocity_from_state(x_abs, cfg, eps=rho_eps)  # [N,2]
-
-    if not hasattr(dec_advdiff_terms_abs, "_printed_vel"):
-        dec_advdiff_terms_abs._printed_vel = False
-
-    if not dec_advdiff_terms_abs._printed_vel:
-        print("[DEC] vel stats:")
-        print("  vel shape:", tuple(vel.shape))
-        print("  vel abs max:", float(vel.abs().max().detach().cpu()))
-        dec_advdiff_terms_abs._printed_vel = True
-
     # --- channel selections ---
     legacy = loss.get("channels", None)
     adv_names  = (loss.get("adv_channels", None)
@@ -192,9 +310,17 @@ def dec_advdiff_terms_abs(
                   or loss.get("dec_diff_channels", None)
                   or legacy)
 
-    default = [idx["rho"], idx["E"]]  # legacy default if nothing provided
-    sel_adv  = _names_to_indices(adv_names,  default=default)
-    sel_diff = _names_to_indices(diff_names, default=default)
+    advection_type = str(loss.get("advection_type", "scalar")).lower()
+
+    # defaults:
+    # - scalar advection default: rho + E (your prior behavior)
+    # - euler advection default: full conservative state
+    default_adv_scalar = [idx["rho"], idx["E"]]
+    default_adv_euler  = [idx["rho"], idx["mx"], idx["my"], idx["E"]]
+    default_diff       = [idx["rho"], idx["E"]]
+
+    sel_adv  = _names_to_indices(adv_names,  default=(default_adv_euler if advection_type == "euler" else default_adv_scalar))
+    sel_diff = _names_to_indices(diff_names, default=default_diff)
 
     # allocate full-sized outputs (fill selected columns only)
     r_adv  = x_abs.new_zeros((N, Fdim))
@@ -202,32 +328,59 @@ def dec_advdiff_terms_abs(
 
     # ----- advection component -----
     if compute_adv and (len(sel_adv) > 0):
-        phi_adv = x_abs[:, sel_adv]  # [N,Ca]
-        scheme = str(loss.get("advection_scheme", "upwind")).lower()
+        if advection_type == "euler":
+            scheme = str(loss.get("euler_flux_scheme", "rusanov")).lower()
+            rho_eps = float(loss.get("rho_eps", 1e-8))
 
-        div_adv = dec_divergence_advective_flux(
-            phi=phi_adv,
-            vel=vel,
-            edge_index=edge_index,
-            nx=nx, ny=ny,
-            face_len=face_len,
-            area=area,
-            scheme=scheme,
-        )  # [N,Ca]
+            div_euler_full = dec_divergence_euler_flux(
+                x_abs=x_abs,
+                edge_index=edge_index,
+                nx=nx, ny=ny,
+                face_len=face_len,
+                area=area,
+                cfg=cfg,
+                scheme=scheme,
+                eps=rho_eps,
+            )  # [N,4] ordered [rho,mx,my,E]
 
-        r_adv[:, sel_adv] = -div_adv
+            euler_idx = [idx["rho"], idx["mx"], idx["my"], idx["E"]]
+            col_map = {j: k for k, j in enumerate(euler_idx)}
+            sel_adv_euler = [j for j in sel_adv if j in col_map]
+            if len(sel_adv_euler) > 0:
+                cols = [col_map[j] for j in sel_adv_euler]
+                r_adv[:, sel_adv_euler] = -div_euler_full[:, cols]
+            # (channels outside the Euler set remain zero)
+
+        else:
+            # scalar advection: -div(u * phi)
+            rho_eps = float(loss.get("rho_eps", 1e-8))
+            vel = compute_velocity_from_state(x_abs, cfg, eps=rho_eps)  # [N,2]
+            phi_adv = x_abs[:, sel_adv]  # [N,Ca]
+            scheme = str(loss.get("advection_scheme", "upwind")).lower()
+
+            div_adv = dec_divergence_advective_flux(
+                phi=phi_adv,
+                vel=vel,
+                edge_index=edge_index,
+                nx=nx, ny=ny,
+                face_len=face_len,
+                area=area,
+                scheme=scheme,
+            )  # [N,Ca]
+
+            r_adv[:, sel_adv] = -div_adv
 
     # ----- diffusion component -----
     if compute_diff and (len(sel_diff) > 0):
-        # nu is scalar or length-F; build full then slice
         nu_full = as_nu_tensor(loss.get("nu", 0.0), Fdim, device=x_abs.device, dtype=x_abs.dtype)  # [F]
-        nu_sel  = nu_full[torch.as_tensor(sel_diff, device=x_abs.device)].view(1, -1)              # [1,Cd]
+        nu_sel  = nu_full[torch.as_tensor(sel_diff, device=x_abs.device)].view(1, -1)             # [1,Cd]
 
         phi_diff = x_abs[:, sel_diff]  # [N,Cd]
         lap = dec_laplacian(phi_diff, edge_index=edge_index, tau=tau, area=area)  # [N,Cd]
         r_diff[:, sel_diff] = lap * nu_sel
 
     return (r_adv if compute_adv else None), (r_diff if compute_diff else None), area
+
 
 
 def _channels_to_indices(cfg: dict, Fdim: int, names, *, default: list[int]) -> list[int]:
