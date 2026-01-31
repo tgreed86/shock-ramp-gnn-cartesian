@@ -33,7 +33,7 @@ from tqdm import tqdm
 
 from dataset import CellRefineTemporalDataset, CellRefineWindowDataset, \
                     preprocess_timesteps_once
-from models import FeatureNet
+from models import FeatureNet, ParcFeatureAdapter
 from amr_policy import coarse_aggregate_from_dynamic, predict_masks_hierarchical_from_gt_gradients
             
 from plots import plot_loss_curves, plot_qual_2x3_pdf, plot_predictions_from_examples_pdf, \
@@ -1079,6 +1079,7 @@ def train_one_epoch_multi_step(
                     _mark_printed()
 
                 if need_phy:
+                    #print("[DEC-CHK] Computing DEC operators for step", step_k)
                     with torch.autocast(device_type=device.type, enabled=False):
 
                         # Only apply advection physics at step 0
@@ -1249,8 +1250,14 @@ def train_one_epoch_multi_step(
                             detach=True,
                         )
 
-                    if (parc_extra is not None) and (parc_extra.numel() > 0):
+                    #if (parc_extra is not None) and (parc_extra.numel() > 0):
                         # parc_extra should already be dtype=x_in.dtype per your call, but keep this safe
+                    #    x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
+                    if (parc_extra is not None) and (parc_extra.numel() > 0):
+                        if not hasattr(model, "parc_adapter"):
+                            raise RuntimeError("parc_use=True but model.parc_adapter is missing. Attach it before optimizer creation.")
+
+                        parc_extra = model.parc_adapter(parc_extra)  # <-- norm + clip + learnable gates
                         x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
 
 
@@ -1976,8 +1983,14 @@ def evaluate_one_epoch_multi_step(
                                 detach=True,
                             )
 
+                        #if (parc_extra is not None) and (parc_extra.numel() > 0):
+                        #    x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
                         if (parc_extra is not None) and (parc_extra.numel() > 0):
+                            if not hasattr(model, "parc_adapter"):
+                                raise RuntimeError("parc_use=True but model.parc_adapter is missing (needed for eval too).")
+                            parc_extra = model.parc_adapter(parc_extra)  # model.eval() => adapter.eval() => frozen stats
                             x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
+
 
                     y_corr = _forward_main_head_with_edge_attr(model, x_in, pei, edge_attr=pea)
 
@@ -2946,6 +2959,27 @@ def main(config_path: str | None = None):
         data_list = torch.load(pt_path)
 
     model = build_model_from_cfg(cfg, device)
+
+    # After model is created, before optimizer is created:
+    loss_cfg = cfg.get("loss", {}) or {}
+    parc_use = bool(loss_cfg.get("parc", False) or loss_cfg.get("parc_inputs", False))
+
+    if parc_use:
+        Fdim = int(cfg.get("features", {}).get("num_features", 4))  # your state size
+        la = len(dec.parc_select_feature_indices_adv(cfg, Fdim))
+        ld = len(dec.parc_select_feature_indices_diff(cfg, Fdim))
+
+        adapter = ParcFeatureAdapter(
+            la, ld,
+            use_norm=bool(loss_cfg.get("parc_feat_norm", True)),
+            clip_pre=float(loss_cfg.get("parc_feat_clip_pre", 10.0)),
+            clip_post=float(loss_cfg.get("parc_feat_clip_post", 10.0)),
+            momentum=float(loss_cfg.get("parc_feat_norm_momentum", 0.02)),
+            per_channel_gates=bool(loss_cfg.get("parc_gate_per_channel", True)),
+            gate_init=float(loss_cfg.get("parc_gate_init", -5.0)),
+        ).to(device)
+
+        model.parc_adapter = adapter
 
     def _get_lr(optimizer):
             return optimizer.param_groups[0]["lr"]

@@ -114,7 +114,14 @@
     "residual_weight": 1e-6,
 
     "rho_floor": 1e-6,
-    "u_clip": 1000.0
+    "u_clip": 1000.0,
+
+    "parc_feat_norm": true,
+    "parc_feat_clip_pre": 10.0,
+    "parc_feat_clip_post": 10.0,
+    "parc_feat_norm_momentum": 0.02,
+    "parc_gate_init": -5.0,
+    "parc_gate_per_channel": true
   },
 
   "eval": {

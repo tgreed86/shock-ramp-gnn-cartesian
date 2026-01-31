@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+import torch.nn as nn
 from torch_geometric.nn import GATConv, GraphUNet
 from torch_geometric.nn import SAGEConv
 import inspect
@@ -665,5 +666,121 @@ class GPARCCompat(nn.Module):
         delta  = self.integrator(dstate, edge_index)         # [N, D]
         return x_dyn + delta if self.use_delta else delta
 '''
+
+
+class ParcFeatureAdapter(nn.Module):
+    """
+    Applies:
+      (1) pre-clip on PARC features
+      (2) running normalization (train updates; eval uses frozen stats)
+      (3) learnable gates (per-channel by default) initialized near 0 influence
+      (4) optional post-clip
+    """
+    def __init__(
+        self,
+        dim_adv: int,
+        dim_diff: int,
+        *,
+        use_norm: bool = True,
+        clip_pre: float = 10.0,
+        clip_post: float = 10.0,
+        momentum: float = 0.02,
+        eps: float = 1e-6,
+        var_floor: float = 1e-6,
+        per_channel_gates: bool = True,
+        gate_init: float = -5.0,   # sigmoid(-5) ~ 0.0067 (starts near OFF)
+    ):
+        super().__init__()
+        self.dim_adv = int(dim_adv)
+        self.dim_diff = int(dim_diff)
+        self.dim = self.dim_adv + self.dim_diff
+
+        self.use_norm = bool(use_norm)
+        self.clip_pre = float(clip_pre) if clip_pre is not None else None
+        self.clip_post = float(clip_post) if clip_post is not None else None
+        self.momentum = float(momentum)
+        self.eps = float(eps)
+        self.var_floor = float(var_floor)
+
+        self.per_channel_gates = bool(per_channel_gates)
+
+        # Running stats in FP32 (stable across AMP / MPS / CUDA)
+        self.register_buffer("running_mean", torch.zeros(self.dim, dtype=torch.float32))
+        self.register_buffer("running_var",  torch.ones(self.dim,  dtype=torch.float32))
+        self.register_buffer("num_updates",  torch.tensor(0, dtype=torch.long))
+
+        # Gates
+        if self.per_channel_gates:
+            self.gate_logits = nn.Parameter(torch.full((self.dim,), float(gate_init), dtype=torch.float32))
+        else:
+            # one scalar for adv block, one for diff block
+            self.gate_adv_logit  = nn.Parameter(torch.tensor(float(gate_init), dtype=torch.float32))
+            self.gate_diff_logit = nn.Parameter(torch.tensor(float(gate_init), dtype=torch.float32))
+
+    def _gate_vector(self, device, dtype):
+        if self.dim == 0:
+            return None
+        if self.per_channel_gates:
+            g = torch.sigmoid(self.gate_logits)  # [dim]
+        else:
+            g_adv  = torch.sigmoid(self.gate_adv_logit)
+            g_diff = torch.sigmoid(self.gate_diff_logit)
+            parts = []
+            if self.dim_adv  > 0: parts.append(g_adv.expand(self.dim_adv))
+            if self.dim_diff > 0: parts.append(g_diff.expand(self.dim_diff))
+            g = torch.cat(parts, dim=0) if len(parts) else torch.zeros((0,), dtype=torch.float32)
+        return g.to(device=device, dtype=dtype).view(1, -1)  # [1,dim]
+
+    def forward(self, parc_extra: torch.Tensor) -> torch.Tensor:
+        if parc_extra is None or parc_extra.numel() == 0:
+            return parc_extra
+        if parc_extra.ndim != 2 or parc_extra.size(1) != self.dim:
+            raise RuntimeError(f"ParcFeatureAdapter expected [N,{self.dim}], got {tuple(parc_extra.shape)}")
+
+        out_dtype = parc_extra.dtype
+        x = parc_extra.to(dtype=torch.float32)
+
+        # 1) pre-clip (limits spikes before stats/gating)
+        if (self.clip_pre is not None) and (self.clip_pre > 0):
+            x = x.clamp(-self.clip_pre, self.clip_pre)
+
+        # 2) normalization
+        if self.use_norm:
+            if self.training:
+                m = x.mean(dim=0)
+                v = (x - m).pow(2).mean(dim=0)  # population var (stable)
+                # EMA update
+                self.running_mean.mul_(1.0 - self.momentum).add_(self.momentum * m)
+                self.running_var.mul_(1.0 - self.momentum).add_(self.momentum * v)
+                self.num_updates.add_(1)
+            denom = torch.sqrt(self.running_var.clamp_min(self.var_floor) + self.eps)
+            x = (x - self.running_mean) / denom
+
+        # 3) learnable gates
+        g = self._gate_vector(device=x.device, dtype=x.dtype)  # [1,dim]
+        if g is not None:
+            x = x * g
+
+        # 4) post-clip (limits extreme normalized values)
+        if (self.clip_post is not None) and (self.clip_post > 0):
+            x = x.clamp(-self.clip_post, self.clip_post)
+
+        return x.to(dtype=out_dtype)
+
+    @torch.no_grad()
+    def gate_values(self):
+        """Convenience for debug prints."""
+        if self.dim == 0:
+            return {"adv": None, "diff": None}
+        if self.per_channel_gates:
+            g = torch.sigmoid(self.gate_logits).detach().cpu()
+            ga = g[:self.dim_adv] if self.dim_adv > 0 else None
+            gd = g[self.dim_adv:] if self.dim_diff > 0 else None
+            return {"adv": ga, "diff": gd}
+        else:
+            return {
+                "adv":  float(torch.sigmoid(self.gate_adv_logit).detach().cpu()),
+                "diff": float(torch.sigmoid(self.gate_diff_logit).detach().cpu()),
+            }
 
 
