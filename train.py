@@ -1275,6 +1275,12 @@ def train_one_epoch_multi_step(
                                 update_diff_stats=diff_active,
                             )
 
+                            # IMPORTANT: prevent normalized “fake adv” on steps where adv is gated off
+                            if not adv_step_gate:
+                                da = int(model.parc_adapter.dim_adv)
+                                if da > 0:
+                                    parc_extra[:, :da] = 0.0
+
                         x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
 
 
@@ -2027,6 +2033,12 @@ def evaluate_one_epoch_multi_step(
                                     update_adv_stats=adv_active,
                                     update_diff_stats=diff_active,
                                 )
+                                
+                            # IMPORTANT: prevent normalized “fake adv” on steps where adv is gated off
+                            if not adv_step_gate:
+                                da = int(model.parc_adapter.dim_adv)
+                                if da > 0:
+                                    parc_extra[:, :da] = 0.0                                
 
                             x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
 
