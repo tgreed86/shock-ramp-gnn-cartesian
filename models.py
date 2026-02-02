@@ -682,13 +682,13 @@ class ParcFeatureAdapter(nn.Module):
         dim_diff: int,
         *,
         use_norm: bool = True,
-        clip_pre: float = 10.0,
+        clip_pre: float = 50.0,
         clip_post: float = 10.0,
         momentum: float = 0.02,
         eps: float = 1e-6,
         var_floor: float = 1e-6,
         per_channel_gates: bool = True,
-        gate_init: float = -5.0,   # sigmoid(-5) ~ 0.0067 (starts near OFF)
+        gate_init: float = -3.0,   # sigmoid(-5) ~ 0.0067 (starts near OFF)
     ):
         super().__init__()
         self.dim_adv = int(dim_adv)
@@ -731,7 +731,13 @@ class ParcFeatureAdapter(nn.Module):
             g = torch.cat(parts, dim=0) if len(parts) else torch.zeros((0,), dtype=torch.float32)
         return g.to(device=device, dtype=dtype).view(1, -1)  # [1,dim]
 
-    def forward(self, parc_extra: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        parc_extra: torch.Tensor,
+        *,
+        update_adv_stats: bool = True,
+        update_diff_stats: bool = True,
+    ) -> torch.Tensor:
         if parc_extra is None or parc_extra.numel() == 0:
             return parc_extra
         if parc_extra.ndim != 2 or parc_extra.size(1) != self.dim:
@@ -740,28 +746,48 @@ class ParcFeatureAdapter(nn.Module):
         out_dtype = parc_extra.dtype
         x = parc_extra.to(dtype=torch.float32)
 
-        # 1) pre-clip (limits spikes before stats/gating)
+        # 1) pre-clip
         if (self.clip_pre is not None) and (self.clip_pre > 0):
             x = x.clamp(-self.clip_pre, self.clip_pre)
 
         # 2) normalization
         if self.use_norm:
             if self.training:
+                # ---- batch stats for normalization ----
                 m = x.mean(dim=0)
-                v = (x - m).pow(2).mean(dim=0)  # population var (stable)
-                # EMA update
-                self.running_mean.mul_(1.0 - self.momentum).add_(self.momentum * m)
-                self.running_var.mul_(1.0 - self.momentum).add_(self.momentum * v)
-                self.num_updates.add_(1)
-            denom = torch.sqrt(self.running_var.clamp_min(self.var_floor) + self.eps)
-            x = (x - self.running_mean) / denom
+                v = (x - m).pow(2).mean(dim=0)  # population var
 
-        # 3) learnable gates
+                denom = torch.sqrt(v.clamp_min(self.var_floor) + self.eps)
+                x = (x - m) / denom
+
+                # ---- selective EMA update for eval-time stability ----
+                did_update = False
+                if self.dim_adv > 0 and update_adv_stats:
+                    sl = slice(0, self.dim_adv)
+                    self.running_mean[sl].mul_(1.0 - self.momentum).add_(self.momentum * m[sl].detach())
+                    self.running_var[sl].mul_(1.0 - self.momentum).add_(self.momentum * v[sl].detach())
+                    did_update = True
+
+                if self.dim_diff > 0 and update_diff_stats:
+                    sl = slice(self.dim_adv, self.dim_adv + self.dim_diff)
+                    self.running_mean[sl].mul_(1.0 - self.momentum).add_(self.momentum * m[sl].detach())
+                    self.running_var[sl].mul_(1.0 - self.momentum).add_(self.momentum * v[sl].detach())
+                    did_update = True
+
+                if did_update:
+                    self.num_updates.add_(1)
+
+            else:
+                # ---- eval: use running stats ----
+                denom = torch.sqrt(self.running_var.clamp_min(self.var_floor) + self.eps)
+                x = (x - self.running_mean) / denom
+
+        # 3) gates
         g = self._gate_vector(device=x.device, dtype=x.dtype)  # [1,dim]
         if g is not None:
             x = x * g
 
-        # 4) post-clip (limits extreme normalized values)
+        # 4) post-clip
         if (self.clip_post is not None) and (self.clip_post > 0):
             x = x.clamp(-self.clip_post, self.clip_post)
 

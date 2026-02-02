@@ -159,6 +159,8 @@ def _maybe_norm(x: torch.Tensor, mu, sigma):
     else:
         sigma_t = sigma.to(device=x.device, dtype=x.dtype)
 
+    sigma_t = sigma_t.clamp_min(1e-12)
+
     return (x - mu_t) / sigma_t
 
 
@@ -178,6 +180,8 @@ def _maybe_denorm(x: torch.Tensor, mu, sigma):
         sigma_t = torch.as_tensor(sigma, dtype=x.dtype, device=x.device)
     else:
         sigma_t = sigma.to(device=x.device, dtype=x.dtype)
+
+    sigma_t = sigma_t.clamp_min(1e-12)
 
     return x * sigma_t + mu_t
 
@@ -850,7 +854,7 @@ def train_one_epoch_multi_step(
     huber_delta = float(cfg["loss"].get("huber_delta", 0.05))
     lap_w  = float(cfg["loss"].get("laplacian_weight", 0.0))
     tmp_w  = float(cfg["loss"].get("temporal_weight", 0.0))
-    use_huber = bool(cfg["loss"].get("interp_use_huber", True))
+    use_huber = bool(cfg["loss"].get("use_huber", True))
 
     predict_type = str(cfg.get("model", {}).get("predict_type", "rate")).lower()
     if predict_type != "rate":
@@ -860,6 +864,7 @@ def train_one_epoch_multi_step(
     loss_cfg = cfg.get("loss", {}) or {}
     dec_use = bool(loss_cfg.get("dec", False))
     parc_use = bool(loss_cfg.get("parc", False) or loss_cfg.get("parc_inputs", False))
+    use_adapter = bool(loss_cfg.get("parc_use_adapter", False))
 
     # Variant-B baseline strength (reuse your existing name)
     dec_blend_w = float(loss_cfg.get("blend_weight", 0.0))        # baseline weight (recommend 1.0 when parc_use)
@@ -1253,11 +1258,23 @@ def train_one_epoch_multi_step(
                     #if (parc_extra is not None) and (parc_extra.numel() > 0):
                         # parc_extra should already be dtype=x_in.dtype per your call, but keep this safe
                     #    x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
-                    if (parc_extra is not None) and (parc_extra.numel() > 0):
-                        if not hasattr(model, "parc_adapter"):
-                            raise RuntimeError("parc_use=True but model.parc_adapter is missing. Attach it before optimizer creation.")
+                    '''
+                    if parc_extra is not None and parc_extra.numel() > 0:
+                        if hasattr(model, "parc_adapter") and (model.parc_adapter is not None) and use_adapter:
+                            parc_extra = model.parc_adapter(parc_extra)                       
+                        x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
+                    '''
+                    if parc_extra is not None and parc_extra.numel() > 0:
+                        if hasattr(model, "parc_adapter") and (model.parc_adapter is not None) and use_adapter:
+                            adv_active  = (r_adv_abs is not None)   # only step0 in your gating
+                            diff_active = (r_diff_abs is not None)  # typically True if enabled
 
-                        parc_extra = model.parc_adapter(parc_extra)  # <-- norm + clip + learnable gates
+                            parc_extra = model.parc_adapter(
+                                parc_extra,
+                                update_adv_stats=adv_active,
+                                update_diff_stats=diff_active,
+                            )
+
                         x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
 
 
@@ -1467,7 +1484,7 @@ def train_one_epoch_multi_step(
                 _assert_finite("rate_target", rate_target)
 
                 center_loss = (F.huber_loss(y_pred, rate_target, delta=huber_delta)
-                               if use_huber else F.l1_loss(y_pred, rate_target))
+                               if use_huber else F.mse_loss(y_pred, rate_target))
 
                 y_pred_abs = _maybe_denorm(norm_in + y_pred * dt_hat, mu, sigma)
 
@@ -1644,7 +1661,7 @@ def evaluate_one_epoch_multi_step(
     huber_delta = float(cfg["loss"].get("huber_delta", 0.05))
     lap_w  = float(cfg["loss"].get("laplacian_weight", 0.0))
     tmp_w  = float(cfg["loss"].get("temporal_weight", 0.0))
-    use_huber = bool(cfg["loss"].get("interp_use_huber", True))
+    use_huber = bool(cfg["loss"].get("use_huber", True))
 
     predict_type = str(cfg.get("model", {}).get("predict_type", "rate")).lower()
     if predict_type != "rate":
@@ -1653,6 +1670,7 @@ def evaluate_one_epoch_multi_step(
     loss_cfg = cfg.get("loss", {}) or {}
     dec_use = bool(loss_cfg.get("dec", False))
     parc_use = bool(loss_cfg.get("parc", False) or loss_cfg.get("parc_inputs", False))
+    use_adapter = bool(loss_cfg.get("parc_use_adapter", False))
 
     dec_blend_w = float(loss_cfg.get("blend_weight", 0.0))
     dec_resid_w = float(loss_cfg.get("residual_weight", 0.0))
@@ -1931,9 +1949,17 @@ def evaluate_one_epoch_multi_step(
                                 r_adv_abs = None
 
                             # Build channel mask from the SAME selector used for PARC inputs
-                            sel = dec.parc_select_feature_indices(cfg, x_in_abs.size(1))
-                            ch_mask = torch.zeros((x_in_abs.size(1),), device=device, dtype=torch.float32)
-                            ch_mask[torch.as_tensor(sel, device=device)] = 1.0
+                            #sel = dec.parc_select_feature_indices(cfg, x_in_abs.size(1))
+                            #ch_mask = torch.zeros((x_in_abs.size(1),), device=device, dtype=torch.float32)
+                            #ch_mask[torch.as_tensor(sel, device=device)] = 1.0
+                            Fdim = x_in_abs.size(1)
+                            sel_adv  = dec.parc_select_feature_indices_adv(cfg, Fdim)
+                            sel_diff = dec.parc_select_feature_indices_diff(cfg, Fdim)
+                            sel = sorted(set(sel_adv + sel_diff))
+
+                            ch_mask = torch.zeros((Fdim,), device=device, dtype=torch.float32)
+                            if len(sel) > 0:
+                                ch_mask[torch.as_tensor(sel, device=device)] = 1.0
 
                             # Build r_phy_abs safely (never 0*inf / None arithmetic)
                             r_phy_abs = None
@@ -1985,10 +2011,23 @@ def evaluate_one_epoch_multi_step(
 
                         #if (parc_extra is not None) and (parc_extra.numel() > 0):
                         #    x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
-                        if (parc_extra is not None) and (parc_extra.numel() > 0):
-                            if not hasattr(model, "parc_adapter"):
-                                raise RuntimeError("parc_use=True but model.parc_adapter is missing (needed for eval too).")
-                            parc_extra = model.parc_adapter(parc_extra)  # model.eval() => adapter.eval() => frozen stats
+                        '''
+                        if parc_extra is not None and parc_extra.numel() > 0:
+                            if hasattr(model, "parc_adapter") and (model.parc_adapter is not None) and use_adapter:
+                                parc_extra = model.parc_adapter(parc_extra)
+                            x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
+                        '''
+                        if parc_extra is not None and parc_extra.numel() > 0:
+                            if hasattr(model, "parc_adapter") and (model.parc_adapter is not None) and use_adapter:
+                                adv_active  = (r_adv_abs is not None)   # only step0 in your gating
+                                diff_active = (r_diff_abs is not None)  # typically True if enabled
+
+                                parc_extra = model.parc_adapter(
+                                    parc_extra,
+                                    update_adv_stats=adv_active,
+                                    update_diff_stats=diff_active,
+                                )
+
                             x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
 
 
@@ -2018,7 +2057,7 @@ def evaluate_one_epoch_multi_step(
 
                         y_pred_f32 = y_pred.to(dtype=torch.float32)
                         center_loss = (F.huber_loss(y_pred_f32, rate_target_f32, delta=huber_delta)
-                                        if use_huber else F.l1_loss(y_pred_f32, rate_target_f32))
+                                        if use_huber else F.mse_loss(y_pred_f32, rate_target_f32))
 
                         y_pred_abs = _maybe_denorm(
                             norm_in.to(dtype=torch.float32) + y_pred_f32 * dt_hat_f32,
@@ -2846,9 +2885,9 @@ def build_model_from_cfg(cfg, device):
     loss = cfg.get("loss", {}) or {}
     parc_on = bool(loss.get("parc", False) or loss.get("parc_inputs", False))
     if parc_on:
-        in_ch += dec.parc_extra_in_channels(cfg, Fdim)  # <-- now returns len(adv)+len(diff)
+        in_ch += dec.parc_extra_in_channels(cfg, Fdim)
 
-    out_ch = Fdim  # predict rate for all state channels
+    out_ch = Fdim
 
     model = FeatureNet(
         in_channels=in_ch,
@@ -2858,6 +2897,27 @@ def build_model_from_cfg(cfg, device):
         dropout=float(cfg.get("model", {}).get("dropout", 0.1)),
         make_score_head=True,
     ).to(device)
+
+    # -------------------------
+    # Optional PARC adapter
+    # -------------------------
+    use_adapter = bool(loss.get("parc_use_adapter", False))
+
+    if parc_on and use_adapter:
+        la = len(dec.parc_select_feature_indices_adv(cfg, Fdim))
+        ld = len(dec.parc_select_feature_indices_diff(cfg, Fdim))
+
+        model.parc_adapter = ParcFeatureAdapter(
+            la, ld,
+            use_norm=bool(loss.get("parc_feat_norm", True)),
+            clip_pre=float(loss.get("parc_feat_clip_pre", 50.0)),
+            clip_post=float(loss.get("parc_feat_clip_post", 10.0)),
+            momentum=float(loss.get("parc_feat_norm_momentum", 0.02)),
+            per_channel_gates=bool(loss.get("parc_gate_per_channel", True)),
+            gate_init=float(loss.get("parc_gate_init", -3.0)),
+        ).to(device)
+    else:
+        model.parc_adapter = None
 
     return model
 
@@ -2963,8 +3023,9 @@ def main(config_path: str | None = None):
     # After model is created, before optimizer is created:
     loss_cfg = cfg.get("loss", {}) or {}
     parc_use = bool(loss_cfg.get("parc", False) or loss_cfg.get("parc_inputs", False))
+    use_adapter = bool(loss_cfg.get("parc_use_adapter", False))
 
-    if parc_use:
+    if parc_use and use_adapter:
         Fdim = int(cfg.get("features", {}).get("num_features", 4))  # your state size
         la = len(dec.parc_select_feature_indices_adv(cfg, Fdim))
         ld = len(dec.parc_select_feature_indices_diff(cfg, Fdim))

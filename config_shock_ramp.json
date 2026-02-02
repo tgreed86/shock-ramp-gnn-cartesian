@@ -94,7 +94,7 @@
     "temporal_weight": 0.0,
     "dec": true,
     "parc": true,
-    "parc_detach_ops": true,
+    "parc_detach_inputs": true,
     
     "parc_include_diff": true,
     "diff_channels": ["density", "energy"],
@@ -111,17 +111,18 @@
     "nu": 0.0001,
 
     "blend_weight": 0.0,
-    "residual_weight": 1e-6,
+    "residual_weight": 0.0,
 
     "rho_floor": 1e-6,
     "u_clip": 1000.0,
 
+    "parc_use_adapter": true,
     "parc_feat_norm": true,
-    "parc_feat_clip_pre": 10.0,
+    "parc_feat_clip_pre": 50.0,
     "parc_feat_clip_post": 10.0,
     "parc_feat_norm_momentum": 0.02,
-    "parc_gate_init": -5.0,
-    "parc_gate_per_channel": true
+    "parc_gate_init": -3.0,
+    "parc_gate_per_channel": false
   },
 
   "eval": {

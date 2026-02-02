@@ -1288,6 +1288,15 @@ def main():
 
     set_seed(int(cfg.get("train", {}).get("seed", 42)))
 
+    # Check for adapter weights in checkpoint
+    '''
+    sd = ckpt["model"] if "model" in ckpt else ckpt
+    has_adapter_weights = any(k.startswith("parc_adapter.") for k in sd.keys())
+    # Build model with/without adapter accordingly
+    cfg["loss"]["parc_use_adapter"] = bool(has_adapter_weights)
+    print(f"[INFO] Checkpoint has_adapter_weights={has_adapter_weights}; setting cfg['loss']['parc_use_adapter']={cfg['loss']['parc_use_adapter']}")
+    '''
+
     # Domain params
     H = int(cfg["data"].get("H", 64))
     W = int(cfg["data"].get("W", 64))
@@ -1391,9 +1400,41 @@ def main():
     )
 
     # ----- Build model & load weights -----
+    '''
     with Timer("Build model"):
         model = build_model_from_cfg(cfg, device)
     model.load_state_dict(ckpt["model"])
+    model.to(device)
+    model.eval()
+    '''
+    with Timer("Build model"):
+        model = build_model_from_cfg(cfg, device)
+
+    # ----- Load weights (strip parc_adapter keys if present) -----
+    sd = ckpt["model"] if "model" in ckpt else ckpt
+
+    # Remove adapter keys unconditionally — safe for all checkpoints
+    sd_no_adapter = {k: v for k, v in sd.items() if not k.startswith("parc_adapter.")}
+
+    missing, unexpected = model.load_state_dict(sd_no_adapter, strict=False)
+
+    # Sanity check: nothing except adapter should be missing/unexpected
+    missing_non_adapter = [k for k in missing if not k.startswith("parc_adapter.")]
+    unexpected_non_adapter = [k for k in unexpected if not k.startswith("parc_adapter.")]
+
+    if missing_non_adapter or unexpected_non_adapter:
+        raise RuntimeError(
+            "State-dict mismatch beyond parc_adapter.*\n"
+            f"Missing: {missing_non_adapter}\n"
+            f"Unexpected: {unexpected_non_adapter}"
+        )
+
+    if missing or unexpected:
+        print(
+            f"[INFO] Loaded checkpoint ignoring adapter keys "
+            f"(missing_adapter={len(missing)}, unexpected_adapter={len(unexpected)})"
+        )
+
     model.to(device)
     model.eval()
 
