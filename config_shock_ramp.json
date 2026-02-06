@@ -25,7 +25,7 @@
   "train": {
     "precomp_cache_path": "./cache/all/shock_ramp_precomp_pLow85_pHigh95_faceAdj_DEC.h5",
     "precomp_force_recompute": false,
-    "epochs": 5,
+    "epochs": 25,
     "batch_size": 1,
     "lr": 0.0001,
     "weight_decay": 0.0,
@@ -39,7 +39,6 @@
     "mesh_mode": "predicted",
     "save_dir": "./runs_mesh_first",
     "multi_step_K": 2,
-    "mesh_mode": "uniform",
     "uniform_H": 256,
     "uniform_W": 256,
     "teacher_forcing_uniform": false,
@@ -85,7 +84,7 @@
   },
 
   "loss": {
-    "use_huber": true,
+    "use_huber": false,
     "huber_delta": 0.05,
     "interp_type": "standard",
     "interp_k": 8,
@@ -107,6 +106,7 @@
     "p_floor": 0.0,
     "adv_channels": ["density", "x_momentum", "y_momentum", "energy"],
     "adv_weight": 1.0,
+    "adv_all_steps": true,
   
     "nu": 0.0001,
 
@@ -116,8 +116,8 @@
     "rho_floor": 1e-6,
     "u_clip": 1000.0,
 
-    "parc_use_adapter": true,
-    "parc_feat_norm": true,
+    "parc_use_adapter": false,
+    "parc_feat_norm": false,
     "parc_feat_clip_pre": 50.0,
     "parc_feat_clip_post": 10.0,
     "parc_feat_norm_momentum": 0.02,
@@ -143,6 +143,7 @@
     "predict_type": "rate",
     "_comment_predict_type": "absolute, delta, or rate"
   },
+
   "debug": {
     "plot_gradients": true,
     "profile": false,
@@ -153,8 +154,20 @@
     "nan_watch": false,
     "nan_first_only": false,
     "dbg_dec_ops": false,
-    "budget_watch": true
+    "budget_watch": true,
+    "run_stepA": false,
+    "stepA_k": 0,
+    "stepA_star": false,
+    "stepA_star_kmin": 5,
+    "stepA_teacher": false,
+    "stepA_u_max": 1000.0,
+    "drift_watch": false,
+    "oracle_watch": false,
+    "fast_next_diag": false,
+    "parc_scale_watch": false,
+    "print_norm_sanity_once": false
   },
+
   "speed": {
     "interp_chunk": 4096
   }

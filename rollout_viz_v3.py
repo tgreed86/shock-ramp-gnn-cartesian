@@ -73,6 +73,7 @@ from train import (
     _get_bbox,
 )
 from utils_geom import build_idw_map, apply_idw_map
+import utils.dec_ops as dec
 
 
 # ----------------- Logging helpers ----------------- #
@@ -1271,6 +1272,20 @@ def main():
             raise RuntimeError("Checkpoint has no 'cfg' and no --config was provided.")
         log("[INFO] Using cfg from checkpoint.")
 
+    # ---- reconcile adapter intent with checkpoint contents ----
+    loss_cfg = cfg.get("loss", {}) or {}
+    sd = ckpt["model"] if "model" in ckpt else ckpt
+
+    has_adapter_weights = any(k.startswith("parc_adapter.") for k in sd.keys())
+    cfg_wants_adapter = bool(loss_cfg.get("parc_use_adapter", False))
+
+
+    if cfg_wants_adapter and (not has_adapter_weights):
+        log("[WARN] cfg requests parc_use_adapter=True but checkpoint has no parc_adapter.* weights. "
+            "Forcing parc_use_adapter=False to avoid runtime errors.")
+        loss_cfg["parc_use_adapter"] = False
+        cfg["loss"] = loss_cfg
+
     # Override pt_path if requested
     if args.pt_path is not None:
         cfg.setdefault("data", {})["pt_path"] = args.pt_path
@@ -1410,6 +1425,29 @@ def main():
     with Timer("Build model"):
         model = build_model_from_cfg(cfg, device)
 
+    # ---- attach ParcFeatureAdapter if PARC is enabled (mirrors training main) ----
+    loss_cfg = cfg.get("loss", {}) or {}
+    parc_use = bool(loss_cfg.get("parc", False) or loss_cfg.get("parc_inputs", False))
+    use_adapter = bool(loss_cfg.get("parc_use_adapter", False))
+
+    if parc_use and use_adapter:
+        Fdim = int(cfg.get("features", {}).get("num_features", 4))
+        la = len(dec.parc_select_feature_indices_adv(cfg, Fdim))
+        ld = len(dec.parc_select_feature_indices_diff(cfg, Fdim))
+
+        model.parc_adapter = ParcFeatureAdapter(
+            la, ld,
+            use_norm=bool(loss_cfg.get("parc_feat_norm", True)),
+            clip_pre=float(loss_cfg.get("parc_feat_clip_pre", 10.0)),
+            clip_post=float(loss_cfg.get("parc_feat_clip_post", 10.0)),
+            momentum=float(loss_cfg.get("parc_feat_norm_momentum", 0.02)),
+            per_channel_gates=bool(loss_cfg.get("parc_gate_per_channel", True)),
+            gate_init=float(loss_cfg.get("parc_gate_init", -5.0)),
+        ).to(device)
+    else:
+        model.parc_adapter = None
+
+    '''
     # ----- Load weights (strip parc_adapter keys if present) -----
     sd = ckpt["model"] if "model" in ckpt else ckpt
 
@@ -1434,6 +1472,32 @@ def main():
             f"[INFO] Loaded checkpoint ignoring adapter keys "
             f"(missing_adapter={len(missing)}, unexpected_adapter={len(unexpected)})"
         )
+    '''
+    sd = ckpt["model"] if "model" in ckpt else ckpt
+    has_adapter_weights = any(k.startswith("parc_adapter.") for k in sd.keys())
+    has_adapter_module  = getattr(model, "parc_adapter", None) is not None
+
+    if has_adapter_weights and has_adapter_module:
+        # load everything (adapter + model)
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+    else:
+        # strip adapter keys if either side doesn't have them
+        sd_no_adapter = {k: v for k, v in sd.items() if not k.startswith("parc_adapter.")}
+        missing, unexpected = model.load_state_dict(sd_no_adapter, strict=False)
+
+    # sanity: allow only adapter-related mismatches
+    missing_non_adapter = [k for k in missing if not k.startswith("parc_adapter.")]
+    unexpected_non_adapter = [k for k in unexpected if not k.startswith("parc_adapter.")]
+    if missing_non_adapter or unexpected_non_adapter:
+        raise RuntimeError(
+            "State-dict mismatch beyond parc_adapter.*\n"
+            f"Missing: {missing_non_adapter}\n"
+            f"Unexpected: {unexpected_non_adapter}"
+        )
+
+    if missing or unexpected:
+        log(f"[INFO] load_state_dict strict=False (missing={len(missing)}, unexpected={len(unexpected)})")
+
 
     model.to(device)
     model.eval()

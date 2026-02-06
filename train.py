@@ -49,10 +49,12 @@ from pretrain import make_collate_with_precompute, \
 from utils.precomp_h5 import LazyPrecompH5
 from utils.uniform_mesh_engine import UniformMeshEngine
 import utils.dec_ops as dec
+from utils.fast_next_diag import maybe_run_fast_next_diag
 
 
 debug_once = False
 
+'''
 @torch.no_grad()
 def _compute_norm_stats_from_loader(loader, device):
     """
@@ -132,6 +134,67 @@ def _compute_norm_stats_from_loader(loader, device):
 
     # Keep them on the same device; _maybe_norm moves them to x.device later.
     return mean, std
+'''
+@torch.no_grad()
+def _compute_norm_stats_from_loader(loader, device):
+    n_total = 0
+    mean = None
+    M2 = None
+
+    for batch in loader:
+        # Prefer the distribution the model actually trains on (pred-mesh mapped)
+        xs = []
+
+        if "feat_t_on_pred_list" in batch and "feat_tp1_on_pred_list" in batch:
+            ft = batch["feat_t_on_pred_list"]
+            f1 = batch["feat_tp1_on_pred_list"]
+            for f in list(ft)[1:] + list(f1)[1:]:
+                if f is None or f.numel() == 0: 
+                    continue
+                xs.append(f.to(device).float())
+
+        elif "feat_list" in batch:
+            for f in batch["feat_list"]:
+                if f is None or f.numel() == 0:
+                    continue
+                xs.append(f.to(device).float())
+
+        elif "center_feat_t" in batch:
+            xs.append(batch["center_feat_t"].to(device).float())
+            if "center_feat_tp1" in batch:
+                xs.append(batch["center_feat_tp1"].to(device).float())
+
+        else:
+            continue
+
+        if not xs:
+            continue
+
+        x = torch.cat(xs, dim=0)  # (N, F)
+        if x.numel() == 0:
+            continue
+
+        batch_n = x.size(0)
+        batch_mean = x.mean(dim=0)
+        batch_M2 = ((x - batch_mean) ** 2).sum(dim=0)
+
+        if mean is None:
+            mean = batch_mean
+            M2 = batch_M2
+            n_total = batch_n
+        else:
+            new_n = n_total + batch_n
+            delta = batch_mean - mean
+            mean = mean + delta * (batch_n / new_n)
+            M2 = M2 + batch_M2 + (delta * delta) * (n_total * batch_n / new_n)
+            n_total = new_n
+
+    if mean is None or n_total < 2:
+        raise RuntimeError("Could not compute normalization stats: no feature tensors found in loader.")
+
+    var = M2 / (n_total - 1)
+    std = torch.sqrt(var + 1e-8)
+    return mean, std
 
 def save_config(run_dir: str, cfg: dict, argv=None):
     argv = list(sys.argv) if argv is None else argv
@@ -145,8 +208,8 @@ def _maybe_norm(x: torch.Tensor, mu, sigma):
     Normalize x using mu, sigma (broadcastable), moving stats to x.device.
     mu/sigma can be tensors, lists, or numpy arrays.
     """
-    #if mu is None or sigma is None:
-    #    return x
+    if mu is None or sigma is None:
+        return x
 
     # Ensure mu, sigma are tensors on x.device with the right dtype
     if not torch.is_tensor(mu):
@@ -168,8 +231,8 @@ def _maybe_denorm(x: torch.Tensor, mu, sigma):
     """
     Inverse of _maybe_norm: x * sigma + mu, moving stats to x.device.
     """
-    #if mu is None or sigma is None:
-    #    return x
+    if mu is None or sigma is None:
+        return x
 
     if not torch.is_tensor(mu):
         mu_t = torch.as_tensor(mu, dtype=x.dtype, device=x.device)
@@ -187,6 +250,644 @@ def _maybe_denorm(x: torch.Tensor, mu, sigma):
 
 
 # ------------------------- Small utilities -------------------------
+
+import math
+
+def _to_scalar_dt(dt, device, dtype):
+    if torch.is_tensor(dt):
+        return dt.to(device=device, dtype=dtype).view(())
+    return torch.tensor(float(dt), device=device, dtype=dtype).view(())
+
+@torch.no_grad()
+def _pearson_corr(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-12) -> float:
+    # a,b: (N,) float tensors
+    a = a.float().flatten()
+    b = b.float().flatten()
+    am = a.mean()
+    bm = b.mean()
+    av = a - am
+    bv = b - bm
+    denom = (av.std(unbiased=False) * bv.std(unbiased=False)).clamp_min(eps)
+    return float((av * bv).mean() / denom)
+
+@torch.no_grad()
+def _wrel_l2(err: torch.Tensor, ref: torch.Tensor, w: torch.Tensor, eps: float = 1e-12) -> float:
+    # err/ref: (N,) ; w: (N,)
+    err2 = (err.float() * err.float()) * w.float()
+    ref2 = (ref.float() * ref.float()) * w.float()
+    num = torch.sqrt(err2.sum().clamp_min(eps))
+    den = torch.sqrt(ref2.sum().clamp_min(eps))
+    return float((num / den).item())
+
+@torch.no_grad()
+def stepA_check_ops_vs_gt_delta(
+    batch: dict,
+    cfg: dict,
+    device: torch.device,
+    *,
+    dx: float,
+    dy: float,
+    step_k: int = 0,
+    u_max: float = 1e3,
+    rho_floor: float = 1e-6,
+    E_floor: float = 1e-6,
+    use_area_weights: bool = True,
+):
+    """
+    Step A: Compare GT delta on pred mesh vs physics delta from DEC ops on the same mesh, with NO NN.
+    Uses:
+      x_in_abs  = feat_t_on_pred_list[k+1]   (GT(t+k) mapped to pred mesh at t+k+1)
+      x_tgt_abs = feat_tp1_on_pred_list[k+1] (GT(t+k+1) mapped to pred mesh at t+k+1)
+
+    And ops are computed on pred mesh at (k+1) using pred_ei_list[k+1] and pred_ea_list[k+1].
+    """
+
+    # -------- required tensors/lists --------
+    dt_list = batch.get("dt_list", None)
+    if dt_list is None:
+        raise RuntimeError("batch missing dt_list")
+
+    feat_t_on_pred_list   = batch.get("feat_t_on_pred_list", None)
+    feat_tp1_on_pred_list = batch.get("feat_tp1_on_pred_list", None)
+    if feat_t_on_pred_list is None or feat_tp1_on_pred_list is None:
+        raise RuntimeError("batch missing feat_t_on_pred_list / feat_tp1_on_pred_list")
+
+    pred_levels_list  = batch.get("pred_levels_list", None)
+    pred_ei_list      = batch.get("pred_ei_list", None)
+    if pred_levels_list is None or pred_ei_list is None:
+        raise RuntimeError("batch missing pred_levels_list / pred_ei_list")
+
+    pred_ea_list = batch.get("pred_ea_list", None) or batch.get("pred_edge_attr_list", None)
+    if pred_ea_list is None:
+        raise RuntimeError("batch missing pred_ea_list or pred_edge_attr_list")
+
+    K = len(feat_t_on_pred_list)
+    if step_k < 0 or step_k > (K - 2):
+        raise ValueError(f"step_k must be in [0, {K-2}], got {step_k}")
+
+    # -------- pick the mesh/time index you use in training (k+1) --------
+    j = step_k + 1
+
+    x_in_abs  = feat_t_on_pred_list[j].to(device).float()    # (N,F)
+    x_tgt_abs = feat_tp1_on_pred_list[j].to(device).float()  # (N,F)
+
+    pred_levels = pred_levels_list[j].to(device)
+    pei = pred_ei_list[j].to(device)
+    pea = pred_ea_list[j].to(device)
+
+    dt = _to_scalar_dt(dt_list[step_k], device=device, dtype=x_in_abs.dtype)
+
+    # -------- sanity prints --------
+    Fdim = x_in_abs.size(1)
+    N = x_in_abs.size(0)
+    print("\n[STEP-A] ================================================")
+    print(f"[STEP-A] step_k={step_k} using index j=k+1={j}")
+    print(f"[STEP-A] N={N} F={Fdim} dt={float(dt.item()):.6e}")
+    print(f"[STEP-A] x_in_abs min/max: {float(x_in_abs.min()):.3e} / {float(x_in_abs.max()):.3e}")
+    print(f"[STEP-A] x_tgt_abs min/max: {float(x_tgt_abs.min()):.3e} / {float(x_tgt_abs.max()):.3e}")
+
+    # -------- build weights (cell area) --------
+    if use_area_weights:
+        area = dec.cell_area_from_levels(
+            pred_levels.long(),
+            dx0=float(dx),
+            dy0=float(dy),
+            dtype=torch.float32,
+            device=device,
+        ).view(-1)
+    else:
+        area = torch.ones((N,), device=device, dtype=torch.float32)
+
+    # -------- sanitize state for ops (IMPORTANT: ops should not see insane mx/rho) --------
+    # Use your sanitizer if you prefer; this is a momentum-by-rho limiter that matches u_max.
+    idx_map = dec.infer_feature_indices(cfg, Fdim)
+    rho_i, mx_i, my_i, E_i = idx_map["rho"], idx_map["mx"], idx_map["my"], idx_map["E"]
+
+    x_ops = x_in_abs.clone()
+    rho = x_ops[:, rho_i].clamp_min(rho_floor)
+    x_ops[:, rho_i] = rho
+    x_ops[:, E_i]   = x_ops[:, E_i].clamp_min(E_floor)
+
+    mmax = (u_max * rho).to(dtype=x_ops.dtype)
+    x_ops[:, mx_i] = x_ops[:, mx_i].clamp(-mmax, mmax)
+    x_ops[:, my_i] = x_ops[:, my_i].clamp(-mmax, mmax)
+
+    # -------- compute DEC operator terms (absolute units) --------
+    loss_cfg = cfg.get("loss", {}) or {}
+    adv_w  = float(loss_cfg.get("adv_weight", 1.0))
+    diff_w = float(loss_cfg.get("diff_weight", 1.0))
+    inc_adv  = bool(loss_cfg.get("parc_include_adv", True))
+    inc_diff = bool(loss_cfg.get("parc_include_diff", True))
+
+    compute_adv  = inc_adv  and (adv_w != 0.0)
+    compute_diff = inc_diff and (diff_w != 0.0)
+
+    with torch.autocast(device_type=device.type, enabled=False):
+        r_adv_abs, r_diff_abs, _area2 = dec.dec_advdiff_terms_abs(
+            x_abs=x_ops.float(),
+            edge_index=pei.long(),
+            pred_ea=pea.float(),
+            levels=pred_levels.long(),
+            dx0=float(dx),
+            dy0=float(dy),
+            cfg=cfg,
+            compute_adv=compute_adv,
+            compute_diff=compute_diff,
+        )
+
+    # Normalize missing terms to zeros for combination:
+    ref = x_in_abs.float()
+    if r_adv_abs is None:
+        r_adv_abs = torch.zeros_like(ref)
+    if r_diff_abs is None:
+        r_diff_abs = torch.zeros_like(ref)
+
+    r_phy_abs = (adv_w * r_adv_abs) + (diff_w * r_diff_abs)   # (N,F)
+    delta_phy = dt * r_phy_abs                                # (N,F)
+    delta_gt  = (x_tgt_abs - x_in_abs)                         # (N,F)
+
+    # -------- metrics --------
+    print("[STEP-A] ---- per-channel delta comparison ----")
+    for c in range(Fdim):
+        gt_c  = delta_gt[:, c]
+        phy_c = delta_phy[:, c]
+        err_c = phy_c - gt_c
+
+        corr = _pearson_corr(phy_c, gt_c)
+        rel  = _wrel_l2(err_c, gt_c, area)
+
+        # also compare rate (optional): r_phy vs delta_gt/dt
+        gt_rate_c = (gt_c / dt.clamp_min(1e-12))
+        corr_r = _pearson_corr(r_phy_abs[:, c], gt_rate_c)
+
+        print(
+            f"[STEP-A] ch={c:02d}  "
+            f"corr(delta_phy,delta_gt)={corr:+.4f}  "
+            f"wRelL2(delta_phy-delta_gt, delta_gt)={rel:.4e}  "
+            f"corr(r_phy, delta_gt/dt)={corr_r:+.4f}  "
+            f"delta_gt min/max={float(gt_c.min()):+.3e}/{float(gt_c.max()):+.3e}  "
+            f"delta_phy min/max={float(phy_c.min()):+.3e}/{float(phy_c.max()):+.3e}"
+        )
+
+    # -------- overall metric (all channels stacked) --------
+    gt_all  = delta_gt.reshape(-1)
+    phy_all = delta_phy.reshape(-1)
+    err_all = phy_all - gt_all
+    area_all = area.repeat_interleave(Fdim)
+
+    corr_all = _pearson_corr(phy_all, gt_all)
+    rel_all  = _wrel_l2(err_all, gt_all, area_all)
+
+    print("[STEP-A] ---- overall ----")
+    print(f"[STEP-A] corr(delta_phy,delta_gt)={corr_all:+.4f}")
+    print(f"[STEP-A] wRelL2(delta_phy-delta_gt, delta_gt)={rel_all:.4e}")
+    print("[STEP-A] ================================================\n")
+
+    return {
+        "delta_gt": delta_gt.detach().cpu(),
+        "delta_phy": delta_phy.detach().cpu(),
+        "r_adv_abs": r_adv_abs.detach().cpu(),
+        "r_diff_abs": r_diff_abs.detach().cpu(),
+        "r_phy_abs": r_phy_abs.detach().cpu(),
+        "dt": float(dt.item()),
+    }
+
+@torch.no_grad()
+def stepA_check_given_state_vs_gt(
+    *,
+    tag: str,
+    x_in_abs: torch.Tensor,     # (N,F) state you are *actually* using at this step
+    x_tgt_abs: torch.Tensor,    # (N,F) GT(t+1) on same mesh
+    pred_levels: torch.Tensor,  # (N,)
+    pei: torch.Tensor,          # (2,E)
+    pea: torch.Tensor,          # (E,5)
+    dt: torch.Tensor,           # scalar
+    cfg: dict,
+    device: torch.device,
+    dx: float,
+    dy: float,
+    u_max: float = 1e3,
+    rho_floor: float = 1e-6,
+    E_floor: float = 1e-6,
+):
+    x_in_abs = x_in_abs.to(device).float()
+    x_tgt_abs = x_tgt_abs.to(device).float()
+    pred_levels = pred_levels.to(device)
+    pei = pei.to(device)
+    pea = pea.to(device)
+    dt = dt.to(device=device, dtype=torch.float32).view(())
+
+    Fdim = x_in_abs.size(1)
+    N = x_in_abs.size(0)
+
+    area = dec.cell_area_from_levels(
+        pred_levels.long(),
+        dx0=float(dx),
+        dy0=float(dy),
+        dtype=torch.float32,
+        device=device,
+    ).view(-1)
+
+    # sanitize state for ops (same limiter style as before)
+    idx_map = dec.infer_feature_indices(cfg, Fdim)
+    rho_i, mx_i, my_i, E_i = idx_map["rho"], idx_map["mx"], idx_map["my"], idx_map["E"]
+
+    x_ops = x_in_abs.clone()
+    rho = x_ops[:, rho_i].clamp_min(rho_floor)
+    x_ops[:, rho_i] = rho
+    x_ops[:, E_i]   = x_ops[:, E_i].clamp_min(E_floor)
+
+    mmax = (u_max * rho).to(dtype=x_ops.dtype)
+    x_ops[:, mx_i] = x_ops[:, mx_i].clamp(-mmax, mmax)
+    x_ops[:, my_i] = x_ops[:, my_i].clamp(-mmax, mmax)
+
+    loss_cfg = cfg.get("loss", {}) or {}
+    adv_w  = float(loss_cfg.get("adv_weight", 1.0))
+    diff_w = float(loss_cfg.get("diff_weight", 1.0))
+    inc_adv  = bool(loss_cfg.get("parc_include_adv", True))
+    inc_diff = bool(loss_cfg.get("parc_include_diff", True))
+
+    compute_adv  = inc_adv  and (adv_w != 0.0)
+    compute_diff = inc_diff and (diff_w != 0.0)
+
+    with torch.autocast(device_type=device.type, enabled=False):
+        r_adv_abs, r_diff_abs, _ = dec.dec_advdiff_terms_abs(
+            x_abs=x_ops.float(),
+            edge_index=pei.long(),
+            pred_ea=pea.float(),
+            levels=pred_levels.long(),
+            dx0=float(dx),
+            dy0=float(dy),
+            cfg=cfg,
+            compute_adv=compute_adv,
+            compute_diff=compute_diff,
+        )
+
+    ref = x_in_abs.float()
+    if r_adv_abs is None:
+        r_adv_abs = torch.zeros_like(ref)
+    if r_diff_abs is None:
+        r_diff_abs = torch.zeros_like(ref)
+
+    r_phy_abs = adv_w * r_adv_abs + diff_w * r_diff_abs
+    delta_phy = dt * r_phy_abs
+    delta_gt  = x_tgt_abs - x_in_abs
+
+    print(f"\n[STEP-A*] {tag}  N={N} F={Fdim} dt={float(dt.item()):.3e}")
+    print(f"[STEP-A*] x_in_abs absmax={float(x_in_abs.abs().max()):.3e}  x_tgt_abs absmax={float(x_tgt_abs.abs().max()):.3e}")
+
+    for c in range(Fdim):
+        gt_c  = delta_gt[:, c]
+        phy_c = delta_phy[:, c]
+        err_c = phy_c - gt_c
+        corr = _pearson_corr(phy_c, gt_c)
+        rel  = _wrel_l2(err_c, gt_c, area)
+        print(f"[STEP-A*] ch={c:02d} corr={corr:+.4f}  wRelL2={rel:.4e}  "
+              f"gt[min/max]={float(gt_c.min()):+.3e}/{float(gt_c.max()):+.3e}  "
+              f"phy[min/max]={float(phy_c.min()):+.3e}/{float(phy_c.max()):+.3e}")
+
+
+import torch
+
+@torch.no_grad()
+def _print_chan_stats(name: str, x: torch.Tensor, idx: dict, max_q: bool = True):
+    """
+    x: [N,F]
+    idx: {'rho':i,'mx':i,'my':i,'E':i}
+    """
+    if x is None or (not torch.is_tensor(x)):
+        print(f"[ABS-CHECK] {name}: None")
+        return
+    if x.ndim != 2:
+        print(f"[ABS-CHECK] {name}: expected [N,F], got {tuple(x.shape)}")
+        return
+
+    N, F = x.shape
+    x_f = x.detach().to(torch.float32)
+
+    # Per-channel mean/std/min/max
+    mean = x_f.mean(dim=0)
+    std  = x_f.std(dim=0, unbiased=False)
+    xmin = x_f.min(dim=0).values
+    xmax = x_f.max(dim=0).values
+
+    def _fmt(v):  # short float
+        return [float(f"{t:.4g}") for t in v.detach().cpu()]
+
+    print(f"\n[ABS-CHECK] {name} shape={tuple(x.shape)} dtype={x.dtype} dev={x.device}")
+    print("  mean:", _fmt(mean))
+    print("  std :", _fmt(std))
+    print("  min :", _fmt(xmin))
+    print("  max :", _fmt(xmax))
+
+    # rho/E negativity is a strong “is this really absolute?” signal
+    rho = x_f[:, idx["rho"]]
+    E   = x_f[:, idx["E"]]
+    neg_rho = float((rho <= 0).float().mean().item())
+    neg_E   = float((E   <= 0).float().mean().item())
+    print(f"  neg_frac rho<=0: {neg_rho:.3e}   E<=0: {neg_E:.3e}")
+
+    if max_q:
+        # a couple robust quantiles for rho/E
+        qs = torch.tensor([0.01, 0.5, 0.99], device=x_f.device)
+        rho_q = torch.quantile(rho, qs).detach().cpu()
+        E_q   = torch.quantile(E, qs).detach().cpu()
+        print(f"  rho q01/q50/q99: {[float(f'{t:.4g}') for t in rho_q]}")
+        print(f"  E   q01/q50/q99: {[float(f'{t:.4g}') for t in E_q]}")
+
+@torch.no_grad()
+def abs_means_abs_check(
+    *,
+    cfg: dict,
+    batch: dict,
+    mu,
+    sigma,
+    device: torch.device,
+    tag: str = "ABS-CHECK",
+):
+    """
+    Confirms whether tensors labeled *_abs are truly in absolute/physical units
+    (i.e., not already standardized by the dataset).
+
+    Prints:
+      - ABS stats for several tensors
+      - NORM stats using current mu/sigma
+      - heuristics for “already normalized?”
+    """
+    def _safe_norm(x: torch.Tensor, mu, sigma):
+        if (mu is None) or (sigma is None):
+            return None
+        mu_t = mu if torch.is_tensor(mu) else torch.as_tensor(mu, dtype=x.dtype, device=x.device)
+        sg_t = sigma if torch.is_tensor(sigma) else torch.as_tensor(sigma, dtype=x.dtype, device=x.device)
+        mu_t = mu_t.to(device=x.device, dtype=x.dtype)
+        sg_t = sg_t.to(device=x.device, dtype=x.dtype).clamp_min(1e-12)
+        return (x - mu_t) / sg_t
+
+    # Pull a few canonical tensors out of the batch
+    # (If any key is missing, we just skip it.)
+    cand = {}
+    try:
+        feat_list = batch.get("feat_list", None)
+        if isinstance(feat_list, list) and len(feat_list) >= 2:
+            cand["feat_list[t0]_abs (GT mesh)"]  = feat_list[0]
+            cand["feat_list[t1]_abs (GT mesh)"]  = feat_list[1]
+    except Exception:
+        pass
+
+    try:
+        ft = batch.get("feat_t_on_pred_list", None)
+        ftp1 = batch.get("feat_tp1_on_pred_list", None)
+        if isinstance(ft, list) and len(ft) >= 2:
+            cand["feat_t_on_pred_list[j=1]_abs"] = ft[1]
+        if isinstance(ftp1, list) and len(ftp1) >= 2:
+            cand["feat_tp1_on_pred_list[j=1]_abs"] = ftp1[1]
+    except Exception:
+        pass
+
+    # If nothing found, bail early
+    if len(cand) == 0:
+        print(f"[{tag}] No candidate tensors found in batch to inspect.")
+        return
+
+    # Determine channel mapping once
+    # Use tensor Fdim from first available candidate
+    first = next(iter(cand.values()))
+    first = first.to(device) if torch.is_tensor(first) else first
+    Fdim = int(first.size(1))
+    idx = dec.infer_feature_indices(cfg, Fdim)
+    print(f"\n[{tag}] inferred idx map: {idx}")
+
+    # Print mu/sigma summaries (these are what you *think* correspond to abs space)
+    if mu is None or sigma is None:
+        print(f"[{tag}] mu/sigma are None -> normalization disabled or not passed here.")
+    else:
+        mu_t = mu.detach().to("cpu") if torch.is_tensor(mu) else torch.as_tensor(mu).to("cpu")
+        sg_t = sigma.detach().to("cpu") if torch.is_tensor(sigma) else torch.as_tensor(sigma).to("cpu")
+        print(f"[{tag}] mu    :", [float(f"{v:.4g}") for v in mu_t])
+        print(f"[{tag}] sigma :", [float(f"{v:.4g}") for v in sg_t])
+
+    # Inspect each candidate in ABS and NORM space
+    for name, x in cand.items():
+        if not torch.is_tensor(x):
+            continue
+        x = x.to(device)
+
+        _print_chan_stats(f"{name} [ABS]", x, idx)
+
+        x_norm = _safe_norm(x, mu, sigma)
+        if x_norm is not None:
+            _print_chan_stats(f"{name} [NORM using mu/sigma]", x_norm, idx)
+
+            # Heuristic: if rho/E in ABS look ~standard normal (mean~0,std~1, many negatives),
+            # then ABS is probably already standardized (dataset normalized) -> DEC sees wrong units.
+            rho_abs = x[:, idx["rho"]].to(torch.float32)
+            E_abs   = x[:, idx["E"]].to(torch.float32)
+
+            rho_m = float(rho_abs.mean().item()); rho_s = float(rho_abs.std(unbiased=False).item())
+            E_m   = float(E_abs.mean().item());   E_s   = float(E_abs.std(unbiased=False).item())
+            neg_rho = float((rho_abs <= 0).float().mean().item())
+            neg_E   = float((E_abs   <= 0).float().mean().item())
+
+            looks_std_rho = (abs(rho_m) < 0.5) and (0.5 < rho_s < 2.0) and (neg_rho > 0.05)
+            looks_std_E   = (abs(E_m)   < 0.5) and (0.5 < E_s   < 2.0) and (neg_E   > 0.05)
+
+            if looks_std_rho or looks_std_E:
+                print(f"[{tag}][WARN] {name}: rho/E ABS look already standardized "
+                      f"(mean~0 std~1 with nontrivial negatives). "
+                      f"If true, DEC ops are being computed on normalized units, not physical units.")
+
+import math
+from typing import Optional, Sequence, Tuple
+
+def _as_feature_vec(x: torch.Tensor, F: int, device=None, dtype=None) -> torch.Tensor:
+    """
+    Make sure mu/sigma broadcast as (1,F) on the right device/dtype.
+    Accepts shape (F,), (1,F), (F,1) etc.
+    """
+    if x is None:
+        raise ValueError("mu/sigma is None but debug needs it.")
+    t = x
+    if not torch.is_tensor(t):
+        t = torch.tensor(t)
+    if device is not None:
+        t = t.to(device)
+    if dtype is not None:
+        t = t.to(dtype)
+    t = t.view(-1)
+    if t.numel() != F:
+        raise ValueError(f"Expected vector of length F={F}, got {t.numel()}")
+    return t.view(1, F)
+
+def norm_to_abs(x_norm: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    # x_abs = mu + sigma * x_norm
+    F = x_norm.size(-1)
+    mu_ = _as_feature_vec(mu, F, device=x_norm.device, dtype=x_norm.dtype)
+    sg_ = _as_feature_vec(sigma, F, device=x_norm.device, dtype=x_norm.dtype)
+    return mu_ + sg_ * x_norm
+
+def abs_to_norm(x_abs: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    F = x_abs.size(-1)
+    mu_ = _as_feature_vec(mu, F, device=x_abs.device, dtype=x_abs.dtype)
+    sg_ = _as_feature_vec(sigma, F, device=x_abs.device, dtype=x_abs.dtype)
+    return (x_abs - mu_) / sg_
+
+@torch.no_grad()
+def quantile_cpu(x: torch.Tensor, q: float, dim: int = 0) -> torch.Tensor:
+    """
+    CPU-safe quantile via sort (works on MPS/CUDA by moving once).
+    Returns tensor with the same shape as x with dim removed.
+    """
+    if not (0.0 <= q <= 1.0):
+        raise ValueError("q must be in [0,1]")
+    # Move to CPU for sort/selection
+    xc = x.detach().to("cpu")
+    n = xc.size(dim)
+    if n <= 0:
+        raise ValueError("empty tensor in quantile_cpu")
+    # nearest-rank index (clamped)
+    k = int(math.floor(q * (n - 1)))
+    k = max(0, min(n - 1, k))
+    xs, _ = torch.sort(xc, dim=dim)
+    out = xs.select(dim, k)
+    return out.to(x.device)
+
+@torch.no_grad()
+def clamp_pos_inplace(
+    x_abs: torch.Tensor,
+    *,
+    rho_idx: int = 0,
+    E_idx: int = 3,
+    rho_floor: float = 1e-6,
+    E_floor: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Applies the same kind of positivity clamp you’re already doing.
+    Returns x_abs (in-place).
+    """
+    if rho_idx is not None:
+        x_abs[:, rho_idx].clamp_(min=float(rho_floor))
+    if E_idx is not None:
+        x_abs[:, E_idx].clamp_(min=float(E_floor))
+    return x_abs
+
+@torch.no_grad()
+def oracle_debug_step(
+    *,
+    step_k: int,
+    x_in_norm: torch.Tensor,     # (N,F) normalized/model-space state at time t
+    x_tgt_norm: torch.Tensor,    # (N,F) normalized/model-space teacher state at time t+1
+    pred_norm: torch.Tensor,     # (N,F) your *processed* model output (after any adapters/clips), same space as x_in_norm
+    dt: torch.Tensor,            # (N,) or scalar
+    x_roll_abs: torch.Tensor,    # (N,F) the rollout state you actually produced (after clamp)
+    x_tgt_abs: torch.Tensor,     # (N,F) teacher in abs space (after your normal abs extraction)
+    mu: torch.Tensor,
+    sigma: torch.Tensor,
+    centers: Optional[torch.Tensor] = None,  # (N,2) optional
+    levels: Optional[torch.Tensor] = None,   # (N,) optional
+    feature_names: Sequence[str] = ("rho", "mx", "my", "E"),
+    rho_idx: int = 0,
+    E_idx: int = 3,
+    rho_floor: float = 1e-6,
+    E_floor: float = 1e-6,
+    topk: int = 10,
+) -> None:
+    """
+    1) Infers whether your current integration is behaving like "delta add" or "rate*dt add"
+       by comparing reconstructed x_next_abs to your produced x_roll_abs.
+    2) Runs an ORACLE step (using GT delta/rate) under each mode and reports error vs teacher.
+    3) Reports pre-clamp negativity rates for rho/E under each candidate.
+    """
+    device = x_in_norm.device
+    N, F = x_in_norm.shape
+
+    # dt -> (N,1)
+    if dt.numel() == 1:
+        dtv = dt.reshape(1).expand(N)
+    else:
+        dtv = dt.view(-1)
+        if dtv.numel() != N:
+            raise ValueError(f"dt has {dtv.numel()} elems but N={N}")
+    dtv = dtv.to(device=device, dtype=x_in_norm.dtype)
+    dt_col = dtv.view(N, 1)
+
+    # Reconstruct two candidate "your code might be doing this"
+    # Candidate A: treat pred_norm as delta in norm space
+    xA_norm = x_in_norm + pred_norm
+    xA_abs_pre = norm_to_abs(xA_norm, mu, sigma)
+    xA_abs = xA_abs_pre.clone()
+    clamp_pos_inplace(xA_abs, rho_idx=rho_idx, E_idx=E_idx, rho_floor=rho_floor, E_floor=E_floor)
+
+    # Candidate B: treat pred_norm as rate in norm space
+    xB_norm = x_in_norm + pred_norm * dt_col
+    xB_abs_pre = norm_to_abs(xB_norm, mu, sigma)
+    xB_abs = xB_abs_pre.clone()
+    clamp_pos_inplace(xB_abs, rho_idx=rho_idx, E_idx=E_idx, rho_floor=rho_floor, E_floor=E_floor)
+
+    # Which candidate matches the x_roll_abs you actually produced?
+    # (Use mean absolute error vs your produced rollout.)
+    errA = (xA_abs - x_roll_abs).abs().mean().item()
+    errB = (xB_abs - x_roll_abs).abs().mean().item()
+    mode = "DELTA_ADD" if errA <= errB else "RATE_TIMES_DT_ADD"
+
+    # Pre-clamp negativity rates (this is what triggers your clamp)
+    negE_A = (xA_abs_pre[:, E_idx] < E_floor).float().mean().item()
+    negE_B = (xB_abs_pre[:, E_idx] < E_floor).float().mean().item()
+    negR_A = (xA_abs_pre[:, rho_idx] < rho_floor).float().mean().item()
+    negR_B = (xB_abs_pre[:, rho_idx] < rho_floor).float().mean().item()
+
+    # ORACLE: build GT delta/rate in norm space
+    gt_delta_norm = (x_tgt_norm - x_in_norm)
+    gt_rate_norm = gt_delta_norm / dt_col
+
+    # Oracle under delta-add
+    xoA_norm = x_in_norm + gt_delta_norm
+    xoA_abs_pre = norm_to_abs(xoA_norm, mu, sigma)
+    xoA_abs = xoA_abs_pre.clone()
+    clamp_pos_inplace(xoA_abs, rho_idx=rho_idx, E_idx=E_idx, rho_floor=rho_floor, E_floor=E_floor)
+
+    # Oracle under rate*dt-add
+    xoB_norm = x_in_norm + gt_rate_norm * dt_col
+    xoB_abs_pre = norm_to_abs(xoB_norm, mu, sigma)
+    xoB_abs = xoB_abs_pre.clone()
+    clamp_pos_inplace(xoB_abs, rho_idx=rho_idx, E_idx=E_idx, rho_floor=rho_floor, E_floor=E_floor)
+
+    # Oracle errors vs teacher (abs)
+    oerrA = (xoA_abs - x_tgt_abs).abs().mean().item()
+    oerrB = (xoB_abs - x_tgt_abs).abs().mean().item()
+
+    # How much clamp would oracle have triggered? (should be ~0.0 if everything is consistent)
+    onegE_A = (xoA_abs_pre[:, E_idx] < E_floor).float().mean().item()
+    onegE_B = (xoB_abs_pre[:, E_idx] < E_floor).float().mean().item()
+
+    print(f"[ORACLE] step_k={step_k} inferred_mode={mode}  match_err(delta)={errA:.3e} match_err(rate*dt)={errB:.3e}")
+    print(f"[ORACLE] step_k={step_k} preclamp_neg_frac pred:  rho A={negR_A:.3e} B={negR_B:.3e} | E A={negE_A:.3e} B={negE_B:.3e}")
+    print(f"[ORACLE] step_k={step_k} oracle_mae_vs_teacher:  A(delta-add)={oerrA:.3e}  B(rate*dt-add)={oerrB:.3e}")
+    print(f"[ORACLE] step_k={step_k} oracle_preclamp_negE_frac: A={onegE_A:.3e} B={onegE_B:.3e}")
+
+    # Optional: show top-k nodes by *your actual* L1 drift (abs) to correlate with your existing DRIFT-C print
+    if topk > 0:
+        drift_l1 = (x_roll_abs - x_tgt_abs).abs().sum(dim=1)  # (N,)
+        k = min(int(topk), N)
+        vals, idx = torch.topk(drift_l1.detach().to("cpu"), k=k, largest=True, sorted=True)
+        print(f"[ORACLE] step_k={step_k} top-{k} nodes by L1 drift (abs):")
+        for r in range(k):
+            i = int(idx[r].item())
+            score = float(vals[r].item())
+            xy_str = ""
+            lvl_str = ""
+            if centers is not None:
+                xy = centers[i].detach().to("cpu").tolist()
+                xy_str = f" xy={xy}"
+            if levels is not None:
+                lvl = int(levels[i].detach().to("cpu").item())
+                lvl_str = f" level={lvl}"
+            # show roll/teach for quick sanity
+            rollv = x_roll_abs[i].detach().to("cpu").tolist()
+            teachv = x_tgt_abs[i].detach().to("cpu").tolist()
+            fn = feature_names
+            print(f"  node={i:6d} score={score:.3e}{xy_str}{lvl_str}")
+            print(f"    roll [{','.join(fn)}]={rollv}")
+            print(f"    teach[{','.join(fn)}]={teachv}")
 
 
 def pick_device(pref: str = "auto") -> torch.device:
@@ -760,12 +1461,29 @@ def sanitize_state_for_ops(x_abs: torch.Tensor, cfg: dict, rho_floor=1e-6, E_flo
     out[:, idx["my"]]  = my
     return out
 
-def _enforce_physical_state(x_abs: torch.Tensor, rho_floor=1e-6, E_floor=1e-6):
-    # assumes [rho, mx, my, E]
+def _enforce_physical_state(
+    x_abs: torch.Tensor,
+    cfg: dict,
+    rho_floor: float = 1e-6,
+    E_floor: float = 1e-6,
+):
+    """
+    Clamp rho and E using the same feature-index mapping as DEC/PARC.
+    This avoids assuming channel order is [rho, mx, my, E].
+    """
+    if x_abs is None:
+        return x_abs
+    if x_abs.ndim != 2:
+        raise ValueError(f"_enforce_physical_state expects [N,F], got {tuple(x_abs.shape)}")
+
+    Fdim = int(x_abs.size(1))
+    idx = dec.infer_feature_indices(cfg, Fdim)
+
     x = x_abs.clone()
-    x[:, 0] = x[:, 0].clamp_min(rho_floor)   # rho
-    x[:, 3] = x[:, 3].clamp_min(E_floor)     # E (optional, but strongly recommended)
+    x[:, idx["rho"]] = x[:, idx["rho"]].clamp_min(rho_floor)
+    x[:, idx["E"]]   = x[:, idx["E"]].clamp_min(E_floor)
     return x
+
 
 def train_one_epoch_multi_step(
     model,
@@ -790,6 +1508,8 @@ def train_one_epoch_multi_step(
 
     Assumes model predicts RATE (cfg["model"]["predict_type"] == "rate").
     """
+
+    diag_state = {"norm": {}, "phys": {}}
 
     model.train()
     total_loss_accum = 0.0
@@ -838,6 +1558,31 @@ def train_one_epoch_multi_step(
         uy = my / rho_safe
         _tstats("ux=mx/|rho|", ux)
         _tstats("uy=my/|rho|", uy)
+
+    @torch.no_grad()
+    def _enforce_physical_state_with_diag(x_abs: torch.Tensor, *, tag: str, step_k: int,
+                                        rho_idx: int = 0, E_idx: int = 3,
+                                        rho_floor: float = 1e-6, E_floor: float = 1e-6) -> torch.Tensor:
+        """
+        Prints how often rho/E are below floor BEFORE clamp, then applies your existing clamp helper.
+        """
+        # pre-clamp stats on the tensor you're about to clamp
+        rho_pre = x_abs[:, rho_idx]
+        E_pre   = x_abs[:, E_idx]
+
+        negR_frac = (rho_pre < rho_floor).float().mean().item()
+        negE_frac = (E_pre   < E_floor).float().mean().item()
+
+        # only print if something is actually getting clamped (or toggle as you like)
+        if (negR_frac > 0.0) or (negE_frac > 0.0):
+            print(
+                f"[CLAMP] step_k={step_k} tag={tag} "
+                f"preclamp neg_rho_frac={negR_frac:.3e} neg_E_frac={negE_frac:.3e} "
+                f"rho[min]={float(rho_pre.min()):+.3e} E[min]={float(E_pre.min()):+.3e}"
+            )
+
+        # now do the actual clamp using your existing helper
+        return _enforce_physical_state(x_abs, rho_floor=rho_floor, E_floor=E_floor)
 
     # ---- dx,dy ----
     if dx is None or dy is None:
@@ -951,7 +1696,7 @@ def train_one_epoch_multi_step(
             norm_in  = _maybe_norm(x_in_abs,  mu, sigma)
             norm_tgt = _maybe_norm(x_tgt_abs, mu, sigma)
 
-            if _should_print():
+            if _should_print() and nan_watch:
                 print(f"[NAN-DBG] step={step_k} ---- norm checks ----")
                 _tstats("x_in_abs", x_in_abs)
                 _tstats("x_tgt_abs", x_tgt_abs)
@@ -985,7 +1730,7 @@ def train_one_epoch_multi_step(
                         if dt_ref_scalar is not None else None)
             dt_hat = (dt_phys / dt_ref_t) if dt_ref_t is not None else dt_phys
 
-            if _should_print():
+            if _should_print() and nan_watch:
                 print(f"[NAN-DBG] step={step_k} ---- dt checks ----")
                 _tstats("dt_phys", dt_phys)
                 _tstats("dt_ref_t", dt_ref_t if dt_ref_t is not None else None)
@@ -997,7 +1742,7 @@ def train_one_epoch_multi_step(
             # ---------------------------
             # NAN DEBUG: dt and targets
             # ---------------------------
-            if _should_print():
+            if _should_print() and nan_watch:
                 print(f"[NAN-DBG] step={step_k} ---- dt/target checks ----")
                 _tstats("dt_phys", dt_phys)
                 _tstats("dt_ref_t", dt_ref_t if dt_ref_t is not None else None)
@@ -1046,7 +1791,7 @@ def train_one_epoch_multi_step(
                 # ---------------------------
                 # NAN DEBUG: graph + geometry
                 # ---------------------------
-                if _should_print():
+                if _should_print() and nan_watch:
                     print(f"[NAN-DBG] step={step_k} ---- graph/edge_attr checks ----")
 
                     # edge_index sanity
@@ -1087,8 +1832,12 @@ def train_one_epoch_multi_step(
                     #print("[DEC-CHK] Computing DEC operators for step", step_k)
                     with torch.autocast(device_type=device.type, enabled=False):
 
-                        # Only apply advection physics at step 0
-                        adv_step_gate = (step_k == 0)
+                        # Check whether advection should be applied at all steps or not
+                        adv_all_steps  = bool(loss_cfg.get("adv_all_steps", True))
+                        if not adv_all_steps:
+                            adv_step_gate = (step_k == 0)
+                        else:
+                            adv_step_gate = True
 
                         adv_w  = float(loss_cfg.get("adv_weight", 1.0))
                         diff_w = float(loss_cfg.get("diff_weight", 1.0))
@@ -1101,6 +1850,10 @@ def train_one_epoch_multi_step(
                         need_adv  = (adv_step_gate and include_adv_cfg  and (adv_w != 0.0))
                         need_diff = (include_diff_cfg and (diff_w != 0.0))
 
+                        if cfg.get("debug", {}).get("print_ops_clamp", False):
+                            _ = _enforce_physical_state_with_diag(
+                                x_in_abs, tag="before_ops_sanitize", step_k=step_k, rho_floor=1e-6, E_floor=1e-6
+                            )
                         #x_for_ops = _enforce_physical_state(x_in_abs, rho_floor=1e-6, E_floor=1e-6)
                         x_for_ops = sanitize_state_for_ops(x_in_abs, cfg, rho_floor=1e-6, E_floor=1e-6)
 
@@ -1125,46 +1878,88 @@ def train_one_epoch_multi_step(
                                 _dump_state("x_for_ops", x_for_ops)
 
                         with torch.autocast(device_type=device.type, enabled=False):
-                            r_adv_abs, r_diff_abs, area = dec.dec_advdiff_terms_abs(
-                                #x_abs=x_in_abs.float(),
-                                x_abs=x_for_ops.float(),
-                                edge_index=pei.long(),
-                                pred_ea=pea.float(),
-                                levels=pred_levels.long().to(device),
-                                dx0=float(dx),
-                                dy0=float(dy),
-                                cfg=cfg,
-                                compute_adv=need_adv,
-                                compute_diff=need_diff,
-                            )
+                            with torch.no_grad():
+                                r_adv_abs, r_diff_abs, area = dec.dec_advdiff_terms_abs(
+                                    #x_abs=x_in_abs.float(),
+                                    x_abs=x_for_ops.float(),
+                                    edge_index=pei.long(),
+                                    pred_ea=pea.float(),
+                                    levels=pred_levels.long().to(device),
+                                    dx0=float(dx),
+                                    dy0=float(dy),
+                                    cfg=cfg,
+                                    compute_adv=need_adv,
+                                    compute_diff=need_diff,
+                                )
 
-                            # If not computed, dec_ops should return None; if it returns something else, normalize here:
-                            if (r_adv_abs is None) and need_adv:
-                                raise RuntimeError("dec_advdiff_terms_abs returned r_adv_abs=None but need_adv=True")
-                            if (r_diff_abs is None) and need_diff:
-                                raise RuntimeError("dec_advdiff_terms_abs returned r_diff_abs=None but need_diff=True")
+                                # If not computed, dec_ops should return None; if it returns something else, normalize here:
+                                if (r_adv_abs is None) and need_adv:
+                                    raise RuntimeError("dec_advdiff_terms_abs returned r_adv_abs=None but need_adv=True")
+                                if (r_diff_abs is None) and need_diff:
+                                    raise RuntimeError("dec_advdiff_terms_abs returned r_diff_abs=None but need_diff=True")
 
-                            if not adv_step_gate:
-                                r_adv_abs = None
+                                if not adv_step_gate:
+                                    r_adv_abs = None
 
-                            r_phy_abs = None
-                            if (dec_blend_w != 0.0) or (dec_resid_w != 0.0):
-                                # Start from diffusion baseline (or zeros)
-                                if need_diff and (r_diff_abs is not None):
-                                    base = diff_w * r_diff_abs
-                                else:
-                                    # need a correctly-shaped zero tensor
-                                    ref = r_diff_abs if (r_diff_abs is not None) else r_adv_abs
-                                    if ref is None:
-                                        # Shouldn't happen if need_phy, but keep safe
-                                        ref = x_in_abs.float()
-                                    base = torch.zeros_like(ref)
+                                r_phy_abs = None
+                                if (dec_blend_w != 0.0) or (dec_resid_w != 0.0):
+                                    # Start from diffusion baseline (or zeros)
+                                    if need_diff and (r_diff_abs is not None):
+                                        base = diff_w * r_diff_abs
+                                    else:
+                                        # need a correctly-shaped zero tensor
+                                        ref = r_diff_abs if (r_diff_abs is not None) else r_adv_abs
+                                        if ref is None:
+                                            # Shouldn't happen if need_phy, but keep safe
+                                            ref = x_in_abs.float()
+                                        base = torch.zeros_like(ref)
 
-                                # Add advection only at step 0 (because need_adv includes adv_step_gate)
-                                if need_adv and (r_adv_abs is not None):
-                                    base = base + adv_w * r_adv_abs
+                                    # Add advection only at step 0 (because need_adv includes adv_step_gate)
+                                    if need_adv and (r_adv_abs is not None):
+                                        base = base + adv_w * r_adv_abs
 
-                                r_phy_abs = base
+                                    r_phy_abs = base
+
+                                if cfg.get("debug", {}).get("stepA_star", False):
+                                    if step_k >= int(cfg.get("debug", {}).get("stepA_star_kmin", 5)):
+                                        stepA_check_given_state_vs_gt(
+                                            tag=f"step_k={step_k} (TRAIN STATE)",
+                                            x_in_abs=x_in_abs,
+                                            x_tgt_abs=x_tgt_abs,
+                                            pred_levels=pred_levels,
+                                            pei=pei,
+                                            pea=pea,
+                                            dt=dt_phys,
+                                            cfg=cfg,
+                                            device=device,
+                                            dx=float(dx),
+                                            dy=float(dy),
+                                            u_max=float(cfg.get("debug", {}).get("stepA_u_max", 1e3)),
+                                        )
+                                if cfg.get("debug", {}).get("stepA_teacher", False):
+                                    j = step_k + 1  
+                                    x_in_teacher = feat_t_on_pred_list[j].to(device)  # GT(t+k) on pred(t+k+1)
+
+                                    stepA_check_given_state_vs_gt(
+                                        tag=f"step_k={step_k} (GT STATE)",
+                                        x_in_abs=x_in_teacher,
+                                        x_tgt_abs=x_tgt_abs,
+                                        pred_levels=pred_levels,
+                                        pei=pei,
+                                        pea=pea,
+                                        dt=dt_phys,
+                                        cfg=cfg,
+                                        device=device,
+                                        dx=float(dx),
+                                        dy=float(dy),
+                                        u_max=float(cfg.get("debug", {}).get("stepA_u_max", 1e3)),
+                                    )
+
+                                    # also print drift magnitude between rollout state and GT state on same mesh:
+                                    drift = x_in_abs.float() - x_in_teacher.float()
+                                    print(f"[STEP-B] step_k={step_k} drift absmax={float(drift.abs().max()):.3e} "
+                                        f"drift meanabs={float(drift.abs().mean()):.3e}")
+
 
                         # Channel mask: use the same selection logic as PARC inputs
                         #sel = dec.parc_select_feature_indices(cfg, x_in_abs.size(1))  # list[int]
@@ -1282,6 +2077,44 @@ def train_one_epoch_multi_step(
                                     parc_extra[:, :da] = 0.0
 
                         x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
+
+
+                    watch_steps = set(cfg.get("debug", {}).get("parc_scale_watch_steps", [0, 3, 6, 9]))
+                    if cfg.get("debug", {}).get("parc_scale_watch", True) and (step_k in watch_steps):
+                        with torch.no_grad():
+                            _tstats("norm_in", norm_in)
+                            _tstats("r_adv_abs", r_adv_abs)
+                            _tstats("r_diff_abs", r_diff_abs)
+
+                            # Convert ABS operator rates to "model units" (normalized-rate space)
+                            sigma_f32 = _as_stat_tensor(sigma, device=device, dtype=torch.float32)
+                            if sigma_f32 is not None:
+                                sigma_f32 = sigma_f32.clamp_min(1e-12)
+
+                            dt_ref_f32  = (dt_ref_t.to(device=device, dtype=torch.float32) if dt_ref_t is not None else None)
+                            dt_phys_f32 = dt_phys.to(device=device, dtype=torch.float32)
+
+                            if r_adv_abs is not None:
+                                adv_model = dec.physics_to_model_units(
+                                    r_adv_abs.to(dtype=torch.float32),
+                                    dt_phys=dt_phys_f32,
+                                    dt_ref=dt_ref_f32,
+                                    sigma=sigma_f32,
+                                    predict_type="rate",
+                                )
+                                _tstats("adv_model_units", adv_model)
+
+                            if r_diff_abs is not None:
+                                diff_model = dec.physics_to_model_units(
+                                    r_diff_abs.to(dtype=torch.float32),
+                                    dt_phys=dt_phys_f32,
+                                    dt_ref=dt_ref_f32,
+                                    sigma=sigma_f32,
+                                    predict_type="rate",
+                                )
+                                _tstats("diff_model_units", diff_model)
+
+                            _tstats("parc_extra", parc_extra)
 
 
                     # ---------------------------
@@ -1489,10 +2322,95 @@ def train_one_epoch_multi_step(
 
                 _assert_finite("rate_target", rate_target)
 
+                watch_steps = set(cfg.get("debug", {}).get("parc_scale_watch_steps", [0, 3, 6, 9]))
+                if cfg.get("debug", {}).get("parc_scale_watch", True) and (step_k in watch_steps):
+                    with torch.no_grad():
+                        _tstats("rate_target", rate_target)
+                        _tstats("y_pred", y_pred)
+
+
+                # ==========================================================
+                # FAST NEXT DIAGNOSTIC (RUN ONCE, STEP 0 ONLY)
+                #   - norm-space call: best for dt scale + channel permutation
+                #   - phys-space call: best to detect normalization mismatch
+                # NOTE: do NOT pass the AMP GradScaler "scaler" here.
+                # ==========================================================
+                '''
+                if step_k == 0:
+                    print("\n[FAST NEXT DIAGNOSTIC] Running fast next diagnostic at step 0")
+                    # (A) Norm-space: consistent with your actual loss space (y_pred vs rate_target)
+                    #     This is the cleanest place to detect:
+                    #       - dt vs 1/dt vs delta-vs-rate bugs (w.r.t dt_hat)
+                    #       - channel permutation
+                    maybe_run_fast_next_diag(
+                        cfg=cfg,
+                        state=diag_state["norm"],
+                        pred_rate=y_pred,          # (N,F) predicted RATE in *normalized* space
+                        gt_t_feats=norm_in,        # (N,F) GT(t) in *normalized* space
+                        gt_tp1_feats=norm_tgt,     # (N,F) GT(t+1) in *normalized* space
+                        dt=dt_hat,                # the exact dt used for rate_target + integration
+                        mu=None,                  # IMPORTANT: already normalized
+                        sigma=None,               # IMPORTANT: already normalized
+                        scaler=None,              # IMPORTANT: do NOT pass AMP GradScaler
+                        feature_names=["rho", "mx", "my", "E"],
+                        tag="FASTDIAG/norm_space/step0",
+                    )
+
+                    # (B) Abs-space GT + mu/sigma provided:
+                    #     This is the fastest way to detect a normalization mismatch:
+                    #       “pred lives in normalized space, but you’re comparing/plotting in abs (or vice versa)”
+                    maybe_run_fast_next_diag(
+                        cfg=cfg,
+                        state=diag_state["phys"],
+                        pred_rate=y_pred,          # still normalized-rate output
+                        gt_t_feats=x_in_abs,       # (N,F) GT(t) in *absolute* space (step0 is teacher by construction)
+                        gt_tp1_feats=x_tgt_abs,    # (N,F) GT(t+1) in *absolute* space
+                        dt=dt_hat,                # keep dt consistent with your supervision/integration path
+                        mu=mu,
+                        sigma=sigma,
+                        scaler=None,              # IMPORTANT: do NOT pass AMP GradScaler
+                        feature_names=["rho", "mx", "my", "E"],
+                        tag="FASTDIAG/abs_space_with_mu_sigma/step0",
+                    )
+                '''
+
                 center_loss = (F.huber_loss(y_pred, rate_target, delta=huber_delta)
                                if use_huber else F.mse_loss(y_pred, rate_target))
 
                 y_pred_abs = _maybe_denorm(norm_in + y_pred * dt_hat, mu, sigma)
+
+                # ---------------- DEBUG: oracle check ----------------
+                if cfg.get("debug", {}).get("oracle_watch", False):
+                    Fdim = int(x_in_abs.size(1))
+                    idx = dec.infer_feature_indices(cfg, Fdim)
+                    rho_idx = int(idx.get("rho", 0))
+                    E_idx   = int(idx.get("E", 3))
+
+                    # dt_hat should already be a scalar tensor; make it robust anyway
+                    dt_oracle = dt_hat
+                    if not torch.is_tensor(dt_oracle):
+                        dt_oracle = torch.tensor(float(dt_oracle), device=device, dtype=norm_in.dtype)
+
+                    oracle_debug_step(
+                        step_k=step_k,
+                        x_in_norm=norm_in,        # (N,F) normalized state at time t
+                        x_tgt_norm=norm_tgt,      # (N,F) normalized teacher at time t+1
+                        pred_norm=y_pred,         # (N,F) the rate you actually integrate (includes baseline if enabled)
+                        dt=dt_oracle,             # scalar tensor
+                        x_roll_abs=y_pred_abs,    # (N,F) absolute next state produced by integration
+                        x_tgt_abs=x_tgt_abs,      # (N,F) absolute teacher next state
+                        mu=mu,
+                        sigma=sigma,
+                        centers=(pred_centers if torch.is_tensor(pred_centers) else None),
+                        levels=(pred_levels if torch.is_tensor(pred_levels) else None),
+                        feature_names=("rho", "mx", "my", "E"),
+                        rho_idx=rho_idx,
+                        E_idx=E_idx,
+                        rho_floor=1e-6,
+                        E_floor=1e-6,
+                        topk=int(cfg.get("debug", {}).get("oracle_topk", 10)),
+                    )
+                # ---------------- END DEBUG ----------------
 
                 # ----- optional existing regularizers -----
                 lap_loss = (laplacian_smoothness(y_pred, pei) if lap_w > 0 else y_pred.new_zeros(()))
@@ -1547,6 +2465,48 @@ def train_one_epoch_multi_step(
         x_in_abs0  = feat_t_on_pred_list[k + 1].to(device)     # absolute GT(t) on pred(k+1)
         x_tgt_abs0 = feat_tp1_on_pred_list[k + 1].to(device)   # absolute GT(t+1) on pred(k+1)
 
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # [STEP-C] DRIFT WATCH (place HERE for step 0, before _run_step)
+        if cfg.get("debug", {}).get("drift_watch", False):
+            x_teacher = x_in_abs0.float()
+            x_roll    = x_in_abs0.float()  # for step0 rollout == teacher by construction
+            drift = (x_roll - x_teacher).abs()
+
+            drift_mean = drift.mean(dim=0)
+            drift_max  = drift.max(dim=0).values
+            print(f"[DRIFT-C] step_k=0 (pre-run) mean={drift_mean.tolist()} max={drift_max.tolist()}")
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+        # ---- DEBUG: normalization check on real training tensors (prints once) ----
+        if cfg.get("debug", {}).get("print_norm_sanity_once", True) and (not hasattr(train_one_epoch_multi_step, "_printed_norm_sanity")):
+            train_one_epoch_multi_step._printed_norm_sanity = True
+
+            print("\n[NORM-SANITY] step0 tensors on pred mesh (k+1)")
+            _tstats("x_in_abs0", x_in_abs0)
+            _tstats("x_tgt_abs0", x_tgt_abs0)
+
+            norm_in0  = _maybe_norm(x_in_abs0,  mu, sigma)
+            norm_tgt0 = _maybe_norm(x_tgt_abs0, mu, sigma)
+
+            _tstats("norm_in0", norm_in0)
+            _tstats("norm_tgt0", norm_tgt0)
+
+            if mu is None or sigma is None:
+                print("[NORM-SANITY] mu/sigma are None (normalization disabled).")
+            else:
+                _tstats("mu", mu)
+                _tstats("sigma", sigma)
+
+                # check how close to 0 mean / unit scale the normalized values look (rough)
+                try:
+                    m = norm_in0.mean(dim=0).detach().cpu()
+                    s = norm_in0.std(dim=0, unbiased=False).detach().cpu()
+                    print("[NORM-SANITY] norm_in0 per-channel mean:", m.numpy())
+                    print("[NORM-SANITY] norm_in0 per-channel std :", s.numpy())
+                except Exception as e:
+                    print("[NORM-SANITY][WARN] couldn't compute per-channel mean/std:", repr(e))
+
+
         dt0 = dt_list[0]
         dt0 = dt0.to(device=device, dtype=x_in_abs0.dtype) if torch.is_tensor(dt0) else torch.tensor(float(dt0), device=device, dtype=x_in_abs0.dtype)
         dt_ref_scalar = batch.get("dt_ref", None)
@@ -1570,7 +2530,12 @@ def train_one_epoch_multi_step(
         window_loss_graph = loss0 if window_loss_graph is None else (window_loss_graph + loss0)
 
         # chain absolute prediction forward
-        pred_feats_k = y_pred_abs0
+        #pred_feats_k = y_pred_abs0
+        #pred_feats_k = _enforce_physical_state(y_pred_abs0, rho_floor=1e-6, E_floor=1e-6)
+        #pred_feats_k = _enforce_physical_state_with_diag(
+        #    y_pred_abs0, tag="rollout_chain", step_k=0, rho_floor=1e-6, E_floor=1e-6
+        #)
+        pred_feats_k = _enforce_physical_state(y_pred_abs0, cfg, rho_floor=1e-6, E_floor=1e-6)
 
         # ======================
         # STEPS 1..K-2
@@ -1584,6 +2549,76 @@ def train_one_epoch_multi_step(
             w_km1   = pred2pred_w_list[k-1].to(device)
             x_in_abs = apply_precomputed_idw_map(idx_km1, w_km1, pred_feats_k).to(device)
 
+            # teacher state on the SAME mesh (pred mesh at j=k+1)
+            x_in_teacher = feat_t_on_pred_list[k + 1].to(device)
+
+            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+            # [STEP-C] DRIFT WATCH (place HERE, right after x_in_abs is defined)
+            if cfg.get("debug", {}).get("drift_watch", False):
+                drift = (x_in_abs.float() - x_in_teacher.float()).abs()  # (N,F)
+
+                drift_mean = drift.mean(dim=0)
+                drift_p95 = torch.quantile(drift.detach().to("cpu"), 0.95, dim=0).to(drift.device)
+                drift_max  = drift.max(dim=0).values
+
+                print(f"[DRIFT-C] step_k={k} (pre-run) mean={drift_mean.tolist()} "
+                    f"p95={drift_p95.tolist()} max={drift_max.tolist()}")
+
+                # optional top-k worst nodes
+                node_score = drift.sum(dim=1)
+                topk = min(10, node_score.numel())
+                vals, idxs = torch.topk(node_score, k=topk, largest=True)
+                print(f"[DRIFT-C] step_k={k} top-{topk} nodes by L1 drift:")
+                for r in range(topk):
+                    ii = int(idxs[r].item())
+                    v  = float(vals[r].item())
+                    xy = pred_centers_next[ii].tolist() if torch.is_tensor(pred_centers_next) else None
+                    lv = int(pred_levels_next[ii].item()) if torch.is_tensor(pred_levels_next) else None
+                    print(f"  node={ii:6d} score={v:.3e} xy={xy} level={lv}")
+
+                    if torch.is_tensor(x_in_abs) and torch.is_tensor(x_in_teacher):
+                        d = (x_in_abs[ii] - x_in_teacher[ii]).detach().to("cpu")
+                        xs = x_in_abs[ii].detach().to("cpu")
+                        xt = x_in_teacher[ii].detach().to("cpu")
+
+                        # channels assumed [rho, mx, my, E]
+                        print(f"    drift[rho,mx,my,E]={d.tolist()}")
+                        print(f"    roll [rho,mx,my,E]={xs.tolist()}")
+                        print(f"    teach[rho,mx,my,E]={xt.tolist()}")
+
+                        # velocity diagnostic (avoid div0)
+                        rho_r = float(xs[0])
+                        rho_t = float(xt[0])
+                        mx_r, my_r = float(xs[1]), float(xs[2])
+                        mx_t, my_t = float(xt[1]), float(xt[2])
+
+                        urx = mx_r / max(abs(rho_r), 1e-12)
+                        ury = my_r / max(abs(rho_r), 1e-12)
+                        utx = mx_t / max(abs(rho_t), 1e-12)
+                        uty = my_t / max(abs(rho_t), 1e-12)
+
+                        print(f"    u_roll=[{urx:.3e},{ury:.3e}]  u_teach=[{utx:.3e},{uty:.3e}]")
+            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+            '''
+            # ---- DEBUG: IDW map sanity (prints once when blowup starts) ----
+            if (k >= 6) and (not hasattr(train_one_epoch_multi_step, "_printed_idw_sanity")):
+                train_one_epoch_multi_step._printed_idw_sanity = True
+                print(f"\n[IDW-SANITY] k={k}")
+                _tstats("pred_feats_k (before IDW)", pred_feats_k)
+
+                w = w_km1
+                _tstats("w_km1", w)
+                # row sums
+                row_sum = w.sum(dim=1)
+                _tstats("w row_sum", row_sum)
+
+                print("  w min:", float(w.min().detach().cpu()), "max:", float(w.max().detach().cpu()))
+                print("  row_sum min:", float(row_sum.min().detach().cpu()), "max:", float(row_sum.max().detach().cpu()))
+                print("  any w<0:", bool((w < 0).any().detach().cpu()))
+                print("  any row_sum<=0:", bool((row_sum <= 0).any().detach().cpu()))
+                print("  any nonfinite w:", bool((~torch.isfinite(w)).any().detach().cpu()))
+            '''
             x_tgt_abs = feat_tp1_on_pred_list[k + 1].to(device)
 
             dtk = dt_list[k]
@@ -1607,16 +2642,34 @@ def train_one_epoch_multi_step(
             n_steps += 1
             window_loss_graph = window_loss_graph + loss_k
 
-            pred_feats_k = y_pred_abs_k
+            #pred_feats_k = y_pred_abs_k
+            #pred_feats_k = _enforce_physical_state(y_pred_abs_k, rho_floor=1e-6, E_floor=1e-6)
+            #pred_feats_k = _enforce_physical_state_with_diag(
+            #    y_pred_abs_k, tag="rollout_chain", step_k=k, rho_floor=1e-6, E_floor=1e-6
+            #)
+            pred_feats_k = _enforce_physical_state(y_pred_abs_k, cfg, rho_floor=1e-6, E_floor=1e-6)
 
         # ===== backward + step once per window =====
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         if window_loss_graph is not None:
+            '''
             if scaler is not None:
                 scaler.scale(window_loss_graph).backward()
                 scaler.step(opt)
                 scaler.update()
             else:
                 window_loss_graph.backward()
+                opt.step()
+            '''
+            if scaler is not None:
+                scaler.scale(window_loss_graph).backward()
+                scaler.unscale_(opt)  # <-- required before clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                window_loss_graph.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
         else:
             opt.step()
@@ -1921,8 +2974,12 @@ def evaluate_one_epoch_multi_step(
                     if need_phy:
                         with torch.autocast(device_type=device.type, enabled=False):
 
-                            # Option A: advection physics only at step 0
-                            adv_step_gate = (step_k == 0)
+                            # Check whether advection should be applied at all steps or not
+                            adv_all_steps  = bool(loss_cfg.get("adv_all_steps", True))
+                            if not adv_all_steps:
+                                adv_step_gate = (step_k == 0)
+                            else:
+                                adv_step_gate = True
 
                             adv_w  = float(loss_cfg.get("adv_weight", 1.0))
                             diff_w = float(loss_cfg.get("diff_weight", 1.0))
@@ -1935,8 +2992,8 @@ def evaluate_one_epoch_multi_step(
                             need_diff = (include_diff_cfg and (diff_w != 0.0))
 
                             # If you have the sanitize helper in eval too, use it (recommended)
-                            # x_for_ops = sanitize_state_for_ops(x_in_abs, cfg, rho_floor=1e-6, E_floor=1e-6)
-                            x_for_ops = x_in_abs
+                            x_for_ops = sanitize_state_for_ops(x_in_abs, cfg, rho_floor=1e-6, E_floor=1e-6)
+                            #x_for_ops = x_in_abs
 
                             r_adv_abs, r_diff_abs, area = dec.dec_advdiff_terms_abs(
                                 x_abs=x_for_ops.float(),
@@ -2033,12 +3090,12 @@ def evaluate_one_epoch_multi_step(
                                     update_adv_stats=adv_active,
                                     update_diff_stats=diff_active,
                                 )
-                                
-                            # IMPORTANT: prevent normalized “fake adv” on steps where adv is gated off
-                            if not adv_step_gate:
-                                da = int(model.parc_adapter.dim_adv)
-                                if da > 0:
-                                    parc_extra[:, :da] = 0.0                                
+
+                                # IMPORTANT: prevent normalized “fake adv” on steps where adv is gated off
+                                if not adv_step_gate:
+                                    da = int(model.parc_adapter.dim_adv)
+                                    if da > 0:
+                                        parc_extra[:, :da] = 0.0                                
 
                             x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
 
@@ -2181,7 +3238,8 @@ def evaluate_one_epoch_multi_step(
                 _append_budget_row(t_abs=t_abs0, step_k=0, kind="pred_on_pred_mesh_tp1", x_abs=y_pred_abs0, pred_levels=pred_levels_1)
 
 
-            pred_feats_k = y_pred_abs0
+            #pred_feats_k = y_pred_abs0
+            pred_feats_k = _enforce_physical_state(y_pred_abs0, cfg, rho_floor=1e-6, E_floor=1e-6)
 
             # ===== STEPS 1..K-2 =====
             for k in range(1, K - 1):
@@ -2252,7 +3310,8 @@ def evaluate_one_epoch_multi_step(
                     _append_budget_row(t_abs=t_absk, step_k=k, kind="pred_on_pred_mesh_tp1", x_abs=y_pred_abs_k, pred_levels=pred_levels_next)
 
                 # keep your existing propagation behavior
-                pred_feats_k = _enforce_physical_state(y_pred_abs_k, rho_floor=1e-6, E_floor=1e-6)
+                #pred_feats_k = _enforce_physical_state(y_pred_abs_k, rho_floor=1e-6, E_floor=1e-6)
+                pred_feats_k = _enforce_physical_state(y_pred_abs_k, cfg, rho_floor=1e-6, E_floor=1e-6)
 
 
     # ---- finalize metrics ----
@@ -2943,6 +4002,10 @@ def main(config_path: str | None = None):
     with open(config_path, "r") as f:
         cfg = json.load(f)
 
+    idx = dec.infer_feature_indices(cfg, 4)
+    print("[IDX]", idx)
+    assert idx["rho"] == 0 and idx["mx"] == 1 and idx["my"] == 2 and idx["E"] == 3
+
     loss = cfg.setdefault("loss", {})
 
     # Do NOT force dec on by default unless you really mean it.
@@ -3259,6 +4322,22 @@ def main(config_path: str | None = None):
         num_workers=0, pin_memory=False, collate_fn=collate
     )
 
+    # --- Step A debug (ONE batch, ONE step) ---
+    if cfg.get("debug", {}).get("run_stepA", False):
+        batch0 = next(iter(train_loader))  # or val_loader
+        _ = stepA_check_ops_vs_gt_delta(
+            batch0,
+            cfg,
+            device,
+            dx=float(dx),
+            dy=float(dy),
+            step_k=int(cfg.get("debug", {}).get("stepA_k", 0)),
+            u_max=float(cfg.get("debug", {}).get("stepA_u_max", 1e3)),
+            rho_floor=1e-6,
+            E_floor=1e-6,
+        )
+        raise SystemExit("[STEP-A] done")
+
      # ---- Normalization stats (μ/σ) ----
     feats_cfg = cfg.get("features", {})
     do_norm = bool(feats_cfg.get("normalize", True))
@@ -3281,7 +4360,25 @@ def main(config_path: str | None = None):
         sigma = sigma.to(device)
     else:
         mu = sigma = None
+
+    # --- ABS really means ABS check (one batch) ---
+    if cfg.get("debug", {}).get("abs_means_abs_check", True):
+        batch0 = next(iter(train_loader))
+        abs_means_abs_check(cfg=cfg, batch=batch0, mu=mu, sigma=sigma, device=device, tag="ABS-MEANS-ABS/TRAIN")
+
+    if cfg.get("debug", {}).get("abs_means_abs_check_val", False):
+        batchv = next(iter(val_loader))
+        abs_means_abs_check(cfg=cfg, batch=batchv, mu=mu, sigma=sigma, device=device, tag="ABS-MEANS-ABS/VAL")
     
+    # ---- DEBUG: normalization stats sanity (prints once) ----
+    print("\n[NORM-STATS] computed from train_loader")
+    print("  mu:", mu.detach().cpu().numpy())
+    print("  sigma:", sigma.detach().cpu().numpy())
+    print("  sigma min/max:", float(sigma.min().detach().cpu()), float(sigma.max().detach().cpu()))
+    print("  any sigma<=0:", bool((sigma <= 0).any().detach().cpu()))
+    print("  any nonfinite mu:", bool((~torch.isfinite(mu)).any().detach().cpu()))
+    print("  any nonfinite sigma:", bool((~torch.isfinite(sigma)).any().detach().cpu()))
+
     # -------- training loop --------
     os.makedirs(cfg["train"]["save_dir"], exist_ok=True)
     log_csv = os.path.join(cfg["train"]["save_dir"], "train_log.csv")
