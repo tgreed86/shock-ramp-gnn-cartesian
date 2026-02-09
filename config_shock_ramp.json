@@ -165,7 +165,8 @@
     "oracle_watch": false,
     "fast_next_diag": false,
     "parc_scale_watch": false,
-    "print_norm_sanity_once": false
+    "print_norm_sanity_once": false,
+    "teacher_force_ops": false
   },
 
   "speed": {

@@ -351,7 +351,17 @@ class _LazyPrecompScalar:
         return self.get()
 
 
-def precomp_h5_is_usable(path: str, cfg: dict, expected_steps: int, verbose: bool = False) -> bool:
+def precomp_h5_is_usable(
+    path: str,
+    cfg: dict,
+    expected_steps: int,
+    *,
+    H: int,
+    W: int,
+    require_dec: bool = False,
+    require_pred2pred: bool = False,
+    verbose: bool = False,
+) -> bool:
     import os, h5py, numpy as np, json, hashlib
 
     def _v(msg):
@@ -380,32 +390,56 @@ def precomp_h5_is_usable(path: str, cfg: dict, expected_steps: int, verbose: boo
                 _v(f"reject: T mismatch stored_T={stored_T} expected_steps={expected_steps}")
                 return False
 
-            # ---- cfg hash check (if you do one)
-            stored_sha = meta.attrs.get("cfg_sha1", None)
-            if stored_sha is None:
-                _v("reject: meta.attrs['cfg_sha1'] missing")
+            # ---- H/W check (matches what your writer stores)
+            if int(meta.attrs.get("H", -1)) != int(H) or int(meta.attrs.get("W", -1)) != int(W):
+                _v(f"reject: H/W mismatch stored=({meta.attrs.get('H')},{meta.attrs.get('W')}) expected=({H},{W})")
                 return False
+
+            # ---- IMPORTANT CHANGE: do NOT reject on cfg_sha1 mismatch
+            stored_sha = meta.attrs.get("cfg_sha1", None)
             if isinstance(stored_sha, (bytes, np.bytes_)):
                 stored_sha = stored_sha.decode("utf-8")
-
-            # compute current sha exactly the same way you did when writing
-            cfg_json = json.dumps(cfg, sort_keys=True, default=str)
-            cur_sha = hashlib.sha1(cfg_json.encode("utf-8")).hexdigest()
-
-            if stored_sha != cur_sha:
-                _v(f"reject: cfg_sha1 mismatch stored={stored_sha} current={cur_sha}")
-                return False
-
-            # ---- required groups check (example)
-            # If your data is under f["steps"], ensure it exists and has enough keys
-            if "steps" in f:
-                n = len(f["steps"].keys())
-                if n < (stored_T - 1):
-                    _v(f"reject: /steps incomplete n={n} expected>={stored_T-1}")
-                    return False
+            if stored_sha is None:
+                _v("warn: meta.attrs['cfg_sha1'] missing (continuing)")
             else:
-                _v("reject: missing /steps group (checker expects it)")
-                return False
+                cfg_json = json.dumps(cfg, sort_keys=True, default=str)
+                cur_sha = hashlib.sha1(cfg_json.encode("utf-8")).hexdigest()
+                if stored_sha != cur_sha:
+                    _v(f"warn: cfg_sha1 mismatch stored={stored_sha} current={cur_sha} (continuing)")
+
+            # ---- IMPORTANT CHANGE: validate streaming layout (t00001..t{T-1}), NOT '/steps'
+            for t in range(1, stored_T):
+                gname = f"t{t:05d}"
+                if gname not in f:
+                    _v(f"reject: missing group {gname}")
+                    return False
+
+                g = f[gname]
+
+                # minimum datasets written in FIRST PASS
+                required = [
+                    "pred_centers", "pred_levels", "pred_parents", "pred_ei",
+                    "mask_pred_parent_flat_u8",
+                    "feat_t_on_pred", "feat_tp1_on_pred",
+                ]
+                for ds in required:
+                    if ds not in g:
+                        _v(f"reject: group {gname} missing dataset '{ds}'")
+                        return False
+
+                if require_dec:
+                    for ds in ("pred_edge_attr", "pred_cell_wh", "pred_cell_area"):
+                        if ds not in g:
+                            _v(f"reject: group {gname} missing DEC dataset '{ds}'")
+                            return False
+
+            if require_pred2pred:
+                for t in range(1, stored_T - 1):
+                    gname = f"t{t:05d}"
+                    g = f[gname]
+                    if "pred2pred_idx_to_next" not in g or "pred2pred_w_to_next" not in g:
+                        _v(f"reject: missing pred2pred maps in {gname}")
+                        return False
 
     except Exception as e:
         _v(f"reject: exception while reading H5: {e}")

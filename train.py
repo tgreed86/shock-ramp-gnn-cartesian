@@ -52,6 +52,7 @@ import utils.dec_ops as dec
 from utils.fast_next_diag import maybe_run_fast_next_diag
 
 
+
 debug_once = False
 
 '''
@@ -1232,7 +1233,7 @@ def _forward_main_head(model: FeatureNet, X: torch.Tensor, edge_index: torch.Ten
     if isinstance(out, (list, tuple)):
         return out[0]
     return out
-
+'''
 def _forward_main_head_with_edge_attr(model, x_in, edge_index, edge_attr=None):
     """
     Backward compatible: if your model ignores edge_attr, it still works.
@@ -1248,6 +1249,49 @@ def _forward_main_head_with_edge_attr(model, x_in, edge_index, edge_attr=None):
     except TypeError:
         # model/_forward_main_head doesn’t accept edge_attr yet
         return _forward_main_head(model, x_in, edge_index)
+'''
+def _forward_main_head_with_edge_attr(model, x_in, edge_index, edge_attr=None, *, force_fp32: bool = True):
+    """
+    Backward compatible:
+      - If model ignores edge_attr, it still works.
+      - If force_fp32=True, we run THIS forward in fp32 (autocast disabled) to avoid fp16 NaNs.
+    """
+    if edge_attr is not None and not hasattr(_forward_main_head_with_edge_attr, "_printed"):
+        _forward_main_head_with_edge_attr._printed = True
+        print("[DEC-CHK] Forward called with edge_attr present.")
+
+    # --- choose autocast-off context safely ---
+    if force_fp32:
+        if x_in.is_cuda:
+            autocast_off = torch.cuda.amp.autocast(enabled=False)
+        else:
+            # torch.autocast exists on newer torch; fall back to nullcontext if unavailable
+            autocast_off = getattr(torch, "autocast", None)
+            autocast_off = autocast_off(device_type=x_in.device.type, enabled=False) if autocast_off else contextlib.nullcontext()
+    else:
+        autocast_off = contextlib.nullcontext()
+
+    # --- run forward ---
+    with autocast_off:
+        X = x_in.float() if force_fp32 else x_in
+        EA = (edge_attr.float() if (force_fp32 and edge_attr is not None) else edge_attr)
+
+        if EA is None:
+            y = _forward_main_head(model, X, edge_index)
+        else:
+            try:
+                # model supports edge_attr
+                y = _forward_main_head(model, X, edge_index, edge_attr=EA)
+            except TypeError:
+                # model doesn’t accept edge_attr yet
+                y = _forward_main_head(model, X, edge_index)
+
+    # If you want to keep downstream memory low / match dtype expectations, cast back.
+    # (Optionally clamp before casting if you ever see fp16 overflow.)
+    if force_fp32 and (y.dtype != x_in.dtype):
+        y = y.to(dtype=x_in.dtype)
+
+    return y
 
 def _get_bbox(cfg: Dict[str,Any]) -> Tuple[float,float,float,float]:
     if cfg.get("data", {}).get("bbox"):
@@ -1677,6 +1721,20 @@ def train_one_epoch_multi_step(
 
         opt.zero_grad(set_to_none=True)
 
+        # ------------------------------------------------------------------
+        # Move per-step tensors to GPU right before each _run_step
+        # ------------------------------------------------------------------
+        def _to_dev_nb(x, *, dtype=None):
+            if x is None:
+                return None
+            if not torch.is_tensor(x):
+                return x
+            # Avoid needless copies when already correct
+            if x.device == device and (dtype is None or x.dtype == dtype):
+                return x
+            return x.to(device=device, dtype=(dtype if dtype is not None else x.dtype), non_blocking=True)
+
+
         # ==========================================================
         # Helper closure: one step computation (k -> k+1 on pred mesh)
         # ==========================================================
@@ -1692,6 +1750,7 @@ def train_one_epoch_multi_step(
             x_tgt_abs: torch.Tensor,    # [N,F] absolute GT(t+1) mapped onto pred mesh at t+1
             dt_phys: torch.Tensor,      # scalar
             dt_ref_scalar,              # None or scalar (from batch)
+            x_ops_abs: torch.Tensor | None = None,
         ):
             norm_in  = _maybe_norm(x_in_abs,  mu, sigma)
             norm_tgt = _maybe_norm(x_tgt_abs, mu, sigma)
@@ -1854,8 +1913,11 @@ def train_one_epoch_multi_step(
                             _ = _enforce_physical_state_with_diag(
                                 x_in_abs, tag="before_ops_sanitize", step_k=step_k, rho_floor=1e-6, E_floor=1e-6
                             )
+
                         #x_for_ops = _enforce_physical_state(x_in_abs, rho_floor=1e-6, E_floor=1e-6)
                         x_for_ops = sanitize_state_for_ops(x_in_abs, cfg, rho_floor=1e-6, E_floor=1e-6)
+                        #x_ops_base = x_ops_abs if (x_ops_abs is not None) else x_in_abs
+                        #x_for_ops = sanitize_state_for_ops(x_ops_base, cfg, rho_floor=1e-6, E_floor=1e-6)
 
                         # Triggered dump: only when state is already “dangerous”
                         if torch.is_tensor(x_in_abs):
@@ -2459,12 +2521,68 @@ def train_one_epoch_multi_step(
         # STEP 0 (k=0)
         # ======================
         k = 0
+        pred_centers_1, pred_levels_1, pred_parents_1, pred_ei_1, mask_pred_1 = _pred_mesh_for_step_strict(
+            k, pred_lists=pred_lists
+        )
+        pred_ea_1 = pred_ea_list[k + 1] if (pred_ea_list is not None) else None
+
+        # --- Option A: move ONLY step-0 tensors to GPU here ---
+        pred_centers_1 = _to_dev_nb(pred_centers_1)
+        pred_levels_1  = _to_dev_nb(pred_levels_1)
+        pred_parents_1 = _to_dev_nb(pred_parents_1)
+        pred_ei_1      = _to_dev_nb(pred_ei_1)
+        mask_pred_1    = _to_dev_nb(mask_pred_1)
+        pred_ea_1      = _to_dev_nb(pred_ea_1)
+
+        x_in_abs0  = _to_dev_nb(feat_t_on_pred_list[k + 1])
+        x_tgt_abs0 = _to_dev_nb(feat_tp1_on_pred_list[k + 1])
+
+        dt0 = dt_list[0]
+        if torch.is_tensor(dt0):
+            dt0 = dt0.to(device=device, dtype=x_in_abs0.dtype, non_blocking=True)
+        else:
+            dt0 = torch.tensor(float(dt0), device=device, dtype=x_in_abs0.dtype)
+
+        dt_ref_scalar = batch.get("dt_ref", None)
+
+        loss0, y_pred_abs0, _x_tgt_abs0 = _run_step(
+            step_k=0,
+            pred_centers=pred_centers_1,
+            pred_levels=pred_levels_1,
+            pred_parents=pred_parents_1,
+            pred_ei=pred_ei_1,
+            pred_ea=pred_ea_1,
+            x_in_abs=x_in_abs0,
+            x_tgt_abs=x_tgt_abs0,
+            dt_phys=dt0,
+            dt_ref_scalar=dt_ref_scalar,
+        )
+
+        '''
+        k = 0
         pred_centers_1, pred_levels_1, pred_parents_1, pred_ei_1, mask_pred_1 = _pred_mesh_for_step_strict(k, pred_lists=pred_lists)
         pred_ea_1 = pred_ea_list[k + 1] if (pred_ea_list is not None) else None
 
         x_in_abs0  = feat_t_on_pred_list[k + 1].to(device)     # absolute GT(t) on pred(k+1)
         x_tgt_abs0 = feat_tp1_on_pred_list[k + 1].to(device)   # absolute GT(t+1) on pred(k+1)
 
+        dt0 = dt_list[0]
+        dt0 = dt0.to(device=device, dtype=x_in_abs0.dtype) if torch.is_tensor(dt0) else torch.tensor(float(dt0), device=device, dtype=x_in_abs0.dtype)
+        dt_ref_scalar = batch.get("dt_ref", None)
+
+        loss0, y_pred_abs0, _x_tgt_abs0 = _run_step(
+            step_k=0,
+            pred_centers=pred_centers_1,
+            pred_levels=pred_levels_1,
+            pred_parents=pred_parents_1,
+            pred_ei=pred_ei_1,
+            pred_ea=pred_ea_1,
+            x_in_abs=x_in_abs0,
+            x_tgt_abs=x_tgt_abs0,
+            dt_phys=dt0,
+            dt_ref_scalar=dt_ref_scalar,
+        )
+        '''
         # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
         # [STEP-C] DRIFT WATCH (place HERE for step 0, before _run_step)
         if cfg.get("debug", {}).get("drift_watch", False):
@@ -2506,24 +2624,6 @@ def train_one_epoch_multi_step(
                 except Exception as e:
                     print("[NORM-SANITY][WARN] couldn't compute per-channel mean/std:", repr(e))
 
-
-        dt0 = dt_list[0]
-        dt0 = dt0.to(device=device, dtype=x_in_abs0.dtype) if torch.is_tensor(dt0) else torch.tensor(float(dt0), device=device, dtype=x_in_abs0.dtype)
-        dt_ref_scalar = batch.get("dt_ref", None)
-
-        loss0, y_pred_abs0, _x_tgt_abs0 = _run_step(
-            step_k=0,
-            pred_centers=pred_centers_1,
-            pred_levels=pred_levels_1,
-            pred_parents=pred_parents_1,
-            pred_ei=pred_ei_1,
-            pred_ea=pred_ea_1,
-            x_in_abs=x_in_abs0,
-            x_tgt_abs=x_tgt_abs0,
-            dt_phys=dt0,
-            dt_ref_scalar=dt_ref_scalar,
-        )
-
         window_loss += float(loss0.detach().cpu())
         window_mae  += float(torch.mean(torch.abs(y_pred_abs0.detach() - x_tgt_abs0)).cpu())
         n_steps += 1
@@ -2545,12 +2645,16 @@ def train_one_epoch_multi_step(
             pred_ea_next = pred_ea_list[k + 1] if (pred_ea_list is not None) else None
 
             # map pred(k)->pred(k+1)
-            idx_km1 = pred2pred_idx_list[k-1].to(device)
-            w_km1   = pred2pred_w_list[k-1].to(device)
+            #idx_km1 = pred2pred_idx_list[k-1].to(device)
+            #w_km1   = pred2pred_w_list[k-1].to(device)
+            idx_km1 = pred2pred_idx_list[k - 1].to(device=device, non_blocking=True)
+            w_km1   = pred2pred_w_list[k - 1].to(device=device, non_blocking=True)
+
             x_in_abs = apply_precomputed_idw_map(idx_km1, w_km1, pred_feats_k).to(device)
 
             # teacher state on the SAME mesh (pred mesh at j=k+1)
-            x_in_teacher = feat_t_on_pred_list[k + 1].to(device)
+            #x_in_teacher = feat_t_on_pred_list[k + 1].to(device)
+            x_in_teacher = _to_dev_nb(feat_t_on_pred_list[k + 1])
 
             # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
             # [STEP-C] DRIFT WATCH (place HERE, right after x_in_abs is defined)
@@ -2619,10 +2723,26 @@ def train_one_epoch_multi_step(
                 print("  any row_sum<=0:", bool((row_sum <= 0).any().detach().cpu()))
                 print("  any nonfinite w:", bool((~torch.isfinite(w)).any().detach().cpu()))
             '''
-            x_tgt_abs = feat_tp1_on_pred_list[k + 1].to(device)
+            #x_tgt_abs = feat_tp1_on_pred_list[k + 1].to(device)
+            x_tgt_abs = _to_dev_nb(feat_tp1_on_pred_list[k + 1])
 
+            #dtk = dt_list[k]
+            #dtk = dtk.to(device=device, dtype=x_in_abs.dtype) if torch.is_tensor(dtk) else torch.tensor(float(dtk), device=device, dtype=x_in_abs.dtype)
             dtk = dt_list[k]
-            dtk = dtk.to(device=device, dtype=x_in_abs.dtype) if torch.is_tensor(dtk) else torch.tensor(float(dtk), device=device, dtype=x_in_abs.dtype)
+            if torch.is_tensor(dtk):
+                dtk = dtk.to(device=device, dtype=x_in_abs.dtype, non_blocking=True)
+            else:
+                dtk = torch.tensor(float(dtk), device=device, dtype=x_in_abs.dtype)
+
+            use_ops_teacher = bool(cfg.get("debug", {}).get("teacher_force_ops", False))
+
+            # --- Move ONLY this step's mesh tensors to GPU here ---
+            pred_centers_next = _to_dev_nb(pred_centers_next)
+            pred_levels_next  = _to_dev_nb(pred_levels_next)
+            pred_parents_next = _to_dev_nb(pred_parents_next)
+            pred_ei_next      = _to_dev_nb(pred_ei_next)
+            mask_pred_next    = _to_dev_nb(mask_pred_next)
+            pred_ea_next      = _to_dev_nb(pred_ea_next)
 
             loss_k, y_pred_abs_k, _ = _run_step(
                 step_k=k,
@@ -2635,6 +2755,7 @@ def train_one_epoch_multi_step(
                 x_tgt_abs=x_tgt_abs,
                 dt_phys=dtk,
                 dt_ref_scalar=dt_ref_scalar,
+                x_ops_abs=(x_in_teacher if (use_ops_teacher and k > 0) else None),
             )
 
             window_loss += float(loss_k.detach().cpu())
@@ -4267,7 +4388,7 @@ def main(config_path: str | None = None):
         force_recompute=force_recompute,
     )
 
-    precomp = move_precomp_to_device(precomp, device)
+    precomp = move_precomp_to_device(precomp, device="cpu")
 
     # --- DEBUG: verify DEC edge attributes exist in precomp ---
     if cfg.get("debug", {}).get("print_dec_checks", False):
@@ -4390,7 +4511,7 @@ def main(config_path: str | None = None):
     TR, VL = [], []
     for epoch in range(1, int(cfg["train"]["epochs"]) + 1):
         t0 = time.time()
-        batch = next(iter(train_loader))
+        #batch = next(iter(train_loader))
 
         # unpack: loss, mae, stats
         tr_loss, tr_mae, tr_stats = train_one_epoch_multi_step(

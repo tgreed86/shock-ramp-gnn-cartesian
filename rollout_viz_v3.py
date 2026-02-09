@@ -74,6 +74,7 @@ from train import (
 )
 from utils_geom import build_idw_map, apply_idw_map
 import utils.dec_ops as dec
+from utils.debug_rollout_checks import DebugRolloutChecks
 
 
 # ----------------- Logging helpers ----------------- #
@@ -1188,6 +1189,241 @@ def make_rollout_gifs_raster(
         print(f"[INFO] wrote {p}")
 
 
+# ----------------- Fast drift diagnostics ----------------- #
+
+def _as_cpu_f32(x):
+    import torch
+    if x is None:
+        return None
+    if torch.is_tensor(x):
+        return x.detach().to("cpu", dtype=torch.float32)
+    # numpy / list
+    return torch.as_tensor(x, dtype=torch.float32, device="cpu")
+
+
+def _as_cpu_i64(x):
+    import torch
+    if x is None:
+        return None
+    if torch.is_tensor(x):
+        return x.detach().to("cpu", dtype=torch.int64)
+    return torch.as_tensor(x, dtype=torch.int64, device="cpu")
+
+
+def _fmt_vec(names, v, fmt="{:.3e}"):
+    return ", ".join([f"{n}={fmt.format(float(v[i]))}" for i, n in enumerate(names)])
+
+
+@torch.no_grad()
+def run_fast_drift_checks(
+    test_stats: dict,
+    examples: list[dict],
+    *,
+    feat_names: list[str] | None,
+    bbox: tuple[float, float, float, float],
+    knn_k: int = 8,
+    chunk: int = 8192,
+    n_probe: int = 5,
+    eps: float = 1e-12,
+):
+    """
+    Four decisive checks:
+      (1) Does error grow with rollout step k? (uses *_by_rollout_step from test_stats)
+      (2) Is k=1 already bad on the *pred mesh*? (pred(t+1) vs GT(t+1) mapped to pred mesh)
+      (3) Is your update magnitude wrong (rate-vs-delta style)? (Δ_pred vs Δ_GT on pred mesh)
+      (4) Are mapping/mesh basics sane? (IDW weight sums, out-of-bounds centers, NaNs, bad levels)
+    """
+    import numpy as np
+    import torch
+
+    if not examples:
+        print("[FASTCHECK] No examples found in test_stats['examples']; nothing to probe.")
+        return
+
+    # ----------------- (1) rollout-step growth -----------------
+    r = test_stats.get("rell2w_feat_by_rollout_step", None)
+    m = test_stats.get("maew_feat_by_rollout_step", None)
+
+    print("\n" + "=" * 90)
+    print("[FASTCHECK-1] Rollout-step growth (if this explodes with k, that IS state drift).")
+
+    if r is None and m is None:
+        print("[FASTCHECK-1] Missing keys in test_stats: 'rell2w_feat_by_rollout_step' and 'maew_feat_by_rollout_step'.")
+    else:
+        if r is not None:
+            r_np = np.asarray(r)
+            if r_np.ndim == 1:
+                r_np = r_np[:, None]
+            K, F = r_np.shape
+            names = feat_names if (feat_names and len(feat_names) == F) else [f"f{i}" for i in range(F)]
+            kshow = min(K, 10)
+            print(f"[FASTCHECK-1] rell2w by rollout step (showing first {kshow}/{K}):")
+            for k in range(kshow):
+                print(f"  k={k+1:02d}: " + _fmt_vec(names, r_np[k], "{:.3e}"))
+            growth = r_np[-1] / (r_np[0] + eps)
+            print("[FASTCHECK-1] growth factor (last / k=1): " + _fmt_vec(names, growth, "{:.3e}"))
+
+        if m is not None:
+            m_np = np.asarray(m)
+            if m_np.ndim == 1:
+                m_np = m_np[:, None]
+            K, F = m_np.shape
+            names = feat_names if (feat_names and len(feat_names) == F) else [f"f{i}" for i in range(F)]
+            kshow = min(K, 10)
+            print(f"[FASTCHECK-1] maew by rollout step (showing first {kshow}/{K}):")
+            for k in range(kshow):
+                print(f"  k={k+1:02d}: " + _fmt_vec(names, m_np[k], "{:.3e}"))
+            growth = m_np[-1] / (m_np[0] + eps)
+            print("[FASTCHECK-1] growth factor (last / k=1): " + _fmt_vec(names, growth, "{:.3e}"))
+
+    # ----------------- probe examples -----------------
+    n_probe = max(1, min(int(n_probe), len(examples)))
+    x0, x1, y0, y1 = bbox
+
+    print("\n" + "-" * 90)
+    print(f"[FASTCHECK-2/3/4] Probing first {n_probe} transitions using IDW maps onto pred mesh.")
+
+    # aggregate summaries
+    agg_rel = None
+    agg_ratio = None
+    agg_cos = None
+    agg_wdev = []
+    agg_oob = []
+    agg_nan = []
+    agg_badlvl = []
+
+    for j in range(n_probe):
+        ex = examples[j]
+
+        centers_t   = _as_cpu_f32(ex.get("centers_t"))
+        centers_tp1 = _as_cpu_f32(ex.get("centers_tp1"))
+        gt_t        = _as_cpu_f32(ex.get("gt_t"))
+        gt_tp1      = _as_cpu_f32(ex.get("gt_tp1"))
+
+        pred_centers = _as_cpu_f32(ex.get("pred_centers"))
+        pred_levels  = _as_cpu_i64(ex.get("pred_levels"))
+        pred_tp1     = _as_cpu_f32(ex.get("pred_tp1"))
+
+        if any(v is None for v in [centers_t, centers_tp1, gt_t, gt_tp1, pred_centers, pred_tp1]):
+            print(f"[FASTCHECK] ex[{j}] missing required keys; skipping.")
+            continue
+
+        F = int(gt_t.shape[1])
+        names = feat_names if (feat_names and len(feat_names) == F) else [f"f{i}" for i in range(F)]
+
+        # (4a) mesh sanity
+        nan_ct = int(torch.isnan(pred_centers).any().item()) + int(torch.isnan(pred_tp1).any().item())
+        agg_nan.append(nan_ct)
+
+        oob = ((pred_centers[:, 0] < x0) | (pred_centers[:, 0] > x1) |
+               (pred_centers[:, 1] < y0) | (pred_centers[:, 1] > y1))
+        oob_frac = float(oob.float().mean().item())
+        agg_oob.append(oob_frac)
+
+        badlvl_frac = 0.0
+        if pred_levels is not None:
+            bad = (pred_levels < 0) | (pred_levels > 10)  # loose sanity bound
+            badlvl_frac = float(bad.float().mean().item())
+        agg_badlvl.append(badlvl_frac)
+
+        # Build maps: GT(t)->predmesh, GT(t+1)->predmesh
+        # NOTE: build_idw_map/apply_idw_map are already imported in your script (utils_geom).
+        idx_t, w_t = build_idw_map(
+            dst_xy=pred_centers,
+            src_xy=centers_t,
+            k=int(knn_k),
+            chunk=int(chunk),
+        )
+        idx_t = _as_cpu_i64(idx_t)
+        w_t = _as_cpu_f32(w_t)
+
+        idx_tp1, w_tp1 = build_idw_map(
+            dst_xy=pred_centers,
+            src_xy=centers_tp1,
+            k=int(knn_k),
+            chunk=int(chunk),
+        )
+        idx_tp1 = _as_cpu_i64(idx_tp1)
+        w_tp1 = _as_cpu_f32(w_tp1)
+
+        # (4b) IDW weight sum sanity
+        wsum_dev = float((w_t.sum(dim=1) - 1.0).abs().max().item())
+        agg_wdev.append(wsum_dev)
+
+        #gt_t_on_pred   = apply_idw_map(gt_t, idx_t, w_t)
+        #gt_tp1_on_pred = apply_idw_map(gt_tp1, idx_tp1, w_tp1)
+        gt_t_on_pred = apply_idw_map(idx_t, w_t, gt_t)
+        gt_tp1_on_pred = apply_idw_map(idx_tp1, w_tp1, gt_tp1)
+
+        # ----------------- (2) k=1 correctness on pred mesh -----------------
+        err = pred_tp1 - gt_tp1_on_pred
+        rel_l2 = err.pow(2).sum(dim=0).sqrt() / (gt_tp1_on_pred.pow(2).sum(dim=0).sqrt() + eps)
+        mae = err.abs().mean(dim=0)
+
+        # ranges (unit/normalization mismatch pops here immediately)
+        p_min, p_max = pred_tp1.amin(dim=0), pred_tp1.amax(dim=0)
+        g_min, g_max = gt_tp1_on_pred.amin(dim=0), gt_tp1_on_pred.amax(dim=0)
+
+        # ----------------- (3) update magnitude / rate-vs-delta smell test -----------------
+        d_pred = pred_tp1 - gt_t_on_pred
+        d_gt   = gt_tp1_on_pred - gt_t_on_pred
+
+        rms_pred = d_pred.pow(2).mean(dim=0).sqrt()
+        rms_gt   = d_gt.pow(2).mean(dim=0).sqrt()
+        ratio    = rms_pred / (rms_gt + eps)
+
+        # cosine similarity per feature (directional agreement)
+        cos = (d_pred * d_gt).mean(dim=0) / (rms_pred * rms_gt + eps)
+
+        # accumulate
+        agg_rel = rel_l2 if agg_rel is None else (agg_rel + rel_l2)
+        agg_ratio = ratio if agg_ratio is None else (agg_ratio + ratio)
+        agg_cos = cos if agg_cos is None else (agg_cos + cos)
+
+        print("\n" + "-" * 70)
+        print(f"[FASTCHECK ex[{j}]] pred vs GT(t+1) on pred mesh:")
+        print("  relL2: " + _fmt_vec(names, rel_l2, "{:.3e}"))
+        print("  MAE  : " + _fmt_vec(names, mae, "{:.3e}"))
+
+        print(f"[FASTCHECK ex[{j}]] value ranges on pred mesh (watch for normalization/unit mismatch):")
+        print("  pred(t+1) min/max: " + _fmt_vec(names, p_min, "{:.3e}") + "  |  " + _fmt_vec(names, p_max, "{:.3e}"))
+        print("  GT(t+1)  min/max: " + _fmt_vec(names, g_min, "{:.3e}") + "  |  " + _fmt_vec(names, g_max, "{:.3e}"))
+
+        print(f"[FASTCHECK ex[{j}]] Δ magnitude check (Δ_pred vs Δ_GT on pred mesh):")
+        print("  RMS ratio (pred/GT): " + _fmt_vec(names, ratio, "{:.3e}"))
+        print("  cosine similarity  : " + _fmt_vec(names, cos, "{:.3e}"))
+
+        print(f"[FASTCHECK ex[{j}]] mapping/mesh sanity:")
+        print(f"  IDW max |sum(w)-1| = {wsum_dev:.3e}")
+        print(f"  pred_centers OOB frac = {oob_frac:.3%}, NaN flag = {bool(nan_ct)}, badlevel frac = {badlvl_frac:.3%}")
+
+    # finalize aggregates
+    if agg_rel is not None:
+        agg_rel = agg_rel / float(n_probe)
+        agg_ratio = agg_ratio / float(n_probe)
+        agg_cos = agg_cos / float(n_probe)
+
+        F = int(agg_rel.numel())
+        names = feat_names if (feat_names and len(feat_names) == F) else [f"f{i}" for i in range(F)]
+
+        print("\n" + "=" * 90)
+        print("[FASTCHECK SUMMARY] Averages over probed transitions:")
+        print("  mean relL2(pred vs GT(t+1) on pred mesh): " + _fmt_vec(names, agg_rel, "{:.3e}"))
+        print("  mean RMS ratio (Δ_pred/Δ_GT):            " + _fmt_vec(names, agg_ratio, "{:.3e}"))
+        print("  mean cosine(Δ_pred, Δ_GT):              " + _fmt_vec(names, agg_cos, "{:.3e}"))
+        print(f"  IDW max |sum(w)-1| (max over probes):   {max(agg_wdev) if agg_wdev else float('nan'):.3e}")
+        print(f"  pred_centers OOB frac (max over probes): {max(agg_oob) if agg_oob else float('nan'):.3%}")
+        print(f"  any NaN flags (sum over probes):        {sum(agg_nan) if agg_nan else 0}")
+        print(f"  badlevel frac (max over probes):        {max(agg_badlvl) if agg_badlvl else float('nan'):.3%}")
+
+        # quick interpretation hints
+        print("\n[FASTCHECK INTERPRETATION HINTS]")
+        print("  - If relL2 is huge at k=1 AND pred ranges look 'normalized' (~O(1)) while GT ranges are physical: scaling mismatch.")
+        print("  - If RMS ratio (Δ_pred/Δ_GT) is consistently ~dt or ~1/dt-ish across features: rate-vs-delta misuse.")
+        print("  - If cosine is ~-1: sign flip bug (e.g., dt sign, swapped t/t+1, or wrong delta direction).")
+        print("  - If IDW |sum(w)-1| is large or OOB is non-trivial: mapping/mesh bug contaminating comparisons.")
+        print("=" * 90 + "\n")
+
 # ----------------- Main rollout script ----------------- #
 
 def main():
@@ -1253,6 +1489,12 @@ def main():
     ap.add_argument("--raster-bins", type=int, default=256, help="IDW grid bins (only for raster-mode=idw).")
     ap.add_argument("--raster-k", type=int, default=8, help="IDW kNN k (only for raster-mode=idw).")
     ap.add_argument("--raster-chunk", type=int, default=32768, help="IDW chunk (only for raster-mode=idw).")
+
+    ap.add_argument("--debug-fast-checks", action="store_true",
+                    help="Run fast drift diagnostics (prints k-growth, k=1 mesh-mapped errors, Δ magnitude, mapping sanity).")
+    ap.add_argument("--debug-fast-checks-n", type=int, default=5,
+                    help="How many transitions to probe for the fast drift checks (default: 5).")
+
 
     args = ap.parse_args()
 
@@ -1557,6 +1799,19 @@ def main():
             ex["bbox"] = (float(xmin), float(xmax), float(ymin), float(ymax))
 
     feat_names = cfg.get("features", {}).get("names", None)
+
+    if args.debug_fast_checks:
+        bbox = examples[0]["bbox"] if len(examples) else tuple(_get_bbox(cfg))
+
+        run_fast_drift_checks(
+            test_stats,
+            examples,
+            feat_names=feat_names,
+            bbox=bbox,
+            knn_k=int(args.raster_k),
+            chunk=int(args.raster_chunk),
+            n_probe=int(args.debug_fast_checks_n),
+        )
 
     # ----- Make GIFs (RASTER) -----
     log("[INFO] Making rollout GIFs (raster) with fixed clims..." if args.unify_clims else "[INFO] Making rollout GIFs (raster)...")

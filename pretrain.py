@@ -2804,7 +2804,9 @@ def precompute_pred_mesh_and_interps_for_rollout(
     os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
 
     # ----------------- optional reuse -----------------
-    if (not force_recompute) and _h5_is_usable(cache_path, cfg, expected_T=T):
+    #if (not force_recompute) and _h5_is_usable(cache_path, cfg, expected_T=T):
+    if (not force_recompute) and precomp_h5_is_usable(cache_path, cfg, expected_steps=T, H=H, W=W,
+                                                  require_dec=True, require_pred2pred=True, verbose=True):
         print(f"[PRECOMP] Using existing H5 cache: {cache_path}")
 
         if cfg.get("debug", {}).get("print_dec_checks", False):
@@ -3231,7 +3233,9 @@ class CollateWithPrecompute:
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         # identity (batch_size=1) + enrich with precomputed lists for the window
-        ex = batch[0]
+        #ex = batch[0]
+        ex0 = batch[0]
+        ex = dict(ex0)
         idxs = ex["t_indices"].tolist()  # absolute time indices in the window
         K = len(idxs)
 
@@ -3240,7 +3244,8 @@ class CollateWithPrecompute:
         dt_list = []
         for j in range(K - 1):
             t_src = idxs[j]
-            dt_list.append(self.dt_transitions[t_src])  # scalar tensor on CPU
+            #dt_list.append(self.dt_transitions[t_src])  # scalar tensor on CPU
+            dt_list.append(float(self.dt_transitions[t_src].item()))
 
         ex["dt_list"] = dt_list
         if self.dt_ref is not None:
