@@ -743,7 +743,7 @@ def compute_velocity_from_state(x_abs: torch.Tensor, cfg: dict, eps: float = 1e-
 
     # floors / clips (tune as needed)
     rho_floor = float(loss.get("rho_floor", 1e-6))
-    u_clip    = float(loss.get("u_clip", 1e3))   # start generous; your normal |u| is ~O(10-40)
+    u_clip    = float(loss.get("u_clip", 1e3))   # start generous; normal |u| is ~O(10-40)
 
     Fdim = x_abs.size(1)
     idx = infer_feature_indices(cfg, Fdim)

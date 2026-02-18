@@ -25,7 +25,7 @@
   "train": {
     "precomp_cache_path": "./cache/all/shock_ramp_precomp_pLow85_pHigh95_faceAdj_DEC.h5",
     "precomp_force_recompute": false,
-    "epochs": 25,
+    "epochs": 10,
     "batch_size": 1,
     "lr": 0.0001,
     "weight_decay": 0.0,
@@ -94,6 +94,17 @@
     "dec": true,
     "parc": true,
     "parc_detach_inputs": true,
+    "physics_backend": "mls",
+    "_comment_physics_backend": "dec (default) or mls (moving least squares)",
+
+    "mls_ops_device": "cpu",
+    "mls_use_2hop_extension": false,
+    "mls_use_neighbor_damping": true,
+    "mls_damping_alpha": 0.5,
+    "mls_poly_order": 2,
+    "mls_min_neighbors": 6,
+    "mls_cache_by_geometry": false,
+    "mls_scale_by_dt": false,
     
     "parc_include_diff": true,
     "diff_channels": ["density", "energy"],

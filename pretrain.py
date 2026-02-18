@@ -2805,8 +2805,19 @@ def precompute_pred_mesh_and_interps_for_rollout(
 
     # ----------------- optional reuse -----------------
     #if (not force_recompute) and _h5_is_usable(cache_path, cfg, expected_T=T):
-    if (not force_recompute) and precomp_h5_is_usable(cache_path, cfg, expected_steps=T, H=H, W=W,
-                                                  require_dec=True, require_pred2pred=True, verbose=True):
+    #if (not force_recompute) and precomp_h5_is_usable(cache_path, cfg, expected_steps=T, H=H, W=W,
+    #                                              require_dec=True, require_pred2pred=True, verbose=True):
+    loss_cfg = cfg.get("loss", {}) or {}
+    want_mls = (str(loss_cfg.get("physics_backend", "")).lower() == "mls")
+
+    if (not force_recompute) and precomp_h5_is_usable(
+            cache_path, cfg,
+            expected_steps=T, H=H, W=W,
+            require_dec=True,
+            require_pred2pred=True,
+            require_mls=want_mls,     # <--- ADD
+            verbose=True
+        ):
         print(f"[PRECOMP] Using existing H5 cache: {cache_path}")
 
         if cfg.get("debug", {}).get("print_dec_checks", False):
@@ -2818,7 +2829,11 @@ def precompute_pred_mesh_and_interps_for_rollout(
                 print("Datasets:", list(g.keys()))
 
                 # common expected names
-                for k in ["pred_edge_attr", "pred_ea", "pred_edge_attr_layout", "pred_cell_area", "pred_cell_wh"]:
+                #for k in ["pred_edge_attr", "pred_ea", "pred_edge_attr_layout", "pred_cell_area", "pred_cell_wh"]:
+                for k in [
+                    "pred_edge_attr", "pred_ea", "pred_edge_attr_layout", "pred_cell_area", "pred_cell_wh",
+                    "mls_grad_M_inv", "mls_grad_dX", "mls_lap_w", "mls_edge_index",  # <--- ADD
+                ]:
                     if k in g:
                         print(k, "shape=", g[k].shape, "dtype=", g[k].dtype)
                     else:
@@ -3225,11 +3240,18 @@ def precompute_pred_mesh_and_interps_for_rollout(
 
 
 class CollateWithPrecompute:
-    def __init__(self, precomp: Dict[str, List], *, dt_transitions: torch.Tensor, dt_ref: torch.Tensor | float | None = None):
-        self.precomp = precomp
-        self.dt_transitions = dt_transitions  # length T-1, CPU tensor is fine
-        self.dt_ref = dt_ref
+    #def __init__(self, precomp: Dict[str, List], *, dt_transitions: torch.Tensor, dt_ref: torch.Tensor | float | None = None):
+    #    self.precomp = precomp
+    #    self.dt_transitions = dt_transitions  # length T-1, CPU tensor is fine
+    #    self.dt_ref = dt_ref
 
+    def __init__(self, precomp, *, dt_transitions, dt_ref=None):
+        self.precomp = precomp
+        if torch.is_tensor(dt_transitions):
+            self.dt_transitions = dt_transitions.detach().cpu()
+        else:
+            self.dt_transitions = torch.as_tensor(dt_transitions, dtype=torch.float32, device="cpu")
+        self.dt_ref = dt_ref
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         # identity (batch_size=1) + enrich with precomputed lists for the window
@@ -3245,7 +3267,10 @@ class CollateWithPrecompute:
         for j in range(K - 1):
             t_src = idxs[j]
             #dt_list.append(self.dt_transitions[t_src])  # scalar tensor on CPU
-            dt_list.append(float(self.dt_transitions[t_src].item()))
+            #dt_list.append(float(self.dt_transitions[t_src].item()))
+            v = self.dt_transitions[t_src]
+            dt_list.append(float(v.item()) if torch.is_tensor(v) else float(v))
+
 
         ex["dt_list"] = dt_list
         if self.dt_ref is not None:
@@ -3316,6 +3341,19 @@ class CollateWithPrecompute:
             #         print(f"  step {j}: idx=None or w=None")
             #     else:
 #                 print(f"  step {j}: idx shape={idx_j.shape}, w shape={w_j.shape}")
+        '''
+        # ----- MLS precomputed pieces (optional) -----
+        # Works for both dict-of-lists and LazyPrecompH5/_LazyPrecompSeq
+        for k in list(self.precomp.keys()):
+            if not str(k).startswith("mls_"):
+                continue
+            seq = self.precomp[k]  # list/tuple OR _LazyPrecompSeq
+            try:
+                ex[f"{k}_list"] = [seq[i] for i in idxs]
+            except Exception:
+                # if a key exists but isn't time-indexable, ignore it
+                pass
+        '''
 
         return ex
 

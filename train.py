@@ -26,10 +26,12 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, Subset
 from torch import optim
 from torch.amp import autocast
+from torch_geometric.data import Data
 from contextlib import nullcontext, contextmanager
 import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
+from types import SimpleNamespace
 
 from dataset import CellRefineTemporalDataset, CellRefineWindowDataset, \
                     preprocess_timesteps_once
@@ -50,6 +52,8 @@ from utils.precomp_h5 import LazyPrecompH5
 from utils.uniform_mesh_engine import UniformMeshEngine
 import utils.dec_ops as dec
 from utils.fast_next_diag import maybe_run_fast_next_diag
+#from utils.mls import SolveGradientsLST, SolveWeightLST2d, apply_laplacian
+import utils.mls as mls
 
 
 
@@ -249,6 +253,292 @@ def _maybe_denorm(x: torch.Tensor, mu, sigma):
 
     return x * sigma_t + mu_t
 
+'''
+# IMPORTANT for dynamic AMR: disable caching-by-geometry (otherwise memory grows forever)
+_MLS_GRAD = mls.SolveGradientsLST(
+    cache_by_geometry=False,
+    use_2hop_extension=True,
+    use_neighbor_damping=True,
+    damping_alpha=0.5,
+)
+
+_MLS_LAPW = mls.SolveWeightLST2d(
+    polynomial_order=2,
+    cache_by_geometry=False,
+    use_2hop_extension=True,
+    use_neighbor_damping=True,
+    damping_alpha=0.5,
+)
+
+_MLS_ADV  = mls.AdvectionMLS(_MLS_GRAD)
+_MLS_DIFF = mls.DiffusionMLS(_MLS_LAPW)
+
+@torch.no_grad()
+def mls_advdiff_terms_abs(
+    *,
+    x_abs: torch.Tensor,          # (N,F) absolute state on current pred mesh
+    pos: torch.Tensor,            # (N,2) centers
+    edge_index: torch.Tensor,     # (2,E)
+    levels: torch.Tensor,         # (N,)
+    dx0: float,
+    dy0: float,
+    cfg: dict,
+    compute_adv: bool,
+    compute_diff: bool,
+):
+    loss_cfg = cfg.get("loss", {}) or {}
+    rho_floor = float(loss_cfg.get("rho_floor", 1e-6))
+    u_clip    = float(loss_cfg.get("u_clip", 1000.0))
+    nu        = float(loss_cfg.get("nu", 0.0))
+
+    # run MLS ops on CPU if requested (helps GPU memory)
+    ops_dev = torch.device(loss_cfg.get("mls_ops_device", "cpu"))
+
+    x_ops  = x_abs.to(device=ops_dev, dtype=torch.float32)
+    pos_ops = pos.to(device=ops_dev, dtype=torch.float32)
+    ei_ops  = edge_index.to(device=ops_dev, dtype=torch.long)
+
+    data = Data(pos=pos_ops, edge_index=ei_ops)
+
+    # velocity from conservative state (assumes [rho,mx,my,E] layout)
+    idx = dec.infer_feature_indices(cfg, x_ops.size(1))
+    rho = x_ops[:, idx["rho"]].abs().clamp_min(rho_floor)
+    mx  = x_ops[:, idx["mx"]]
+    my  = x_ops[:, idx["my"]]
+    vel = torch.stack([mx / rho, my / rho], dim=1).clamp(-u_clip, u_clip)  # (N,2)
+
+    r_adv = None
+    if compute_adv:
+        r_adv = _MLS_ADV(x_ops, vel, data)  # (N,F)
+
+    r_diff = None
+    if compute_diff:
+        r_diff = _MLS_DIFF(x_ops, data)     # (N,F)
+        if nu != 0.0:
+            r_diff = nu * r_diff
+
+    # area for compatibility with your residual loss codepath
+    area = dec.cell_area_from_levels(
+        levels.long().to(device=x_abs.device),
+        dx0=float(dx0),
+        dy0=float(dy0),
+        dtype=torch.float32,
+        device=x_abs.device,
+    )
+
+    # move outputs back to the training device
+    if r_adv is not None:
+        r_adv = r_adv.to(device=x_abs.device, dtype=torch.float32)
+    if r_diff is not None:
+        r_diff = r_diff.to(device=x_abs.device, dtype=torch.float32)
+
+    return r_adv, r_diff, area
+
+
+def mls_terms_from_precomp(
+    *,
+    x_abs: torch.Tensor,            # (N,F)
+    edge_index: torch.Tensor,       # (2,E)
+    grad_M_inv: torch.Tensor,       # (N,2,2)
+    grad_dX: torch.Tensor,          # (E,2)
+    lap_w: torch.Tensor | None,     # (E,) or None
+    cfg: dict,
+    compute_adv: bool,
+    compute_diff: bool,
+):
+    """
+    MPS-safe MLS advection/diffusion terms using precomputed geometry.
+
+    Key changes vs your version:
+      - Avoid 3D in-place index_add_ on MPS by flattening (E,2,F)->(E,2F) and using out-of-place index_add.
+      - Also avoid in-place index_add_ for diffusion on MPS (optional but recommended).
+      - Ensure row/col and grad_dX/lap_w live on the same device as x_abs.
+    """
+    loss_cfg = cfg.get("loss", {}) or {}
+    rho_floor = float(loss_cfg.get("rho_floor", 1e-6))
+    u_clip    = float(loss_cfg.get("u_clip", 1000.0))
+
+    dev = x_abs.device
+    dtype = x_abs.dtype
+
+    # velocity from conservative state (assumes [rho,mx,my,E] layout)
+    idx = dec.infer_feature_indices(cfg, x_abs.size(1))
+    rho = x_abs[:, idx["rho"]].abs().clamp_min(rho_floor)
+    mx  = x_abs[:, idx["mx"]]
+    my  = x_abs[:, idx["my"]]
+    vel = torch.stack([mx / rho, my / rho], dim=1).clamp(-u_clip, u_clip)  # (N,2)
+
+    # edge indices on-device
+    edge_index = edge_index.to(dev, dtype=torch.long)
+    row, col = edge_index[0], edge_index[1]
+
+    N = int(x_abs.size(0))
+    F = int(x_abs.size(1))
+
+    r_adv = None
+    if compute_adv:
+        # Bring geometry to device/dtype
+        dX = grad_dX.to(dev, dtype=torch.float32)  # keep dX as float32 for stability
+        M_inv = grad_M_inv.to(dev, dtype=torch.float32)
+
+        # du uses model dtype; compute in float32 to match geometry + avoid MPS dtype oddities
+        du = (x_abs[col] - x_abs[row]).to(torch.float32)                    # (E,F)
+        V_edge = dX.unsqueeze(2) * du.unsqueeze(1)                          # (E,2,F) float32
+
+        if dev.type == "mps":
+            # MPS workaround: flatten and out-of-place index_add
+            V_edge2 = V_edge.reshape(V_edge.size(0), -1).contiguous()       # (E,2F)
+            V_node2 = torch.zeros((N, V_edge2.size(1)), device=dev, dtype=V_edge2.dtype)
+            V_node2 = V_node2.index_add(0, row, V_edge2)                    # (N,2F)
+            V_node = V_node2.view(N, 2, F)                                  # (N,2,F)
+        else:
+            V_node = torch.zeros((N, 2, F), device=dev, dtype=V_edge.dtype)
+            V_node.index_add_(0, row, V_edge)
+
+        grads = torch.einsum("nij,njf->nif", M_inv, V_node)                 # (N,2,F) float32
+        r_adv_f32 = vel[:, 0:1].to(torch.float32) * grads[:, 0, :] + vel[:, 1:2].to(torch.float32) * grads[:, 1, :]
+        r_adv = r_adv_f32.to(dtype)                                         # back to model dtype
+
+    r_diff = None
+    if compute_diff and (lap_w is not None):
+        w = lap_w.to(dev, dtype=torch.float32)                              # (E,)
+        du = (x_abs[col] - x_abs[row]).to(torch.float32)                    # (E,F)
+        contrib = w.unsqueeze(1) * du                                       # (E,F) float32
+
+        if dev.type == "mps":
+            # MPS: prefer out-of-place index_add
+            r_diff_f32 = torch.zeros((N, F), device=dev, dtype=contrib.dtype).index_add(0, row, contrib)
+        else:
+            r_diff_f32 = torch.zeros((N, F), device=dev, dtype=contrib.dtype)
+            r_diff_f32.index_add_(0, row, contrib)
+
+        nu = float(loss_cfg.get("nu", 0.0))
+        if nu != 0.0:
+            r_diff_f32 = nu * r_diff_f32
+
+        r_diff = r_diff_f32.to(dtype)
+
+    return r_adv, r_diff
+'''
+_MLS_STATE = {
+    "sig": None,
+    "grad": None,
+    "lapw": None,
+    "adv": None,
+    "diff": None,
+}
+
+def _mls_sig_from_cfg(cfg: dict) -> tuple:
+    loss_cfg = cfg.get("loss", {}) or {}
+    # only include knobs that affect MLS solver behavior
+    return (
+        bool(loss_cfg.get("mls_cache_by_geometry", False)),
+        bool(loss_cfg.get("mls_use_2hop_extension", True)),
+        bool(loss_cfg.get("mls_use_neighbor_damping", True)),
+        float(loss_cfg.get("mls_damping_alpha", 0.5)),
+        int(loss_cfg.get("mls_poly_order", 2)),
+        int(loss_cfg.get("mls_min_neighbors", 6)),
+    )
+
+def _get_mls_ops(cfg: dict):
+    """
+    Lazily construct MLS solvers once (per process) using cfg knobs.
+    IMPORTANT for dynamic AMR: default cache_by_geometry=False.
+    """
+    sig = _mls_sig_from_cfg(cfg)
+    if _MLS_STATE["sig"] == sig and _MLS_STATE["adv"] is not None:
+        return _MLS_STATE["adv"], _MLS_STATE["diff"]
+
+    cache_by_geometry, use_2hop, use_damp, alpha, poly_order, min_nbrs = sig
+
+    grad = mls.SolveGradientsLST(
+        cache_by_geometry=cache_by_geometry,
+        use_2hop_extension=use_2hop,
+        use_neighbor_damping=use_damp,
+        damping_alpha=alpha,
+    )
+    lapw = mls.SolveWeightLST2d(
+        polynomial_order=poly_order,
+        min_neighbors=min_nbrs,
+        cache_by_geometry=cache_by_geometry,
+        use_2hop_extension=use_2hop,
+        use_neighbor_damping=use_damp,
+        damping_alpha=alpha,
+    )
+
+    adv  = mls.AdvectionMLS(grad)
+    diff = mls.DiffusionMLS(lapw)
+
+    _MLS_STATE.update({"sig": sig, "grad": grad, "lapw": lapw, "adv": adv, "diff": diff})
+    return adv, diff
+
+
+@torch.no_grad()
+def mls_advdiff_terms_abs_faceadj(
+    *,
+    x_abs: torch.Tensor,          # (N,F) absolute state on current pred mesh
+    pos: torch.Tensor,            # (N,2) centers (same mesh as x_abs)
+    edge_index: torch.Tensor,     # (2,E) FACE-ADJ edges from your precomp H5
+    levels: torch.Tensor,         # (N,)
+    dx0: float,
+    dy0: float,
+    cfg: dict,
+    compute_adv: bool,
+    compute_diff: bool,
+):
+    """
+    Runs MLS advection/diffusion using the mls.py solvers, but on your face-adjacency edge_index.
+    Still supports 2-hop and neighbor damping via solver options.
+    """
+    loss_cfg = cfg.get("loss", {}) or {}
+    rho_floor = float(loss_cfg.get("rho_floor", 1e-6))
+    u_clip    = float(loss_cfg.get("u_clip", 1000.0))
+    nu        = float(loss_cfg.get("nu", 0.0))
+
+    # Choose where MLS runs (CPU recommended on MPS; avoids scatter/index_add headaches)
+    ops_dev = torch.device(loss_cfg.get("mls_ops_device", "cpu"))
+
+    x_ops   = x_abs.to(device=ops_dev, dtype=torch.float32)
+    pos_ops = pos.to(device=ops_dev, dtype=torch.float32)
+    ei_ops  = edge_index.to(device=ops_dev, dtype=torch.long)
+
+    data = Data(pos=pos_ops, edge_index=ei_ops)
+
+    # velocity from conservative state (assumes [rho,mx,my,E])
+    idx = dec.infer_feature_indices(cfg, x_ops.size(1))
+    rho = x_ops[:, idx["rho"]].abs().clamp_min(rho_floor)
+    mx  = x_ops[:, idx["mx"]]
+    my  = x_ops[:, idx["my"]]
+    vel = torch.stack([mx / rho, my / rho], dim=1).clamp(-u_clip, u_clip)  # (N,2)
+
+    mls_adv, mls_diff = _get_mls_ops(cfg)
+
+    r_adv = None
+    if compute_adv:
+        r_adv = mls_adv(x_ops, vel, data)  # (N,F) on ops_dev
+
+    r_diff = None
+    if compute_diff:
+        r_diff = mls_diff(x_ops, data)     # (N,F) on ops_dev
+        if nu != 0.0:
+            r_diff = nu * r_diff
+
+    # area (keep compatibility with your residual-loss codepath)
+    area = dec.cell_area_from_levels(
+        levels.long().to(device=x_abs.device),
+        dx0=float(dx0),
+        dy0=float(dy0),
+        dtype=torch.float32,
+        device=x_abs.device,
+    )
+
+    # move outputs back to training device
+    if r_adv is not None:
+        r_adv = r_adv.to(device=x_abs.device, dtype=torch.float32)
+    if r_diff is not None:
+        r_diff = r_diff.to(device=x_abs.device, dtype=torch.float32)
+
+    return r_adv, r_diff, area
 
 # ------------------------- Small utilities -------------------------
 
@@ -548,8 +838,6 @@ def stepA_check_given_state_vs_gt(
               f"phy[min/max]={float(phy_c.min()):+.3e}/{float(phy_c.max()):+.3e}")
 
 
-import torch
-
 @torch.no_grad()
 def _print_chan_stats(name: str, x: torch.Tensor, idx: dict, max_q: bool = True):
     """
@@ -697,8 +985,6 @@ def abs_means_abs_check(
                       f"(mean~0 std~1 with nontrivial negatives). "
                       f"If true, DEC ops are being computed on normalized units, not physical units.")
 
-import math
-from typing import Optional, Sequence, Tuple
 
 def _as_feature_vec(x: torch.Tensor, F: int, device=None, dtype=None) -> torch.Tensor:
     """
@@ -906,6 +1192,24 @@ def set_seed(seed: int = 42):
     torch.manual_seed(seed)
     np.random.seed(seed)
 
+
+def _chan_name_to_index_map():
+    # accepts both your config names and your internal short names
+    return {
+        "density": 0, "rho": 0,
+        "x_momentum": 1, "mx": 1,
+        "y_momentum": 2, "my": 2,
+        "energy": 3, "E": 3,
+    }
+
+def _channels_to_indices(ch_list):
+    m = _chan_name_to_index_map()
+    out = []
+    for s in (ch_list or []):
+        if s not in m:
+            raise ValueError(f"Unknown channel name '{s}'. Expected one of: {sorted(m.keys())}")
+        out.append(m[s])
+    return out
 
 # Per‑edge Laplacian smoothness on cell‑graph predictions
 
@@ -1662,6 +1966,15 @@ def train_one_epoch_multi_step(
     # Determine whether we must compute physics operators this step
     need_phy = parc_use or (dec_use and (dec_blend_w != 0.0 or dec_resid_w != 0.0))
 
+    backend = str(loss_cfg.get("physics_backend", "dec")).lower()
+    use_mls = (backend in ("mls", "moving_least_squares", "moving-least-squares"))
+
+    # For MLS, use CPU ops to avoid GPU OOMs
+    mls_ops_device = torch.device(loss_cfg.get("mls_ops_device", "cpu"))
+    mls_scale_by_dt = bool(loss_cfg.get("mls_scale_by_dt", False))
+
+    IDX = {"rho": 0, "mx": 1, "my": 2, "E": 3}  # for velocity extraction inside MLS
+
     if scaler is None and use_amp and device.type == "cuda":
         from torch.cuda.amp import GradScaler
         scaler = GradScaler()
@@ -1720,6 +2033,13 @@ def train_one_epoch_multi_step(
         window_loss_graph = None
 
         opt.zero_grad(set_to_none=True)
+
+        # Only DEC needs edge_attr. MLS does not.
+        if need_phy and (not use_mls) and (pred_ea_list is None):
+            raise RuntimeError(
+                "DEC/PARC physics enabled but batch is missing pred_ea_list / pred_edge_attr_list. "
+                "Update loader + CollateWithPrecompute to attach edge_attr per step."
+            )
 
         # ------------------------------------------------------------------
         # Move per-step tensors to GPU right before each _run_step
@@ -1941,18 +2261,99 @@ def train_one_epoch_multi_step(
 
                         with torch.autocast(device_type=device.type, enabled=False):
                             with torch.no_grad():
-                                r_adv_abs, r_diff_abs, area = dec.dec_advdiff_terms_abs(
-                                    #x_abs=x_in_abs.float(),
-                                    x_abs=x_for_ops.float(),
-                                    edge_index=pei.long(),
-                                    pred_ea=pea.float(),
-                                    levels=pred_levels.long().to(device),
-                                    dx0=float(dx),
-                                    dy0=float(dy),
-                                    cfg=cfg,
-                                    compute_adv=need_adv,
-                                    compute_diff=need_diff,
-                                )
+                                def _pick_mls_at_k(batch, k, N, E=None):
+                                    """
+                                    Pick an index kk near k such that:
+                                    - grad_M_inv[kk].shape[0] == N
+                                    - and if E is provided, grad_dX[kk].shape[0] == E
+                                    Returns (kk, M_inv, dX, lap_w, ei_used)
+                                    """
+                                    M_list  = batch.get("mls_grad_M_inv_list", None)
+                                    dX_list = batch.get("mls_grad_dX_list", None)
+                                    w_list  = batch.get("mls_lap_weights_list", None) or batch.get("mls_lap_w_list", None)
+                                    ei_list = batch.get("mls_grad_ei_used_list", None)  # strongly preferred
+
+                                    if M_list is None or dX_list is None:
+                                        raise RuntimeError("Missing MLS lists in batch (mls_grad_M_inv_list / mls_grad_dX_list).")
+
+                                    for kk in (k, k + 1, k - 1):
+                                        if not (0 <= kk < len(M_list)):
+                                            continue
+                                        M = M_list[kk]
+                                        dX = dX_list[kk]
+                                        if M is None or dX is None:
+                                            continue
+                                        if int(M.shape[0]) != int(N):
+                                            continue
+
+                                        ei_used = None
+                                        if ei_list is not None and 0 <= kk < len(ei_list):
+                                            ei_used = ei_list[kk]
+                                            if ei_used is not None:
+                                                # ensure E consistency with dX if possible
+                                                if int(ei_used.shape[1]) != int(dX.shape[0]):
+                                                    continue
+
+                                        if E is not None and int(dX.shape[0]) != int(E):
+                                            # if caller supplied E, enforce it
+                                            continue
+
+                                        lap_w = None
+                                        if w_list is not None and 0 <= kk < len(w_list):
+                                            lap_w = w_list[kk]
+
+                                        return kk, M, dX, lap_w, ei_used
+
+                                    # If we got here, show the nearby sizes to make the indexing bug obvious
+                                    def _sz(x): 
+                                        return None if x is None else tuple(x.shape)
+                                    dbg = []
+                                    for kk in (k, k+1, k-1):
+                                        if 0 <= kk < len(M_list):
+                                            dbg.append((kk, _sz(M_list[kk]), _sz(dX_list[kk]), _sz(ei_list[kk]) if ei_list is not None else None))
+                                    raise RuntimeError(f"Could not align MLS geometry to x_abs(N={N}). Nearby shapes: {dbg}")
+
+                                '''
+                                if use_mls:
+                                    r_adv_abs, r_diff_abs, area = mls_advdiff_terms_abs(
+                                        x_abs=x_for_ops.float(),
+                                        pos=pred_centers,
+                                        edge_index=pei.long(),
+                                        levels=pred_levels,
+                                        dx0=float(dx),
+                                        dy0=float(dy),
+                                        cfg=cfg,
+                                        compute_adv=need_adv,
+                                        compute_diff=need_diff,
+                                    )
+                                '''
+                                if use_mls:
+                                    # FACE-ADJ edges (same ones used by DEC)
+                                    r_adv_abs, r_diff_abs, area = mls_advdiff_terms_abs_faceadj(
+                                        x_abs=x_for_ops.float(),          # your absolute state tensor on pred mesh
+                                        pos=pred_centers,                # (N,2) for that mesh
+                                        edge_index=pei.long(),           # (2,E) face-adj from precomp_rollout.h5
+                                        levels=pred_levels,              # (N,)
+                                        dx0=float(dx),
+                                        dy0=float(dy),
+                                        cfg=cfg,
+                                        compute_adv=need_adv,
+                                        compute_diff=need_diff,
+                                    )
+
+                                else:
+                                    r_adv_abs, r_diff_abs, area = dec.dec_advdiff_terms_abs(
+                                        #x_abs=x_in_abs.float(),
+                                        x_abs=x_for_ops.float(),
+                                        edge_index=pei.long(),
+                                        pred_ea=pea.float(),
+                                        levels=pred_levels.long().to(device),
+                                        dx0=float(dx),
+                                        dy0=float(dy),
+                                        cfg=cfg,
+                                        compute_adv=need_adv,
+                                        compute_diff=need_diff,
+                                    )
 
                                 # If not computed, dec_ops should return None; if it returns something else, normalize here:
                                 if (r_adv_abs is None) and need_adv:

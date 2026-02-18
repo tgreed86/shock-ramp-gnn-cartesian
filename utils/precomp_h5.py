@@ -119,7 +119,7 @@ class PrecompH5Writer:
         finally:
             self.f.close()
 
-
+'''
 class LazyPrecompH5(dict):
     """
     Dict-like drop-in replacement for the old dict-of-lists precomp.
@@ -315,7 +315,211 @@ class LazyPrecompH5(dict):
                 return self._to_torch(arr.astype(np.float32, copy=False), dtype=torch.float32, device=self.device)
 
         return None
+'''
 
+def _normalize_device(device):
+    if isinstance(device, torch.device):
+        return device
+    return torch.device(str(device))
+
+
+class LazyPrecompH5(dict):
+    """
+    H5-backed, dict-like precomp with time-indexable sequences.
+
+    Timestep groups are expected at /t00001..../t{T-1:05d}
+    MLS datasets are expected under /tXXXXX/mls/*
+    """
+    def __init__(self, path: str, T: int, H: int, W: int, device: str | torch.device = "cpu"):
+        super().__init__()
+        if h5py is None:
+            raise ImportError("LazyPrecompH5 requires h5py (pip install h5py).")
+
+        self.path = str(path)
+        self.T = int(T)
+        self.H = int(H)
+        self.W = int(W)
+        self.device = _normalize_device(device)
+
+        self._f = None
+        self._meta_cache = {}
+
+        # time-indexed keys
+        seq_keys = [
+            # base geometry + mappings
+            "pred_centers", "pred_levels", "pred_parents", "pred_ei", "mask_pred",
+            "feat_t_on_pred", "feat_tp1_on_pred",
+            "pred2pred_idx", "pred2pred_w",
+            # DEC
+            "pred_edge_attr", "pred_cell_wh", "pred_cell_area",
+            # MLS (mapped to subgroup datasets)
+            "mls_grad_M_inv", "mls_grad_dX", "mls_lap_w",
+            "mls_edge_index",              # convenience: edges used by MLS path
+            "mls_grad_node_damp", "mls_lap_node_damp",
+        ]
+        for k in seq_keys:
+            super().__setitem__(k, _LazyPrecompSeq(self, k))
+
+        # non-indexed metadata keys (optional)
+        super().__setitem__("pred_edge_attr_layout", _LazyPrecompScalar(self, "pred_edge_attr_layout"))
+
+    def _ensure_open(self):
+        if self._f is None:
+            self._f = h5py.File(self.path, "r")
+
+    def _group(self, t: int):
+        """
+        Returns group /t{t:05d} if exists, else None.
+        Note: your writer starts at t00001. So t==0 returns None.
+        """
+        if t is None:
+            return None
+        t = int(t)
+        if t <= 0:
+            return None
+        self._ensure_open()
+        gname = f"t{t:05d}"
+        if gname not in self._f:
+            return None
+        return self._f[gname]
+
+    def _to_tensor(self, arr, *, dtype=None, device=None):
+        t = torch.from_numpy(arr)
+        if dtype is not None:
+            t = t.to(dtype=dtype)
+        if device is None:
+            device = self.device
+        return t.to(device=device)
+
+    def _get(self, key: str, t: int):
+        g = self._group(t)
+        if g is None:
+            return None
+
+        # ---------- root datasets ----------
+        if key == "pred_centers":
+            if "pred_centers" not in g: return None
+            return self._to_tensor(g["pred_centers"][...].astype(np.float32, copy=False), dtype=torch.float32)
+
+        if key == "pred_levels":
+            if "pred_levels" not in g: return None
+            # store as int64 for downstream ops
+            return self._to_tensor(g["pred_levels"][...].astype(np.int64, copy=False), dtype=torch.int64)
+
+        if key == "pred_parents":
+            if "pred_parents" not in g: return None
+            return self._to_tensor(g["pred_parents"][...].astype(np.int64, copy=False), dtype=torch.int64)
+
+        if key == "pred_ei":
+            if "pred_ei" not in g: return None
+            return self._to_tensor(g["pred_ei"][...].astype(np.int64, copy=False), dtype=torch.int64)
+
+        if key == "mask_pred":
+            # your writer uses mask_pred_parent_flat_u8
+            if "mask_pred_parent_flat_u8" not in g: return None
+            m = g["mask_pred_parent_flat_u8"][...].astype(np.uint8, copy=False)
+            m = (m != 0)
+            return self._to_tensor(m.astype(np.bool_, copy=False), dtype=torch.bool)
+
+        if key == "feat_t_on_pred":
+            if "feat_t_on_pred" not in g: return None
+            return self._to_tensor(g["feat_t_on_pred"][...].astype(np.float32, copy=False), dtype=torch.float32)
+
+        if key == "feat_tp1_on_pred":
+            if "feat_tp1_on_pred" not in g: return None
+            return self._to_tensor(g["feat_tp1_on_pred"][...].astype(np.float32, copy=False), dtype=torch.float32)
+
+        if key == "pred2pred_idx":
+            if "pred2pred_idx_to_next" not in g: return None
+            return self._to_tensor(g["pred2pred_idx_to_next"][...].astype(np.int64, copy=False), dtype=torch.int64)
+
+        if key == "pred2pred_w":
+            if "pred2pred_w_to_next" not in g: return None
+            # stored float16; keep float16 unless you prefer float32
+            return self._to_tensor(g["pred2pred_w_to_next"][...].astype(np.float16, copy=False), dtype=torch.float16)
+
+        # ---------- DEC ----------
+        if key == "pred_edge_attr":
+            if "pred_edge_attr" not in g: return None
+            return self._to_tensor(g["pred_edge_attr"][...].astype(np.float32, copy=False), dtype=torch.float32)
+
+        if key == "pred_cell_wh":
+            if "pred_cell_wh" not in g: return None
+            return self._to_tensor(g["pred_cell_wh"][...].astype(np.float32, copy=False), dtype=torch.float32)
+
+        if key == "pred_cell_area":
+            if "pred_cell_area" not in g: return None
+            return self._to_tensor(g["pred_cell_area"][...].astype(np.float32, copy=False), dtype=torch.float32)
+
+        # ---------- MLS subgroup ----------
+        mg = g.get("mls", None)
+
+        if key == "mls_grad_M_inv":
+            if mg is None or "grad_M_inv" not in mg: return None
+            return self._to_tensor(mg["grad_M_inv"][...].astype(np.float32, copy=False), dtype=torch.float32)
+
+        if key == "mls_grad_dX":
+            if mg is None or "grad_dX" not in mg: return None
+            return self._to_tensor(mg["grad_dX"][...].astype(np.float32, copy=False), dtype=torch.float32)
+
+        if key == "mls_lap_w":
+            # your writer calls this "lap_weights"
+            if mg is None or "lap_weights" not in mg: return None
+            # could be float16 or float32 in file; upcast to float32 for math
+            w = mg["lap_weights"][...]
+            if w.dtype == np.float16:
+                w = w.astype(np.float32, copy=False)
+            else:
+                w = w.astype(np.float32, copy=False)
+            return self._to_tensor(w, dtype=torch.float32)
+
+        if key == "mls_grad_node_damp":
+            if mg is None or "grad_node_damp" not in mg: return None
+            return self._to_tensor(mg["grad_node_damp"][...].astype(np.float32, copy=False), dtype=torch.float32)
+
+        if key == "mls_lap_node_damp":
+            if mg is None or "lap_node_damp" not in mg: return None
+            return self._to_tensor(mg["lap_node_damp"][...].astype(np.float32, copy=False), dtype=torch.float32)
+
+        if key == "mls_edge_index":
+            # Prefer grad_ei_used (2-hop augmented), else lap_ei_base, else pred_ei
+            if mg is not None:
+                if "grad_ei_used" in mg:
+                    return self._to_tensor(mg["grad_ei_used"][...].astype(np.int64, copy=False), dtype=torch.int64)
+                if "lap_ei_base" in mg:
+                    return self._to_tensor(mg["lap_ei_base"][...].astype(np.int64, copy=False), dtype=torch.int64)
+            # fallback to face-adj pred_ei (still valid)
+            if "pred_ei" in g:
+                return self._to_tensor(g["pred_ei"][...].astype(np.int64, copy=False), dtype=torch.int64)
+            return None
+
+        return None
+
+    def _get_scalar(self, key: str):
+        self._ensure_open()
+        meta = self._f.get("meta", None)
+        if meta is None:
+            return None
+        if key in self._meta_cache:
+            return self._meta_cache[key]
+
+        # attr example for pred_edge_attr_layout stored as bytes
+        v = meta.attrs.get(key, None)
+        if isinstance(v, (bytes, np.bytes_)):
+            v = v.decode("utf-8")
+        self._meta_cache[key] = v
+        return v
+
+    def close(self):
+        if self._f is not None:
+            try:
+                self._f.close()
+            except Exception:
+                pass
+            self._f = None
+
+    def __del__(self):
+        self.close()
 
 class _LazyPrecompSeq:
     """Sequence-like wrapper: seq[t] calls LazyPrecompH5._get(key,t)."""
@@ -360,6 +564,7 @@ def precomp_h5_is_usable(
     W: int,
     require_dec: bool = False,
     require_pred2pred: bool = False,
+    require_mls: bool = False,
     verbose: bool = False,
 ) -> bool:
     import os, h5py, numpy as np, json, hashlib
@@ -371,6 +576,15 @@ def precomp_h5_is_usable(
     if not os.path.exists(path):
         _v("reject: file does not exist")
         return False
+    
+    # MLS schema options (adjust if your writer used different names)
+    MLS_REQUIRED_SCHEMAS = [
+        # Schema A: explicit per-node/per-edge arrays
+        ("mls_grad_M_inv", "mls_grad_dX", "mls_lap_w"),
+        # Schema B: gradient only (if you sometimes precompute only grad pieces)
+        # Uncomment if you want this to be accepted when require_mls=True.
+        # ("mls_grad_M_inv", "mls_grad_dX"),
+    ]
 
     try:
         with h5py.File(path, "r") as f:
@@ -432,6 +646,45 @@ def precomp_h5_is_usable(
                         if ds not in g:
                             _v(f"reject: group {gname} missing DEC dataset '{ds}'")
                             return False
+                '''
+                if require_mls:
+                    # accept if ANY one of the schemas is satisfied
+                    ok = False
+                    for schema in MLS_REQUIRED_SCHEMAS:
+                        if all((name in g) for name in schema):
+                            ok = True
+                            break
+                    if not ok:
+                        # helpful message: show which MLS keys are present
+                        present = [k for k in g.keys() if str(k).startswith("mls_")]
+                        _v(
+                            f"reject: group {gname} missing required MLS datasets. "
+                            f"Present mls_* keys: {present}"
+                        )
+                        return False
+                '''
+                '''
+                if require_mls:
+                    if "mls" not in g:
+                        _v(f"reject: group {gname} missing 'mls' subgroup")
+                        return False
+
+                    mg = g["mls"]
+
+                    # What your writer actually produces:
+                    #   grad: grad_M_inv, grad_dX (and grad_ei_used optional)
+                    #   lap : lap_weights (lap_ei_base optional but usually present)
+                    need = ["grad_M_inv", "grad_dX", "lap_weights"]
+
+                    missing = [k for k in need if k not in mg]
+                    if missing:
+                        present = list(mg.keys())
+                        _v(
+                            f"reject: group {gname} missing MLS datasets in /mls: {missing}. "
+                            f"Present /mls keys: {present}"
+                        )
+                        return False
+                '''
 
             if require_pred2pred:
                 for t in range(1, stored_T - 1):
