@@ -119,7 +119,7 @@ class PrecompH5Writer:
         finally:
             self.f.close()
 
-'''
+
 class LazyPrecompH5(dict):
     """
     Dict-like drop-in replacement for the old dict-of-lists precomp.
@@ -520,6 +520,7 @@ class LazyPrecompH5(dict):
 
     def __del__(self):
         self.close()
+'''
 
 class _LazyPrecompSeq:
     """Sequence-like wrapper: seq[t] calls LazyPrecompH5._get(key,t)."""

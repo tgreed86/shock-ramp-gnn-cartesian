@@ -3258,6 +3258,9 @@ def evaluate_one_epoch_multi_step(
 
     need_phy = parc_use or (dec_use and (dec_blend_w != 0.0 or dec_resid_w != 0.0))
 
+    backend = str(loss_cfg.get("physics_backend", "dec")).lower()
+    use_mls = (backend in ("mls", "moving_least_squares", "moving-least-squares"))
+
     amp_ctx = (torch.cuda.amp.autocast if use_amp and device.type == "cuda"
                else (lambda **kw: torch.autocast("cpu", enabled=False)))
 
@@ -3517,17 +3520,31 @@ def evaluate_one_epoch_multi_step(
                             x_for_ops = sanitize_state_for_ops(x_in_abs, cfg, rho_floor=1e-6, E_floor=1e-6)
                             #x_for_ops = x_in_abs
 
-                            r_adv_abs, r_diff_abs, area = dec.dec_advdiff_terms_abs(
-                                x_abs=x_for_ops.float(),
-                                edge_index=pei.long(),
-                                pred_ea=pea.float(),
-                                levels=pred_levels.long().to(device),
-                                dx0=float(dx),
-                                dy0=float(dy),
-                                cfg=cfg,
-                                compute_adv=need_adv,
-                                compute_diff=need_diff,
-                            )
+                            if use_mls:
+                                # MLS physics terms computed on the SAME face-adj edges as DEC uses
+                                r_adv_abs, r_diff_abs, area = mls_advdiff_terms_abs_faceadj(
+                                    x_abs=x_for_ops.float(),
+                                    pos=pred_centers.to(device=device, dtype=torch.float32),  # (N,2)
+                                    edge_index=pei.long(),                                   # (2,E) face-adj
+                                    levels=pred_levels.to(device=device),                    # (N,)
+                                    dx0=float(dx),
+                                    dy0=float(dy),
+                                    cfg=cfg,
+                                    compute_adv=need_adv,
+                                    compute_diff=need_diff,
+                                )
+                            else:
+                                r_adv_abs, r_diff_abs, area = dec.dec_advdiff_terms_abs(
+                                    x_abs=x_for_ops.float(),
+                                    edge_index=pei.long(),
+                                    pred_ea=pea.float(),
+                                    levels=pred_levels.long().to(device),
+                                    dx0=float(dx),
+                                    dy0=float(dy),
+                                    cfg=cfg,
+                                    compute_adv=need_adv,
+                                    compute_diff=need_diff,
+                                )
 
                             # Belt-and-suspenders: ensure adv absent for k>0
                             if not adv_step_gate:
