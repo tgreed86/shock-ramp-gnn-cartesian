@@ -1567,13 +1567,13 @@ def _forward_main_head_with_edge_attr(model, x_in, edge_index, edge_attr=None, *
     # --- choose autocast-off context safely ---
     if force_fp32:
         if x_in.is_cuda:
-            autocast_off = torch.cuda.amp.autocast(enabled=False)
+            autocast_off = torch.amp.autocast(device_type="cuda", enabled=False)
         else:
             # torch.autocast exists on newer torch; fall back to nullcontext if unavailable
             autocast_off = getattr(torch, "autocast", None)
-            autocast_off = autocast_off(device_type=x_in.device.type, enabled=False) if autocast_off else contextlib.nullcontext()
+            autocast_off = autocast_off(device_type=x_in.device.type, enabled=False) if autocast_off else nullcontext()
     else:
-        autocast_off = contextlib.nullcontext()
+        autocast_off = nullcontext()
 
     # --- run forward ---
     with autocast_off:
@@ -1979,8 +1979,9 @@ def train_one_epoch_multi_step(
         from torch.cuda.amp import GradScaler
         scaler = GradScaler()
 
-    amp_ctx = (torch.cuda.amp.autocast if use_amp and device.type == "cuda"
-               else (lambda **kw: torch.autocast("cpu", enabled=False)))
+    amp_ctx = ((lambda: torch.amp.autocast(device_type="cuda", enabled=True))
+               if use_amp and device.type == "cuda"
+               else (lambda: torch.autocast("cpu", enabled=False)))
 
     train_one_epoch_multi_step._printed_loss_components = False
 
@@ -3261,8 +3262,9 @@ def evaluate_one_epoch_multi_step(
     backend = str(loss_cfg.get("physics_backend", "dec")).lower()
     use_mls = (backend in ("mls", "moving_least_squares", "moving-least-squares"))
 
-    amp_ctx = (torch.cuda.amp.autocast if use_amp and device.type == "cuda"
-               else (lambda **kw: torch.autocast("cpu", enabled=False)))
+    amp_ctx = ((lambda: torch.amp.autocast(device_type="cuda", enabled=True))
+               if use_amp and device.type == "cuda"
+               else (lambda: torch.autocast("cpu", enabled=False)))
 
     # ---- metric accumulators (weighted by cell area) ----
     step_wsum = []
@@ -3981,8 +3983,9 @@ def evaluate_one_epoch_multi_step(
 
     need_phy = parc_use or (dec_use and (dec_blend_w != 0.0 or dec_resid_w != 0.0))
 
-    amp_ctx = (torch.cuda.amp.autocast if use_amp and device.type == "cuda"
-               else (lambda **kw: torch.autocast("cpu", enabled=False)))
+    amp_ctx = ((lambda: torch.amp.autocast(device_type="cuda", enabled=True))
+               if use_amp and device.type == "cuda"
+               else (lambda: torch.autocast("cpu", enabled=False)))
 
     # ---- metric accumulators (weighted by cell area) ----
     step_wsum = []
@@ -5147,5 +5150,4 @@ if __name__ == "__main__":
     args = ap.parse_args()
     print("Running main...", flush=True)
     main(args.config)
-
 

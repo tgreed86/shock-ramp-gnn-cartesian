@@ -146,6 +146,8 @@ class SolveGradientsLST(nn.Module):
     def __init__(self, pos_mean=None, pos_std=None, boundary_margin=0.0,
                  norm_method='z_score', max_position=None, **kwargs):
         super().__init__()
+        # Dynamic AMR creates many transient geometries; keep caching opt-in.
+        self.cache_by_geometry = bool(kwargs.get("cache_by_geometry", True))
         self.geo_cache = {}
         
         # Physical Ceiling derived from 900-simulation scan
@@ -171,6 +173,9 @@ class SolveGradientsLST(nn.Module):
     #    return data.pos.data_ptr()
 
     def _get_cache_key(self, data):
+        if not self.cache_by_geometry:
+            return None
+
         # If you provide mesh_id, it MUST uniquely identify a geometry+connectivity snapshot.
         if hasattr(data, "mesh_id") and data.mesh_id is not None:
             mid = data.mesh_id.item() if data.mesh_id.numel() == 1 else tuple(int(x) for x in data.mesh_id.flatten().tolist())
@@ -209,32 +214,27 @@ class SolveGradientsLST(nn.Module):
     def solve_single_variable(self, pos, edge_index, u, cache_key=None):
         row, col = edge_index
         N = pos.size(0)
-        
-        if cache_key is not None and cache_key in self.geo_cache:
-            M_inv, dX = self.geo_cache[cache_key]
-            if M_inv.device != pos.device:
-                M_inv, dX = M_inv.to(pos.device), dX.to(pos.device)
-                self.geo_cache[cache_key] = (M_inv, dX)
-        else:
-            M_inv, dX = self._precompute_geometry(pos, edge_index, pos.device)
-            if cache_key is not None: self.geo_cache[cache_key] = (M_inv, dX)
-        
-        if cache_key is not None and cache_key in self.geo_cache:
-            M_inv, dX = self.geo_cache[cache_key]
 
-            # ---- NEW: cache validity check for dynamic graphs ----
-            E_now = int(edge_index.size(1))
-            N_now = int(pos.size(0))
-            if (dX.size(0) != E_now) or (M_inv.size(0) != N_now):
-                # stale cache entry (edge_index/pos changed) -> recompute
-                M_inv, dX = self._precompute_geometry(pos, edge_index, pos.device)
+        M_inv = dX = None
+        if cache_key is not None:
+            cached = self.geo_cache.get(cache_key, None)
+            if cached is not None:
+                M_inv, dX = cached
+                # Guard against stale cache entries when geometry/connectivity changed.
+                E_now = int(edge_index.size(1))
+                N_now = int(pos.size(0))
+                if (dX.size(0) != E_now) or (M_inv.size(0) != N_now):
+                    M_inv, dX = None, None
+
+        if M_inv is None or dX is None:
+            M_inv, dX = self._precompute_geometry(pos, edge_index, pos.device)
+            if cache_key is not None:
                 self.geo_cache[cache_key] = (M_inv, dX)
-            else:
-                # keep your existing device-move logic (if any)
-                if dX.device != pos.device:
-                    dX = dX.to(pos.device)
-                if M_inv.device != pos.device:
-                    M_inv = M_inv.to(pos.device)
+        elif (M_inv.device != pos.device) or (dX.device != pos.device):
+            M_inv = M_inv.to(pos.device)
+            dX = dX.to(pos.device)
+            if cache_key is not None:
+                self.geo_cache[cache_key] = (M_inv, dX)
 
         # Compute raw gradients
         du = u[col] - u[row]
@@ -281,6 +281,8 @@ class SolveWeightLST2d(nn.Module):
                  norm_method='z_score', max_position=None, min_neighbors=5,
                  use_2hop_extension=True, **kwargs):
         super().__init__()
+        # Dynamic AMR creates many transient geometries; keep caching opt-in.
+        self.cache_by_geometry = bool(kwargs.get("cache_by_geometry", True))
         self.weights_cache = {}
         self.damping_cache = {}
         self.edge_aug_cache = {}
@@ -313,6 +315,9 @@ class SolveWeightLST2d(nn.Module):
     #        return data.mesh_id.item() if data.mesh_id.numel() == 1 else tuple(data.mesh_id.tolist())
     #    return data.pos.data_ptr()
     def _get_cache_key(self, data):
+        if not self.cache_by_geometry:
+            return None
+
         if hasattr(data, "mesh_id") and data.mesh_id is not None:
             mid = data.mesh_id.item() if data.mesh_id.numel() == 1 else tuple(int(x) for x in data.mesh_id.flatten().tolist())
         else:
@@ -337,8 +342,7 @@ class SolveWeightLST2d(nn.Module):
         edge_index too, so 2-hop neighbors contribute to the Laplacian.
         """
         key = self._get_cache_key(data)
-        
-        if key in self.edge_aug_cache:
+        if key is not None and key in self.edge_aug_cache:
             cached = self.edge_aug_cache[key]
             if cached.device != data.pos.device:
                 cached = cached.to(data.pos.device)
@@ -379,8 +383,8 @@ class SolveWeightLST2d(nn.Module):
 
     def forward(self, data: Data):
         key = self._get_cache_key(data)
-        
-        if key in self.weights_cache:
+
+        if key is not None and key in self.weights_cache:
             weights = self.weights_cache[key]
             if weights.numel() != data.edge_index.size(1):
                 # stale
@@ -440,7 +444,7 @@ class SolveWeightLST2d(nn.Module):
         
         # Apply damping only if NOT using 2-hop extension
         if not self.use_2hop_extension:
-            if key in self.damping_cache:
+            if key is not None and key in self.damping_cache:
                 damping = self.damping_cache[key].to(data.pos.device)
             else:
                 damping = self._get_laplacian_damping(
