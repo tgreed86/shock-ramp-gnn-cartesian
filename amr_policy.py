@@ -20,12 +20,11 @@
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-import math, os
 
 
 # --------------------------- small helpers / config -------------------------- #
@@ -69,27 +68,6 @@ def _get_bbox(cfg: Dict[str,Any]) -> Tuple[float,float,float,float]:
         ymin = float(dom.get("ymin", 0.0)); ymax = float(dom.get("ymax", 1.0))
     return xmin, xmax, ymin, ymax
 
-'''
-def _resolve_channel_indices(cfg_: dict, Fdim: int) -> torch.Tensor:
-    chmap = cfg_.get("channels", {})
-    names = cfg_.get("policy", {}).get("refine_channels") or cfg_.get("features", {}).get("supervised")
-    idxs = []
-    if names:
-        for nm in names:
-            if isinstance(nm, int):
-                idxs.append(int(nm))
-            elif nm in chmap:
-                idxs.append(int(chmap[nm]))
-    if not idxs and cfg_.get("features", {}).get("use_columns"):
-        idxs = list(cfg_["features"]["use_columns"])
-    if not idxs and cfg_.get("data", {}).get("feature_idx"):
-        idxs = list(cfg_["data"]["feature_idx"])
-    if not idxs:
-        idxs = [0, 1, 2]
-    t = torch.as_tensor(idxs, dtype=torch.long)
-    # clamp to [0, Fdim)
-    return t[(t >= 0) & (t < Fdim)]
-'''
 def _resolve_channel_indices(cfg: dict, Fdim: int) -> torch.Tensor:
     """
     Decide which feature channels to use when combining gradients.
@@ -359,20 +337,6 @@ def compute_hierarchical_gradients_from_gt_raster(
         raise ValueError("No valid feature channels.")
 
     # Compose each channel to finest
-    """
-    Hf, Wf = H * (2 ** Lmax), W * (2 ** Lmax)
-    imgs = []
-    for c in use_cols.tolist():
-        img_flat, valid_flat, Hc, Wc = amr_composite_to_finest_grid(
-            batch["centers_t"].detach().cpu(),
-            (None if "level_t" not in batch else batch["level_t"].detach().cpu()),
-            batch["center_feat_t"][:, [c]].detach().cpu(),
-            H, W, (xmin, xmax, ymin, ymax)
-        )
-        img2d = _to_tensor_2d(img_flat, Hc, Wc, device=dev, dtype=torch.float32)  # <— robust conversion
-        imgs.append(img2d)  # (1, Hf, Wf)
-    """
-    Hf, Wf = H * (2 ** Lmax), W * (2 ** Lmax)
     imgs = []
     valid2d = None   # geometry mask, same for all channels
     for c in use_cols.tolist():
@@ -462,225 +426,6 @@ def compute_hierarchical_gradients_from_gt_raster(
 
     return {"grad_by_level": grad_by_level, "grad_feat_by_level": grad_feat_by_level}
 
-'''
-@torch.no_grad()
-def predict_masks_hierarchical_from_gt_gradients(
-    batch: dict,
-    cfg: dict,
-    H: int,
-    W: int,
-    dx_unused: float,
-    dy_unused: float,
-    *,
-    device=None,
-) -> dict[int, torch.Tensor]:
-    dev = device or next((v.device for v in batch.values() if torch.is_tensor(v)), torch.device("cpu"))
-
-    pol          = cfg.get("policy", {})
-    tau_by_level = pol.get("tau_by_level", None)
-    tau_low_def  = float(pol.get("tau_low",  0.02))
-    tau_high_def = float(pol.get("tau_high", 0.03))
-
-    mode = str(pol.get("hysteresis_mode", "absolute")).lower()  # "absolute" or "percentile"
-    pct_low_default  = float(pol.get("percentile_low",  75.0))
-    pct_high_default = float(pol.get("percentile_high", 90.0))
-    pct_by_level     = pol.get("percentiles_by_level", {})
-    dbg_thr = bool(pol.get("debug_thresholds", False))
-
-    def _taus(L: int) -> tuple[float, float]:
-        if isinstance(tau_by_level, dict) and L in tau_by_level:
-            tl = tau_by_level[L]
-            if isinstance(tl, dict):
-                return float(tl.get("low", tau_low_def)), float(tl.get("high", tau_high_def))
-            else:
-                return (tau_low_def, float(tl))
-        return (tau_low_def, tau_high_def)
-
-    xmin, xmax, ymin, ymax = cfg["data"]["bbox"]
-    dx0 = (xmax - xmin) / float(W)
-    dy0 = (ymax - ymin) / float(H)
-    """
-    # --- compute grads (let it infer Lmax; we pass debug_levels accordingly)
-    grads = compute_hierarchical_gradients_from_gt(
-        batch, cfg, H, W, dx0, dy0,
-        feature_idx=None,
-        top_percent=None,
-        debug_distances=False,
-        debug_levels=(),   # empty => function will default to 0..Lmax
-    )
-    """
-    # --- compute grads (let it infer Lmax; we pass debug_levels accordingly)
-    grads = compute_hierarchical_gradients_from_gt_raster(
-        batch, cfg, H, W, dx0, dy0,
-        feature_idx=None, feature_names=None
-    )
-    
-    # --- per-feature combine -> single (h,w) per level (unchanged) ---
-    combine = str(cfg.get("policy", {}).get("combine", "l2")).lower()
-    _anyL = next(iter(grads["grad_feat_by_level"].keys()))
-    Fdim = grads["grad_feat_by_level"][_anyL].shape[-1]
-    use_cols = _resolve_channel_indices(cfg, Fdim)
-
-    raw_w = cfg.get("policy", {}).get("refine_weights", None)
-    if raw_w is not None:
-        w = torch.as_tensor(raw_w, dtype=torch.float32)
-        if w.numel() != use_cols.numel():
-            if w.numel() < use_cols.numel():
-                w = torch.cat([w, w.new_ones(use_cols.numel() - w.numel())])
-            else:
-                w = w[:use_cols.numel()]
-    else:
-        w = None
-
-    G = {
-        L: _combine_level(
-            torch.nan_to_num(grads["grad_feat_by_level"][L], nan=0.0),
-            use_cols=use_cols,
-            combine=combine,
-            w=w,
-        )
-        for L in grads["grad_feat_by_level"]
-    }
-
-    # --- pooled-up max propagation (level-agnostic) ---
-    pooled_up = {L: G[L].clone() for L in G}
-    maxL = max(G.keys())
-    for L in range(maxL - 1, -1, -1):
-        for Lc in range(L + 1, maxL + 1):
-            scale = 2 ** (Lc - L)
-            pooled = torch.nn.functional.max_pool2d(G[Lc][None, None], kernel_size=scale, stride=scale)[0, 0]
-            pooled_up[L] = torch.maximum(pooled_up[L], pooled)
-
-    # --- thresholding with absolute/percentile hysteresis (unchanged logic, now covers any L) ---
-    masks_by_level = {}
-    for L in range(1, maxL + 1):
-        parent = L - 1
-        Gparent = pooled_up[parent].to(dev)
-
-        if mode == "percentile":
-            if isinstance(pct_by_level, dict) and L in pct_by_level:
-                pL = pct_by_level[L]
-                p_low  = float(pL.get("low",  pct_low_default))
-                p_high = float(pL.get("high", pct_high_default))
-            else:
-                p_low, p_high = pct_low_default, pct_high_default
-            p_low  = max(0.0, min(100.0, p_low))
-            p_high = max(0.0, min(100.0, p_high))
-            if p_low > p_high: p_low, p_high = p_high, p_low
-
-            finite = torch.isfinite(Gparent)
-            if finite.any():
-                thr_low  = torch.quantile(Gparent[finite], p_low  / 100.0)
-                thr_high = torch.quantile(Gparent[finite], p_high / 100.0)
-            else:
-                thr_low  = torch.tensor(float("inf"), device=Gparent.device)
-                thr_high = torch.tensor(float("inf"), device=Gparent.device)
-        else:
-            tau_low, tau_high = _taus(L)
-            thr_low  = torch.as_tensor(tau_low,  device=Gparent.device, dtype=Gparent.dtype)
-            thr_high = torch.as_tensor(tau_high, device=Gparent.device, dtype=Gparent.dtype)
-
-        if dbg_thr:
-            finite = torch.isfinite(Gparent)
-            gmin = Gparent[finite].min().item() if finite.any() else float("nan")
-            gmax = Gparent[finite].max().item() if finite.any() else float("nan")
-            print(f"[THR] L{L} mode={mode} thr_low={float(thr_low):.3e} thr_high={float(thr_high):.3e} "
-                  f"min={gmin:.3e} max={gmax:.3e}")
-        """
-        if L == 1 and ("mask_t" in batch):
-            prev = batch["mask_t"].to(dev).view_as(Gparent).bool()
-            keep = prev & (Gparent > thr_low)
-            newr = (~prev) & (Gparent > thr_high)
-            M = keep | newr
-        else:
-            M = (Gparent > thr_high)
-        """
-
-        # --- Hysteresis with robust resizing of prev mask ---
-        if L == 1 and ("mask_t" in batch):
-            prev_flat = batch["mask_t"].to(dev)
-            Gparent = Gparent  # (h_p, w_p)
-            h_p, w_p = int(Gparent.shape[0]), int(Gparent.shape[1])
-
-            # Try to infer the native coarse size for prev
-            numel_prev = prev_flat.numel()
-            # 1) Prefer cfg data H/W if consistent
-            H0 = int(cfg["data"].get("H", H))
-            W0 = int(cfg["data"].get("W", W))
-            if H0 * W0 == numel_prev:
-                prev2d = prev_flat.view(H0, W0).float()
-            else:
-                # 2) Fallback: square side if possible; else bail to all-false
-                side = int(round(numel_prev ** 0.5))
-                if side * side == numel_prev:
-                    prev2d = prev_flat.view(side, side).float()
-                else:
-                    # last-resort: disable hysteresis cleanly when incompatible
-                    prev2d = torch.zeros((h_p, w_p), device=dev, dtype=torch.float32)
-
-            # Resize to parent shape (nearest to preserve mask semantics)
-            if prev2d.shape != (h_p, w_p):
-                prev_resized = F.interpolate(prev2d[None, None], size=(h_p, w_p), mode="nearest")[0, 0]
-            else:
-                prev_resized = prev2d
-
-            prev_mask = prev_resized.bool()
-            keep = prev_mask & (Gparent > thr_low)
-            newr = (~prev_mask) & (Gparent > thr_high)
-            M = keep | newr
-        else:
-            M = (Gparent > thr_high)
-
-        if L > 1:
-            allow = torch.nn.functional.interpolate(
-                masks_by_level[L - 1].float()[None, None], scale_factor=2.0, mode="nearest"
-            )[0, 0].bool()
-            h, w = Gparent.shape
-            M = M & allow[:h, :w]
-
-        # Optional: constant-physical-width dilation
-        r_phys = float(cfg.get("policy", {}).get(f"dilate_phys_L{L}", 0.0))
-        if r_phys > 0:
-            dxL_here = (xmax - xmin) / (W * (2 ** (L - 1)))
-            r_cells = max(1, int(round(r_phys / dxL_here)))
-            k = 2 * r_cells + 1
-            M = torch.nn.functional.max_pool2d(M.float()[None, None], kernel_size=k, stride=1, padding=r_cells)[0, 0].bool()
-
-        masks_by_level[L] = M
-
-    # --- Normalize masks to PARENT grid resolution expected by geometry builder ---
-    # Expected shape for level L is (H * 2^(L-1), W * 2^(L-1)).
-    norm_masks_by_level = {}
-    for L, M in masks_by_level.items():
-        M = M.to(torch.bool)
-        expected_h = H * (2 ** (L - 1))
-        expected_w = W * (2 ** (L - 1))
-        h, w = int(M.shape[0]), int(M.shape[1])
-
-        if (h, w) == (expected_h, expected_w):
-            # OK: already parent grid
-            norm_masks_by_level[L] = M
-            continue
-
-        # If we accidentally produced CHILD grid for level L (i.e., 2× parent),
-        # downsample by 2 with OR semantics using max-pool.
-        if (h, w) == (expected_h * 2, expected_w * 2):
-            Mp = F.max_pool2d(M.float()[None, None], kernel_size=2, stride=2)[0, 0].to(torch.bool)
-            norm_masks_by_level[L] = Mp
-            # Optional debug:
-            # print(f"[MASK NORM] L{L}: child ({h},{w}) -> parent ({expected_h},{expected_w})")
-            continue
-
-        # As a safety net: any other mismatch -> resize with nearest (preserves booleans)
-        Mp = F.interpolate(M.float()[None, None], size=(expected_h, expected_w), mode="nearest")[0, 0].to(torch.bool)
-        norm_masks_by_level[L] = Mp
-        # Optional debug:
-        # print(f"[MASK NORM] L{L}: ({h},{w}) -> ({expected_h},{expected_w}) via nearest")
-
-    masks_by_level = norm_masks_by_level
-
-    return masks_by_level
-'''
 @torch.no_grad()
 def predict_masks_hierarchical_from_gt_gradients(
     batch: dict,
@@ -1190,7 +935,6 @@ def _idw_map(src_x: torch.Tensor,
         out[rows] = src_x.index_select(0, topk_idx[rows, 0])
 
     return out
-
 
 
 

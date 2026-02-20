@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
+from torch import Tensor
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
 from utils_geom import unique_undirected
@@ -797,6 +798,7 @@ class AMRTemporalDataset(Dataset):
 
 class CellRefineTemporalDataset(Dataset):
     """
+    Legacy compatibility dataset for older training/plotting entry points.
     Yields per-sample dictionaries for consecutive timesteps (t -> t+1),
     with features and geometry defined at **cell centers**.
 
@@ -844,13 +846,10 @@ class CellRefineTemporalDataset(Dataset):
             parents_tp1 = _parents_from_level_ij(level_tp1, ij_tp1, self.H, self.W)  # only for mask at t+1
             mask_tp1    = _coarse_mask_from_level_parents(level_tp1, parents_tp1, self.H, self.W)
 
-            #print("level_t unique:", torch.unique(level_t))
-
             # --- edges (center graph) ---
             ei_t   = _safe_edge_index(dt)
             ei_tp1 = _safe_edge_index(dt1)
 
-            # after you compute ei_t / ei_tp1 in CellRefineTemporalDataset.__init__
             if ei_t.numel() == 0:
                 print("[WARN] ei_t is empty for t sample")
             if ei_tp1.numel() == 0:
@@ -1141,6 +1140,5 @@ class CellRefineWindowDataset(Dataset):
             })
             
         return out
-
 
 

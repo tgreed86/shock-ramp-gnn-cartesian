@@ -72,9 +72,9 @@ from train import (
     evaluate_one_epoch_multi_step,
     _get_bbox,
 )
+from models import ParcFeatureAdapter
 from utils_geom import build_idw_map, apply_idw_map
 import utils.dec_ops as dec
-from utils.debug_rollout_checks import DebugRolloutChecks
 
 
 # ----------------- Logging helpers ----------------- #
@@ -999,7 +999,7 @@ def make_rollout_gifs_raster(
                                      global_d_abs_f)
 
         print("[CLIM] Done.")
-        print(f"[CLIM] Example (first 3 feats):")
+        print("[CLIM] Example (first 3 feats):")
         for f in range(min(3, F)):
             print(f"       f={f}: top=[{float(global_top_min_f[f]):.6e}, {float(global_top_max_f[f]):.6e}] "
                   f"delta=±{float(global_d_abs_f[f]):.6e}")
@@ -1070,11 +1070,6 @@ def make_rollout_gifs_raster(
             # Diagnostic: rasterized level map (what refinement is actually present)
             P_level_img, HH, WW = _rasterize_block_common(P_cent, P_lev, P_lev.to(torch.float32)[:, None], H, W, bbox, step_lmax)
             B_level_img, B_HH, B_WW = _rasterize_block_common(B_cent, B_lev, B_lev.to(torch.float32)[:, None], H, W, bbox, step_lmax)
-
-            # deltas on the same raster grid
-            #Dgt = (B_img - A_img)  # GT(t+1)-GT(t)
-            #Dpg = (P_img - B_img)  # Pred(t+1)-GT(t+1)
-            #Dpt = (P_img - A_img)  # Pred(t+1)-GT(t)
 
             # deltas on the same raster grid
             Dgt = (B_img - A_img)  # GT(t+1)-GT(t)
@@ -1427,13 +1422,6 @@ def run_fast_drift_checks(
 # ----------------- Main rollout script ----------------- #
 
 def main():
-    import argparse
-    import json
-    import os
-    import time
-    import torch
-    from torch.utils.data import DataLoader, Subset, SequentialSampler
-
     ap = argparse.ArgumentParser(description="Long-rollout visualization with GIFs (raster version + fixed clims).")
 
     ap.add_argument("--checkpoint", type=str, required=True,
@@ -1545,15 +1533,6 @@ def main():
 
     set_seed(int(cfg.get("train", {}).get("seed", 42)))
 
-    # Check for adapter weights in checkpoint
-    '''
-    sd = ckpt["model"] if "model" in ckpt else ckpt
-    has_adapter_weights = any(k.startswith("parc_adapter.") for k in sd.keys())
-    # Build model with/without adapter accordingly
-    cfg["loss"]["parc_use_adapter"] = bool(has_adapter_weights)
-    print(f"[INFO] Checkpoint has_adapter_weights={has_adapter_weights}; setting cfg['loss']['parc_use_adapter']={cfg['loss']['parc_use_adapter']}")
-    '''
-
     # Domain params
     H = int(cfg["data"].get("H", 64))
     W = int(cfg["data"].get("W", 64))
@@ -1657,13 +1636,6 @@ def main():
     )
 
     # ----- Build model & load weights -----
-    '''
-    with Timer("Build model"):
-        model = build_model_from_cfg(cfg, device)
-    model.load_state_dict(ckpt["model"])
-    model.to(device)
-    model.eval()
-    '''
     with Timer("Build model"):
         model = build_model_from_cfg(cfg, device)
 
@@ -1689,32 +1661,6 @@ def main():
     else:
         model.parc_adapter = None
 
-    '''
-    # ----- Load weights (strip parc_adapter keys if present) -----
-    sd = ckpt["model"] if "model" in ckpt else ckpt
-
-    # Remove adapter keys unconditionally — safe for all checkpoints
-    sd_no_adapter = {k: v for k, v in sd.items() if not k.startswith("parc_adapter.")}
-
-    missing, unexpected = model.load_state_dict(sd_no_adapter, strict=False)
-
-    # Sanity check: nothing except adapter should be missing/unexpected
-    missing_non_adapter = [k for k in missing if not k.startswith("parc_adapter.")]
-    unexpected_non_adapter = [k for k in unexpected if not k.startswith("parc_adapter.")]
-
-    if missing_non_adapter or unexpected_non_adapter:
-        raise RuntimeError(
-            "State-dict mismatch beyond parc_adapter.*\n"
-            f"Missing: {missing_non_adapter}\n"
-            f"Unexpected: {unexpected_non_adapter}"
-        )
-
-    if missing or unexpected:
-        print(
-            f"[INFO] Loaded checkpoint ignoring adapter keys "
-            f"(missing_adapter={len(missing)}, unexpected_adapter={len(unexpected)})"
-        )
-    '''
     sd = ckpt["model"] if "model" in ckpt else ckpt
     has_adapter_weights = any(k.startswith("parc_adapter.") for k in sd.keys())
     has_adapter_module  = getattr(model, "parc_adapter", None) is not None
@@ -1767,7 +1713,6 @@ def main():
     # ----- Evaluate only this rollout window -----
     log(f"[INFO] Running multi-step evaluation for ONE window at start_t={start_t} (horizon={horizon})...")
     with Timer("evaluate_one_epoch_multi_step"):
-        #test_loss, test_mae, test_stats = evaluate_one_epoch_multi_step(
         test_loss, test_stats = evaluate_one_epoch_multi_step(
             model,
             test_loader,
@@ -1781,7 +1726,6 @@ def main():
             budget_csv_path=budget_csv_path, 
             write_budgets=True,
         )
-    #log(f"[TEST] loss={test_loss:.4e}, MAE={test_mae:.4e}")
     log(f"[TEST] loss={test_loss:.4e}")
 
     _maybe_empty_device_cache(device)
@@ -1849,4 +1793,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

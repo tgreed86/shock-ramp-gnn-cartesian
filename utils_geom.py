@@ -1,9 +1,6 @@
 from __future__ import annotations
 import torch
-from torch import Tensor
 import torch.nn.functional as F
-import numpy as np
-from typing import Dict, Tuple, Optional
 
 
 
@@ -335,8 +332,6 @@ def build_coarse_n4(H: int, W: int, device=None) -> torch.Tensor:
     i = torch.arange(W, device=device)
     JJ, II = torch.meshgrid(j, i, indexing="ij")  # JJ: [H,W] rows, II: [H,W] cols
 
-    idx = JJ * W + II  # [H,W] linear index
-
     left_i  = torch.clamp(II - 1, 0, W - 1)
     right_i = torch.clamp(II + 1, 0, W - 1)
     down_j  = torch.clamp(JJ - 1, 0, H - 1)
@@ -475,6 +470,5 @@ def parents_from_pos(centers: torch.Tensor,
     col = torch.floor((x - xmin) / dx).long().clamp_(0, W - 1)
     row = torch.floor((y - ymin) / dy).long().clamp_(0, H - 1)
     return row * W + col
-
 
 

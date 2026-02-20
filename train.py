@@ -19,127 +19,33 @@ Also produces qualitative PDFs of feature fields per sample using
 
 from __future__ import annotations
 print("[train.py] module import started", flush=True)
-from typing import Dict, Any, List, Tuple
-import os, io, json, time, zipfile, random, hashlib, sys, csv
+from typing import Dict, Any, List, Tuple, Optional, Sequence
+import os, io, json, time, zipfile, random, sys, csv
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, Subset
+from torch.utils.data import DataLoader, RandomSampler, Subset
 from torch import optim
-from torch.amp import autocast
 from torch_geometric.data import Data
-from contextlib import nullcontext, contextmanager
-import matplotlib.pyplot as plt
+from contextlib import nullcontext
 import numpy as np
-from tqdm import tqdm
-from types import SimpleNamespace
 
-from dataset import CellRefineTemporalDataset, CellRefineWindowDataset, \
-                    preprocess_timesteps_once
+from dataset import CellRefineWindowDataset
 from models import FeatureNet, ParcFeatureAdapter
-from amr_policy import coarse_aggregate_from_dynamic, predict_masks_hierarchical_from_gt_gradients
+from amr_policy import coarse_aggregate_from_dynamic
             
-from plots import plot_loss_curves, plot_qual_2x3_pdf, plot_predictions_from_examples_pdf, \
-                compute_plot_deltas, plot_qual_2x3_pdf_with_cells, plot_qual_pdf
-from utils_geom import build_coarse_n4, \
-             build_idw_map, apply_idw_map, _targeted_map_to_pred, \
-             knn_interpolate_cuda_cdist, knn_interpolate_matmul, \
-             parents_from_pos, apply_precomputed_idw_map
+from plots import plot_loss_curves
+from utils_geom import build_idw_map, apply_idw_map, apply_precomputed_idw_map
 
-from pretrain import make_collate_with_precompute, \
-                precompute_pred_mesh_and_interps_for_rollout, CollateWithPrecompute
+from pretrain import precompute_pred_mesh_and_interps_for_rollout, CollateWithPrecompute
 
 from utils.precomp_h5 import LazyPrecompH5
-from utils.uniform_mesh_engine import UniformMeshEngine
 import utils.dec_ops as dec
-from utils.fast_next_diag import maybe_run_fast_next_diag
 #from utils.mls import SolveGradientsLST, SolveWeightLST2d, apply_laplacian
 import utils.mls as mls
 
 
 
 debug_once = False
-
-'''
-@torch.no_grad()
-def _compute_norm_stats_from_loader(loader, device):
-    """
-    Compute mean/std of physics features over the training loader.
-
-    Supports:
-      - old single-step batches with 'center_feat_t' (and optionally 'center_feat_tp1')
-      - new multi-step batches with 'feat_list' (list of tensors per time step)
-    """
-    n_total = 0
-    mean = None
-    M2 = None  # for Welford's online variance
-
-    for batch in loader:
-        # -------- single-step case (old dataset) --------
-        if "center_feat_t" in batch:
-            x_t = batch["center_feat_t"].to(device).float()   # (N_t, F)
-            xs = [x_t]
-
-            # if you also want to include t+1 in stats (like before), keep this:
-            if "center_feat_tp1" in batch:
-                x_tp1 = batch["center_feat_tp1"].to(device).float()
-                xs.append(x_tp1)
-
-            x = torch.cat(xs, dim=0)  # (N_all, F)
-
-        # -------- windowed case (CellRefineWindowDataset) --------
-        elif "feat_list" in batch:
-            feat_list = batch["feat_list"]  # list/tuple of length K, each (N_k, F)
-
-            xs = []
-            for f in feat_list:
-                if f is None:
-                    continue
-                f = f.to(device).float()
-                if f.numel() == 0:
-                    continue
-                xs.append(f)
-
-            if not xs:
-                continue  # nothing in this batch
-
-            x = torch.cat(xs, dim=0)  # (sum_k N_k, F)
-
-        else:
-            # Nothing we recognize; skip this batch
-            continue
-
-        # -------- Welford update --------
-        if x.numel() == 0:
-            continue
-
-        if mean is None:
-            # first batch
-            mean = x.mean(dim=0)
-            # unbiased variance components
-            diff = x - mean
-            M2 = (diff * diff).sum(dim=0)
-            n_total = x.size(0)
-        else:
-            n_batch = x.size(0)
-            new_n_total = n_total + n_batch
-
-            delta = x.mean(dim=0) - mean
-            mean = mean + delta * (n_batch / new_n_total)
-
-            diff = x - mean
-            M2 = M2 + (diff * diff).sum(dim=0) + (delta * delta) * (n_total * n_batch / new_n_total)
-
-            n_total = new_n_total
-
-    if mean is None or n_total == 0:
-        raise RuntimeError("Could not compute normalization stats: no feature tensors found in loader.")
-
-    var = M2 / max(n_total - 1, 1)
-    std = torch.sqrt(var + 1e-8)
-
-    # Keep them on the same device; _maybe_norm moves them to x.device later.
-    return mean, std
-'''
 @torch.no_grad()
 def _compute_norm_stats_from_loader(loader, device):
     n_total = 0
@@ -253,173 +159,6 @@ def _maybe_denorm(x: torch.Tensor, mu, sigma):
 
     return x * sigma_t + mu_t
 
-'''
-# IMPORTANT for dynamic AMR: disable caching-by-geometry (otherwise memory grows forever)
-_MLS_GRAD = mls.SolveGradientsLST(
-    cache_by_geometry=False,
-    use_2hop_extension=True,
-    use_neighbor_damping=True,
-    damping_alpha=0.5,
-)
-
-_MLS_LAPW = mls.SolveWeightLST2d(
-    polynomial_order=2,
-    cache_by_geometry=False,
-    use_2hop_extension=True,
-    use_neighbor_damping=True,
-    damping_alpha=0.5,
-)
-
-_MLS_ADV  = mls.AdvectionMLS(_MLS_GRAD)
-_MLS_DIFF = mls.DiffusionMLS(_MLS_LAPW)
-
-@torch.no_grad()
-def mls_advdiff_terms_abs(
-    *,
-    x_abs: torch.Tensor,          # (N,F) absolute state on current pred mesh
-    pos: torch.Tensor,            # (N,2) centers
-    edge_index: torch.Tensor,     # (2,E)
-    levels: torch.Tensor,         # (N,)
-    dx0: float,
-    dy0: float,
-    cfg: dict,
-    compute_adv: bool,
-    compute_diff: bool,
-):
-    loss_cfg = cfg.get("loss", {}) or {}
-    rho_floor = float(loss_cfg.get("rho_floor", 1e-6))
-    u_clip    = float(loss_cfg.get("u_clip", 1000.0))
-    nu        = float(loss_cfg.get("nu", 0.0))
-
-    # run MLS ops on CPU if requested (helps GPU memory)
-    ops_dev = torch.device(loss_cfg.get("mls_ops_device", "cpu"))
-
-    x_ops  = x_abs.to(device=ops_dev, dtype=torch.float32)
-    pos_ops = pos.to(device=ops_dev, dtype=torch.float32)
-    ei_ops  = edge_index.to(device=ops_dev, dtype=torch.long)
-
-    data = Data(pos=pos_ops, edge_index=ei_ops)
-
-    # velocity from conservative state (assumes [rho,mx,my,E] layout)
-    idx = dec.infer_feature_indices(cfg, x_ops.size(1))
-    rho = x_ops[:, idx["rho"]].abs().clamp_min(rho_floor)
-    mx  = x_ops[:, idx["mx"]]
-    my  = x_ops[:, idx["my"]]
-    vel = torch.stack([mx / rho, my / rho], dim=1).clamp(-u_clip, u_clip)  # (N,2)
-
-    r_adv = None
-    if compute_adv:
-        r_adv = _MLS_ADV(x_ops, vel, data)  # (N,F)
-
-    r_diff = None
-    if compute_diff:
-        r_diff = _MLS_DIFF(x_ops, data)     # (N,F)
-        if nu != 0.0:
-            r_diff = nu * r_diff
-
-    # area for compatibility with your residual loss codepath
-    area = dec.cell_area_from_levels(
-        levels.long().to(device=x_abs.device),
-        dx0=float(dx0),
-        dy0=float(dy0),
-        dtype=torch.float32,
-        device=x_abs.device,
-    )
-
-    # move outputs back to the training device
-    if r_adv is not None:
-        r_adv = r_adv.to(device=x_abs.device, dtype=torch.float32)
-    if r_diff is not None:
-        r_diff = r_diff.to(device=x_abs.device, dtype=torch.float32)
-
-    return r_adv, r_diff, area
-
-
-def mls_terms_from_precomp(
-    *,
-    x_abs: torch.Tensor,            # (N,F)
-    edge_index: torch.Tensor,       # (2,E)
-    grad_M_inv: torch.Tensor,       # (N,2,2)
-    grad_dX: torch.Tensor,          # (E,2)
-    lap_w: torch.Tensor | None,     # (E,) or None
-    cfg: dict,
-    compute_adv: bool,
-    compute_diff: bool,
-):
-    """
-    MPS-safe MLS advection/diffusion terms using precomputed geometry.
-
-    Key changes vs your version:
-      - Avoid 3D in-place index_add_ on MPS by flattening (E,2,F)->(E,2F) and using out-of-place index_add.
-      - Also avoid in-place index_add_ for diffusion on MPS (optional but recommended).
-      - Ensure row/col and grad_dX/lap_w live on the same device as x_abs.
-    """
-    loss_cfg = cfg.get("loss", {}) or {}
-    rho_floor = float(loss_cfg.get("rho_floor", 1e-6))
-    u_clip    = float(loss_cfg.get("u_clip", 1000.0))
-
-    dev = x_abs.device
-    dtype = x_abs.dtype
-
-    # velocity from conservative state (assumes [rho,mx,my,E] layout)
-    idx = dec.infer_feature_indices(cfg, x_abs.size(1))
-    rho = x_abs[:, idx["rho"]].abs().clamp_min(rho_floor)
-    mx  = x_abs[:, idx["mx"]]
-    my  = x_abs[:, idx["my"]]
-    vel = torch.stack([mx / rho, my / rho], dim=1).clamp(-u_clip, u_clip)  # (N,2)
-
-    # edge indices on-device
-    edge_index = edge_index.to(dev, dtype=torch.long)
-    row, col = edge_index[0], edge_index[1]
-
-    N = int(x_abs.size(0))
-    F = int(x_abs.size(1))
-
-    r_adv = None
-    if compute_adv:
-        # Bring geometry to device/dtype
-        dX = grad_dX.to(dev, dtype=torch.float32)  # keep dX as float32 for stability
-        M_inv = grad_M_inv.to(dev, dtype=torch.float32)
-
-        # du uses model dtype; compute in float32 to match geometry + avoid MPS dtype oddities
-        du = (x_abs[col] - x_abs[row]).to(torch.float32)                    # (E,F)
-        V_edge = dX.unsqueeze(2) * du.unsqueeze(1)                          # (E,2,F) float32
-
-        if dev.type == "mps":
-            # MPS workaround: flatten and out-of-place index_add
-            V_edge2 = V_edge.reshape(V_edge.size(0), -1).contiguous()       # (E,2F)
-            V_node2 = torch.zeros((N, V_edge2.size(1)), device=dev, dtype=V_edge2.dtype)
-            V_node2 = V_node2.index_add(0, row, V_edge2)                    # (N,2F)
-            V_node = V_node2.view(N, 2, F)                                  # (N,2,F)
-        else:
-            V_node = torch.zeros((N, 2, F), device=dev, dtype=V_edge.dtype)
-            V_node.index_add_(0, row, V_edge)
-
-        grads = torch.einsum("nij,njf->nif", M_inv, V_node)                 # (N,2,F) float32
-        r_adv_f32 = vel[:, 0:1].to(torch.float32) * grads[:, 0, :] + vel[:, 1:2].to(torch.float32) * grads[:, 1, :]
-        r_adv = r_adv_f32.to(dtype)                                         # back to model dtype
-
-    r_diff = None
-    if compute_diff and (lap_w is not None):
-        w = lap_w.to(dev, dtype=torch.float32)                              # (E,)
-        du = (x_abs[col] - x_abs[row]).to(torch.float32)                    # (E,F)
-        contrib = w.unsqueeze(1) * du                                       # (E,F) float32
-
-        if dev.type == "mps":
-            # MPS: prefer out-of-place index_add
-            r_diff_f32 = torch.zeros((N, F), device=dev, dtype=contrib.dtype).index_add(0, row, contrib)
-        else:
-            r_diff_f32 = torch.zeros((N, F), device=dev, dtype=contrib.dtype)
-            r_diff_f32.index_add_(0, row, contrib)
-
-        nu = float(loss_cfg.get("nu", 0.0))
-        if nu != 0.0:
-            r_diff_f32 = nu * r_diff_f32
-
-        r_diff = r_diff_f32.to(dtype)
-
-    return r_adv, r_diff
-'''
 _MLS_STATE = {
     "sig": None,
     "grad": None,
@@ -1537,23 +1276,6 @@ def _forward_main_head(model: FeatureNet, X: torch.Tensor, edge_index: torch.Ten
     if isinstance(out, (list, tuple)):
         return out[0]
     return out
-'''
-def _forward_main_head_with_edge_attr(model, x_in, edge_index, edge_attr=None):
-    """
-    Backward compatible: if your model ignores edge_attr, it still works.
-    """
-    if edge_attr is not None and not hasattr(_forward_main_head_with_edge_attr, "_printed"):
-        _forward_main_head_with_edge_attr._printed = True
-        print("[DEC-CHK] Forward called with edge_attr present.")
-
-    if edge_attr is None:
-        return _forward_main_head(model, x_in, edge_index)  # your existing helper
-    try:
-        return _forward_main_head(model, x_in, edge_index, edge_attr=edge_attr)
-    except TypeError:
-        # model/_forward_main_head doesn’t accept edge_attr yet
-        return _forward_main_head(model, x_in, edge_index)
-'''
 def _forward_main_head_with_edge_attr(model, x_in, edge_index, edge_attr=None, *, force_fp32: bool = True):
     """
     Backward compatible:
@@ -1652,7 +1374,6 @@ def _map_pred_to_next_pred(pred_centers_src,
 
     need_idw = torch.ones(N_dst, dtype=torch.bool, device=dev)
 
-    copied = 0
     if src_coarse_idx.numel() > 0 and dst_coarse_idx.numel() > 0:
         # lookup[parent] = index of coarse src node whose parent is `parent`
         lookup = -torch.ones(H * W, dtype=torch.long, device=dev)
@@ -1666,7 +1387,6 @@ def _map_pred_to_next_pred(pred_centers_src,
             src_keep = src_match_for_dst[has_match]
             out[dst_keep] = feats_src[src_keep]
             need_idw[dst_keep] = False
-            copied = int(has_match.sum().item())
 
     # ---- 2) IDW for the remaining nodes -----------------------------------
     q_idx = need_idw.nonzero(as_tuple=True)[0]
@@ -1857,8 +1577,6 @@ def train_one_epoch_multi_step(
     Assumes model predicts RATE (cfg["model"]["predict_type"] == "rate").
     """
 
-    diag_state = {"norm": {}, "phys": {}}
-
     model.train()
     total_loss_accum = 0.0
     mae_accum = 0.0
@@ -1867,8 +1585,6 @@ def train_one_epoch_multi_step(
     dbg = cfg.get("debug", {})
     nan_watch = bool(dbg.get("nan_watch", True))          # turn on/off
     nan_watch_first_only = bool(dbg.get("nan_first_only", True))
-
-    budget_rows = []
 
     if not hasattr(train_one_epoch_multi_step, "_nan_printed"):
         train_one_epoch_multi_step._nan_printed = False
@@ -1969,12 +1685,6 @@ def train_one_epoch_multi_step(
     backend = str(loss_cfg.get("physics_backend", "dec")).lower()
     use_mls = (backend in ("mls", "moving_least_squares", "moving-least-squares"))
 
-    # For MLS, use CPU ops to avoid GPU OOMs
-    mls_ops_device = torch.device(loss_cfg.get("mls_ops_device", "cpu"))
-    mls_scale_by_dt = bool(loss_cfg.get("mls_scale_by_dt", False))
-
-    IDX = {"rho": 0, "mx": 1, "my": 2, "E": 3}  # for velocity extraction inside MLS
-
     if scaler is None and use_amp and device.type == "cuda":
         from torch.cuda.amp import GradScaler
         scaler = GradScaler()
@@ -1992,12 +1702,9 @@ def train_one_epoch_multi_step(
 
         # Required lists (existing)
         centers_list  = _require_list(batch, "centers_list")
-        feat_list     = _require_list(batch, "feat_list")
-        level_list    = _require_list(batch, "level_list")
-        ij_list       = _require_list(batch, "ij_list")
-        ei_list       = _require_list(batch, "ei_list")
-        parents_list  = _require_list(batch, "parents_list")
-        mask_list     = _require_list(batch, "mask_list")
+        _ = _require_list(batch, "feat_list")
+        _ = _require_list(batch, "level_list")
+        _ = _require_list(batch, "parents_list")
 
         pred_centers_list  = _require_list(batch, "pred_centers_list")
         pred_levels_list   = _require_list(batch, "pred_levels_list")
@@ -2136,22 +1843,7 @@ def train_one_epoch_multi_step(
                 if (dt_hat <= 0).any():
                     print("[NAN-DBG][WARN] dt_hat has non-positive values")
 
-            # area on the pred mesh for THIS step
-            # (use float32 on device; we move to CPU in the integrals function anyway)
-            area_pred = dec.cell_area_from_levels(
-                pred_levels.long().to(device),
-                dx0=float(dx),
-                dy0=float(dy),
-                dtype=torch.float32,
-                device=device,
-            )  # [N]
-
-            dbg_cfg = cfg.get("debug", {}) or {}
-            budget_watch = bool(dbg_cfg.get("budget_watch", True))
-            budget_every = int(dbg_cfg.get("budget_every", 1))  # set to >1 to reduce spam
-
             sigma_f32 = _as_stat_tensor(sigma, device=device, dtype=torch.float32)
-            mu_f32    = _as_stat_tensor(mu,    device=device, dtype=torch.float32)  # if you ever need it here
 
             if sigma_f32 is not None:
                 sigma_f32 = sigma_f32.clamp_min(1e-12)
@@ -2314,20 +2006,6 @@ def train_one_epoch_multi_step(
                                             dbg.append((kk, _sz(M_list[kk]), _sz(dX_list[kk]), _sz(ei_list[kk]) if ei_list is not None else None))
                                     raise RuntimeError(f"Could not align MLS geometry to x_abs(N={N}). Nearby shapes: {dbg}")
 
-                                '''
-                                if use_mls:
-                                    r_adv_abs, r_diff_abs, area = mls_advdiff_terms_abs(
-                                        x_abs=x_for_ops.float(),
-                                        pos=pred_centers,
-                                        edge_index=pei.long(),
-                                        levels=pred_levels,
-                                        dx0=float(dx),
-                                        dy0=float(dy),
-                                        cfg=cfg,
-                                        compute_adv=need_adv,
-                                        compute_diff=need_diff,
-                                    )
-                                '''
                                 if use_mls:
                                     # FACE-ADJ edges (same ones used by DEC)
                                     r_adv_abs, r_diff_abs, area = mls_advdiff_terms_abs_faceadj(
@@ -2458,25 +2136,6 @@ def train_one_epoch_multi_step(
                     if r_phy_abs is not None:
                         _assert_finite("r_phy_abs", r_phy_abs)
 
-                """
-                # ----- build node input X (PARC appends operator inputs) -----
-                x_in = _build_X(norm_in, pred_centers, pred_levels, cfg)
-
-                if parc_use and r_adv_abs is not None and r_diff_abs is not None:
-                    parc_extra = dec.parc_terms_to_node_inputs(
-                        r_adv_abs.to(device=device, dtype=torch.float32),
-                        r_diff_abs.to(device=device, dtype=torch.float32),
-                        dt_phys=dt_phys.to(device=device, dtype=torch.float32),
-                        dt_ref=(dt_ref_t.to(device=device, dtype=torch.float32) if dt_ref_t is not None else None),
-                        sigma=(sigma.to(device, dtype=torch.float32) if (sigma is not None and torch.is_tensor(sigma)) else None),
-                        predict_type=predict_type,
-                        cfg=cfg,
-                        dtype=x_in.dtype,
-                        detach=True,
-                    )
-                    if parc_extra.numel() > 0:
-                        x_in = torch.cat([x_in, parc_extra], dim=1)
-                """
                 # ----- build node input X (PARC appends operator inputs) -----
                 x_in = _build_X(norm_in, pred_centers, pred_levels, cfg)
 
@@ -2517,12 +2176,6 @@ def train_one_epoch_multi_step(
                     #if (parc_extra is not None) and (parc_extra.numel() > 0):
                         # parc_extra should already be dtype=x_in.dtype per your call, but keep this safe
                     #    x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
-                    '''
-                    if parc_extra is not None and parc_extra.numel() > 0:
-                        if hasattr(model, "parc_adapter") and (model.parc_adapter is not None) and use_adapter:
-                            parc_extra = model.parc_adapter(parc_extra)                       
-                        x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
-                    '''
                     if parc_extra is not None and parc_extra.numel() > 0:
                         if hasattr(model, "parc_adapter") and (model.parc_adapter is not None) and use_adapter:
                             adv_active  = (r_adv_abs is not None)   # only step0 in your gating
@@ -2799,45 +2452,6 @@ def train_one_epoch_multi_step(
                 #   - phys-space call: best to detect normalization mismatch
                 # NOTE: do NOT pass the AMP GradScaler "scaler" here.
                 # ==========================================================
-                '''
-                if step_k == 0:
-                    print("\n[FAST NEXT DIAGNOSTIC] Running fast next diagnostic at step 0")
-                    # (A) Norm-space: consistent with your actual loss space (y_pred vs rate_target)
-                    #     This is the cleanest place to detect:
-                    #       - dt vs 1/dt vs delta-vs-rate bugs (w.r.t dt_hat)
-                    #       - channel permutation
-                    maybe_run_fast_next_diag(
-                        cfg=cfg,
-                        state=diag_state["norm"],
-                        pred_rate=y_pred,          # (N,F) predicted RATE in *normalized* space
-                        gt_t_feats=norm_in,        # (N,F) GT(t) in *normalized* space
-                        gt_tp1_feats=norm_tgt,     # (N,F) GT(t+1) in *normalized* space
-                        dt=dt_hat,                # the exact dt used for rate_target + integration
-                        mu=None,                  # IMPORTANT: already normalized
-                        sigma=None,               # IMPORTANT: already normalized
-                        scaler=None,              # IMPORTANT: do NOT pass AMP GradScaler
-                        feature_names=["rho", "mx", "my", "E"],
-                        tag="FASTDIAG/norm_space/step0",
-                    )
-
-                    # (B) Abs-space GT + mu/sigma provided:
-                    #     This is the fastest way to detect a normalization mismatch:
-                    #       “pred lives in normalized space, but you’re comparing/plotting in abs (or vice versa)”
-                    maybe_run_fast_next_diag(
-                        cfg=cfg,
-                        state=diag_state["phys"],
-                        pred_rate=y_pred,          # still normalized-rate output
-                        gt_t_feats=x_in_abs,       # (N,F) GT(t) in *absolute* space (step0 is teacher by construction)
-                        gt_tp1_feats=x_tgt_abs,    # (N,F) GT(t+1) in *absolute* space
-                        dt=dt_hat,                # keep dt consistent with your supervision/integration path
-                        mu=mu,
-                        sigma=sigma,
-                        scaler=None,              # IMPORTANT: do NOT pass AMP GradScaler
-                        feature_names=["rho", "mx", "my", "E"],
-                        tag="FASTDIAG/abs_space_with_mu_sigma/step0",
-                    )
-                '''
-
                 center_loss = (F.huber_loss(y_pred, rate_target, delta=huber_delta)
                                if use_huber else F.mse_loss(y_pred, rate_target))
 
@@ -2960,31 +2574,6 @@ def train_one_epoch_multi_step(
             dt_ref_scalar=dt_ref_scalar,
         )
 
-        '''
-        k = 0
-        pred_centers_1, pred_levels_1, pred_parents_1, pred_ei_1, mask_pred_1 = _pred_mesh_for_step_strict(k, pred_lists=pred_lists)
-        pred_ea_1 = pred_ea_list[k + 1] if (pred_ea_list is not None) else None
-
-        x_in_abs0  = feat_t_on_pred_list[k + 1].to(device)     # absolute GT(t) on pred(k+1)
-        x_tgt_abs0 = feat_tp1_on_pred_list[k + 1].to(device)   # absolute GT(t+1) on pred(k+1)
-
-        dt0 = dt_list[0]
-        dt0 = dt0.to(device=device, dtype=x_in_abs0.dtype) if torch.is_tensor(dt0) else torch.tensor(float(dt0), device=device, dtype=x_in_abs0.dtype)
-        dt_ref_scalar = batch.get("dt_ref", None)
-
-        loss0, y_pred_abs0, _x_tgt_abs0 = _run_step(
-            step_k=0,
-            pred_centers=pred_centers_1,
-            pred_levels=pred_levels_1,
-            pred_parents=pred_parents_1,
-            pred_ei=pred_ei_1,
-            pred_ea=pred_ea_1,
-            x_in_abs=x_in_abs0,
-            x_tgt_abs=x_tgt_abs0,
-            dt_phys=dt0,
-            dt_ref_scalar=dt_ref_scalar,
-        )
-        '''
         # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
         # [STEP-C] DRIFT WATCH (place HERE for step 0, before _run_step)
         if cfg.get("debug", {}).get("drift_watch", False):
@@ -3106,25 +2695,6 @@ def train_one_epoch_multi_step(
                         print(f"    u_roll=[{urx:.3e},{ury:.3e}]  u_teach=[{utx:.3e},{uty:.3e}]")
             # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
-            '''
-            # ---- DEBUG: IDW map sanity (prints once when blowup starts) ----
-            if (k >= 6) and (not hasattr(train_one_epoch_multi_step, "_printed_idw_sanity")):
-                train_one_epoch_multi_step._printed_idw_sanity = True
-                print(f"\n[IDW-SANITY] k={k}")
-                _tstats("pred_feats_k (before IDW)", pred_feats_k)
-
-                w = w_km1
-                _tstats("w_km1", w)
-                # row sums
-                row_sum = w.sum(dim=1)
-                _tstats("w row_sum", row_sum)
-
-                print("  w min:", float(w.min().detach().cpu()), "max:", float(w.max().detach().cpu()))
-                print("  row_sum min:", float(row_sum.min().detach().cpu()), "max:", float(row_sum.max().detach().cpu()))
-                print("  any w<0:", bool((w < 0).any().detach().cpu()))
-                print("  any row_sum<=0:", bool((row_sum <= 0).any().detach().cpu()))
-                print("  any nonfinite w:", bool((~torch.isfinite(w)).any().detach().cpu()))
-            '''
             #x_tgt_abs = feat_tp1_on_pred_list[k + 1].to(device)
             x_tgt_abs = _to_dev_nb(feat_tp1_on_pred_list[k + 1])
 
@@ -3175,15 +2745,6 @@ def train_one_epoch_multi_step(
         # ===== backward + step once per window =====
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         if window_loss_graph is not None:
-            '''
-            if scaler is not None:
-                scaler.scale(window_loss_graph).backward()
-                scaler.step(opt)
-                scaler.update()
-            else:
-                window_loss_graph.backward()
-                opt.step()
-            '''
             if scaler is not None:
                 scaler.scale(window_loss_graph).backward()
                 scaler.unscale_(opt)  # <-- required before clipping
@@ -3199,9 +2760,6 @@ def train_one_epoch_multi_step(
 
         total_loss_accum += window_loss
         mae_accum        += window_mae
-
-    out_dir = cfg["train"]["save_dir"]
-    budget_path = os.path.join(out_dir, "train_budgets.csv")
 
     denom = max(n_steps, 1)
     return total_loss_accum / denom, mae_accum / denom, {"num_windows": len(loader), "num_steps": n_steps}
@@ -3225,7 +2783,6 @@ def evaluate_one_epoch_multi_step(
 
     model.eval()
 
-    budget_rows = []  
     idx_map = None
 
     # ---- dx,dy ----
@@ -3280,7 +2837,6 @@ def evaluate_one_epoch_multi_step(
     # ---- budgets (CSV) ----
     budget_rows = []
     budget_cfg = cfg.get("eval", {}) or {}
-    save_budgets = bool(budget_cfg.get("save_budgets_csv", True))
 
     # Where to save:
     # - In training runs you probably use train.save_dir
@@ -3431,10 +2987,7 @@ def evaluate_one_epoch_multi_step(
             centers_list  = _require_list(batch, "centers_list")
             feat_list     = _require_list(batch, "feat_list")
             level_list    = _require_list(batch, "level_list")
-            ij_list       = _require_list(batch, "ij_list")
-            ei_list       = _require_list(batch, "ei_list")
             parents_list  = _require_list(batch, "parents_list")
-            mask_list     = _require_list(batch, "mask_list")
 
             pred_centers_list  = _require_list(batch, "pred_centers_list")
             pred_levels_list   = _require_list(batch, "pred_levels_list")
@@ -3615,12 +3168,6 @@ def evaluate_one_epoch_multi_step(
 
                         #if (parc_extra is not None) and (parc_extra.numel() > 0):
                         #    x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
-                        '''
-                        if parc_extra is not None and parc_extra.numel() > 0:
-                            if hasattr(model, "parc_adapter") and (model.parc_adapter is not None) and use_adapter:
-                                parc_extra = model.parc_adapter(parc_extra)
-                            x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
-                        '''
                         if parc_extra is not None and parc_extra.numel() > 0:
                             if hasattr(model, "parc_adapter") and (model.parc_adapter is not None) and use_adapter:
                                 adv_active  = (r_adv_abs is not None)   # only step0 in your gating
@@ -3936,504 +3483,6 @@ def evaluate_one_epoch_multi_step(
         stats["examples"] = examples
     return avg_loss, stats
 
-'''
-def evaluate_one_epoch_multi_step(
-    model,
-    loader,
-    cfg,
-    device,
-    *,
-    H: int,
-    W: int,
-    dx=None,
-    dy=None,
-    mu=None,
-    sigma=None,
-    collect_examples: bool = False,
-):
-    model.eval()
-
-    # ---- dx,dy ----
-    if dx is None or dy is None:
-        bbox = cfg.get("data", {}).get("bbox", None)
-        if bbox is None:
-            raise ValueError("dx/dy not provided and cfg['data']['bbox'] missing; cannot compute area weights.")
-        x0, x1, y0, y1 = map(float, bbox)
-        dx = (x1 - x0) / float(W)
-        dy = (y1 - y0) / float(H)
-
-    speed = cfg.get("speed", {})
-    use_amp = bool(speed.get("amp", True)) and device.type == "cuda"
-
-    huber_delta = float(cfg["loss"].get("huber_delta", 0.05))
-    lap_w  = float(cfg["loss"].get("laplacian_weight", 0.0))
-    tmp_w  = float(cfg["loss"].get("temporal_weight", 0.0))
-    use_huber = bool(cfg["loss"].get("interp_use_huber", True))
-
-    predict_type = str(cfg.get("model", {}).get("predict_type", "rate")).lower()
-    if predict_type != "rate":
-        raise RuntimeError(f"PARC/Variant-B implementation below assumes predict_type='rate', got '{predict_type}'")
-
-    loss_cfg = cfg.get("loss", {}) or {}
-    dec_use = bool(loss_cfg.get("dec", False))   # <-- FIXED
-    parc_use = bool(loss_cfg.get("parc", False) or loss_cfg.get("parc_inputs", False))
-
-    dec_blend_w = float(loss_cfg.get("blend_weight", 0.0))
-    dec_resid_w = float(loss_cfg.get("residual_weight", 0.0))
-
-    need_phy = parc_use or (dec_use and (dec_blend_w != 0.0 or dec_resid_w != 0.0))
-
-    amp_ctx = ((lambda: torch.amp.autocast(device_type="cuda", enabled=True))
-               if use_amp and device.type == "cuda"
-               else (lambda: torch.autocast("cpu", enabled=False)))
-
-    # ---- metric accumulators (weighted by cell area) ----
-    step_wsum = []
-    step_mae_num = []
-    step_mse_num = []
-    step_gt2_num = []
-    by_t = {}
-
-    total_loss_accum = 0.0
-    n_steps_total = 0
-    examples = [] if collect_examples else None
-
-    def _ensure_step_capacity(k: int, Fdim: int):
-        while len(step_wsum) <= k:
-            step_wsum.append(0.0)
-            step_mae_num.append(torch.zeros(Fdim, dtype=torch.float64))
-            step_mse_num.append(torch.zeros(Fdim, dtype=torch.float64))
-            step_gt2_num.append(torch.zeros(Fdim, dtype=torch.float64))
-
-    def _accumulate_metrics(*, k: int, t_abs: int | None, pred_abs: torch.Tensor, gt_abs: torch.Tensor, pred_levels: torch.Tensor):
-        if pred_abs.ndim == 1: pred_abs_ = pred_abs[:, None]
-        else: pred_abs_ = pred_abs
-        if gt_abs.ndim == 1: gt_abs_ = gt_abs[:, None]
-        else: gt_abs_ = gt_abs
-        if pred_abs_.shape != gt_abs_.shape:
-            raise RuntimeError(f"Metric shape mismatch: pred {pred_abs_.shape} vs gt {gt_abs_.shape}")
-        N, Fdim = pred_abs_.shape
-        _ensure_step_capacity(k, Fdim)
-
-        dtype = pred_abs_.dtype
-        dev = pred_abs_.device
-        w = dec.cell_area_from_levels(pred_levels, dx0=float(dx), dy0=float(dy), dtype=dtype, device=dev)  # [N]
-        wsum_add = float(w.sum().detach().cpu())
-
-        diff = (pred_abs_ - gt_abs_)
-        mae_add = (w[:, None] * diff.abs()).sum(dim=0).detach().cpu().to(torch.float64)
-        mse_add = (w[:, None] * diff.pow(2)).sum(dim=0).detach().cpu().to(torch.float64)
-        gt2_add = (w[:, None] * gt_abs_.pow(2)).sum(dim=0).detach().cpu().to(torch.float64)
-
-        step_wsum[k] += wsum_add
-        step_mae_num[k] += mae_add
-        step_mse_num[k] += mse_add
-        step_gt2_num[k] += gt2_add
-
-        if t_abs is not None:
-            rec = by_t.get(int(t_abs), None)
-            if rec is None:
-                by_t[int(t_abs)] = {"wsum": wsum_add, "mae": mae_add.clone(), "mse": mse_add.clone(), "gt2": gt2_add.clone()}
-            else:
-                rec["wsum"] += wsum_add
-                rec["mae"]  += mae_add
-                rec["mse"]  += mse_add
-                rec["gt2"]  += gt2_add
-
-    def _append_example_step(
-        *,
-        step_idx: int,
-        pred_centers,
-        pred_levels,
-        pred_parents,
-        y_pred_step_abs,
-        centers_list,
-        feat_list,
-        level_list,
-        parents_list,
-        batch,
-    ):
-        if not collect_examples:
-            return
-        idx_tp1 = step_idx + 1
-        t_indices = batch.get("t_indices", None)
-        t_idx = int(t_indices[idx_tp1].item()) if (t_indices is not None and torch.is_tensor(t_indices)) else (int(t_indices[idx_tp1]) if t_indices is not None else int(idx_tp1))
-        bbox = tuple(cfg.get("data", {}).get("bbox", (0.0, 1.0, 0.0, 1.0)))
-        examples.append({
-            "pred_centers": pred_centers.detach().cpu(),
-            "pred_levels":  pred_levels.detach().cpu(),
-            "pred_parents": pred_parents.detach().cpu(),
-            "gt_t":         feat_list[step_idx].detach().cpu(),
-            "gt_tp1":       feat_list[idx_tp1].detach().cpu(),
-            "pred_tp1":     y_pred_step_abs.detach().cpu(),
-            "H": H, "W": W, "bbox": bbox,
-            "t": int(t_idx),
-
-            # True-mesh geometry for plotting
-            "centers_t":    centers_list[step_idx].detach().cpu(),
-            "level_t":      level_list[step_idx].detach().cpu(),
-            "parents_t":    parents_list[step_idx].detach().cpu(),
-            "feat_t":       feat_list[step_idx].detach().cpu(),
-
-            "centers_tp1":  centers_list[idx_tp1].detach().cpu(),
-            "level_tp1":    level_list[idx_tp1].detach().cpu(),
-            "parents_tp1":  parents_list[idx_tp1].detach().cpu(),
-            "feat_tp1":     feat_list[idx_tp1].detach().cpu(),
-        })
-
-    with torch.no_grad():
-        for batch in loader:
-            dt_list = batch.get("dt_list", None)
-            if dt_list is None:
-                raise RuntimeError("Missing dt_list in batch. Ensure CollateWithPrecompute attaches dt_list.")
-
-            centers_list  = _require_list(batch, "centers_list")
-            feat_list     = _require_list(batch, "feat_list")
-            level_list    = _require_list(batch, "level_list")
-            ij_list       = _require_list(batch, "ij_list")
-            ei_list       = _require_list(batch, "ei_list")
-            parents_list  = _require_list(batch, "parents_list")
-            mask_list     = _require_list(batch, "mask_list")
-
-            pred_centers_list  = _require_list(batch, "pred_centers_list")
-            pred_levels_list   = _require_list(batch, "pred_levels_list")
-            pred_parents_list  = _require_list(batch, "pred_parents_list")
-            pred_ei_list       = _require_list(batch, "pred_ei_list")
-            mask_pred_list     = _require_list(batch, "mask_pred_list")
-
-            pred_ea_list = batch.get("pred_ea_list", None) or batch.get("pred_edge_attr_list", None)
-
-            feat_t_on_pred_list   = _require_list(batch, "feat_t_on_pred_list")
-            feat_tp1_on_pred_list = _require_list(batch, "feat_tp1_on_pred_list")
-
-            pred2pred_idx_list = batch.get("pred2pred_idx_list", None)
-            pred2pred_w_list   = batch.get("pred2pred_w_list", None)
-
-            t_indices = batch.get("t_indices", None)
-
-            K = len(centers_list)
-            if K < 2:
-                raise RuntimeError("window_size must be ≥ 2")
-
-            if need_phy and pred_ea_list is None:
-                raise RuntimeError(
-                    "PARC/DEC enabled but batch is missing pred_ea_list / pred_edge_attr_list."
-                )
-
-            pred_lists = (pred_centers_list, pred_levels_list, pred_parents_list, pred_ei_list, mask_pred_list)
-            dt_ref_scalar = batch.get("dt_ref", None)
-
-            # helper closure for one step (mirrors train)
-            def _run_step_eval(
-                *,
-                step_k: int,
-                pred_centers,
-                pred_levels,
-                pred_parents,
-                pred_ei,
-                pred_ea,
-                x_in_abs,
-                x_tgt_abs,
-                dt_phys,
-            ):
-                norm_in  = _maybe_norm(x_in_abs,  mu, sigma)
-                norm_tgt = _maybe_norm(x_tgt_abs, mu, sigma)
-
-                dt_ref_t = (torch.tensor(float(dt_ref_scalar), device=device, dtype=norm_in.dtype)
-                            if dt_ref_scalar is not None else None)
-                dt_hat = (dt_phys / dt_ref_t) if dt_ref_t is not None else dt_phys
-
-                with amp_ctx():
-                    pei = pred_ei.to(device) if torch.is_tensor(pred_ei) else pred_ei
-                    pea = pred_ea.to(device) if (pred_ea is not None and torch.is_tensor(pred_ea)) else pred_ea
-
-                    r_adv_abs = r_diff_abs = r_phy_abs = area = None
-                    ch_mask = None
-
-                    if need_phy:
-                        with torch.autocast(device_type=device.type, enabled=False):
-                            r_adv_abs, r_diff_abs, area = dec.dec_advdiff_terms_abs(
-                                x_abs=x_in_abs.float(),
-                                edge_index=pei.long(),
-                                pred_ea=pea.float(),
-                                levels=pred_levels.long().to(device),
-                                dx0=float(dx),
-                                dy0=float(dy),
-                                cfg=cfg,
-                                compute_adv=True,
-                                compute_diff=True,
-                            )
-                            adv_w  = float(loss_cfg.get("adv_weight", 1.0))
-                            diff_w = float(loss_cfg.get("diff_weight", 1.0))
-                            r_phy_abs = adv_w * r_adv_abs + diff_w * r_diff_abs
-
-                            ch_mask = dec.build_channel_mask_from_loss(
-                                cfg, x_in_abs.size(1), device=device, dtype=torch.float32
-                            )
-                            if ch_mask is None:
-                                idx_map = dec.infer_feature_indices(cfg, x_in_abs.size(1))
-                                ch_mask = torch.zeros((x_in_abs.size(1),), device=device, dtype=torch.float32)
-                                ch_mask[idx_map["rho"]] = 1.0
-                                ch_mask[idx_map["E"]] = 1.0
-
-                    x_in = _build_X(norm_in, pred_centers, pred_levels, cfg)
-
-                    if parc_use and r_adv_abs is not None and r_diff_abs is not None:
-                        parc_extra = dec.parc_terms_to_node_inputs(
-                            r_adv_abs.to(device=device, dtype=torch.float32),
-                            r_diff_abs.to(device=device, dtype=torch.float32),
-                            dt_phys=dt_phys.to(device=device, dtype=torch.float32),
-                            dt_ref=(dt_ref_t.to(device=device, dtype=torch.float32) if dt_ref_t is not None else None),
-                            sigma=(sigma.to(device, dtype=torch.float32) if (sigma is not None and torch.is_tensor(sigma)) else None),
-                            predict_type=predict_type,
-                            cfg=cfg,
-                            dtype=x_in.dtype,
-                            detach=True,
-                        )
-                        if parc_extra.numel() > 0:
-                            x_in = torch.cat([x_in, parc_extra], dim=1)
-
-                    y_corr = _forward_main_head_with_edge_attr(model, x_in, pei, edge_attr=pea)
-                    """
-                    y_pred = y_corr
-                    if need_phy and (dec_blend_w != 0.0) and (r_phy_abs is not None):
-                        phy_units = dec.physics_to_model_units(
-                            r_phy_abs.to(dtype=y_corr.dtype),
-                            dt_phys=dt_phys,
-                            dt_ref=dt_ref_t,
-                            sigma=(sigma.to(device, dtype=y_corr.dtype) if (sigma is not None and torch.is_tensor(sigma)) else None),
-                            predict_type=predict_type,
-                        )
-                        phy_units = phy_units * ch_mask.view(1, -1).to(dtype=y_corr.dtype)
-                        y_pred = y_corr + dec_blend_w * phy_units
-                    """
-                    y_pred = y_corr
-                    if need_phy and (dec_blend_w != 0.0) and (r_phy_abs is not None):
-                        # ---- compute baseline in fp32 to avoid fp16 inf/NaN during eval rollouts ----
-                        with torch.autocast(device_type=device.type, enabled=False):
-                            phy_units_f32 = dec.physics_to_model_units(
-                                r_phy_abs.to(dtype=torch.float32),
-                                dt_phys=(dt_phys.to(dtype=torch.float32) if torch.is_tensor(dt_phys) else dt_phys),
-                                dt_ref=(dt_ref_t.to(dtype=torch.float32) if (dt_ref_t is not None and torch.is_tensor(dt_ref_t)) else dt_ref_t),
-                                sigma=(sigma.to(device, dtype=torch.float32) if (sigma is not None and torch.is_tensor(sigma)) else None),
-                                predict_type=predict_type,
-                            )
-                            phy_units_f32 = phy_units_f32 * ch_mask.view(1, -1).to(dtype=torch.float32)
-
-                        phy_units = phy_units_f32.to(dtype=y_corr.dtype)
-                        y_pred = y_corr + dec_blend_w * phy_units
-                    """
-                    delta_target = norm_tgt - norm_in
-                    rate_target = delta_target / dt_hat.clamp_min(1e-12)
-
-                    center_loss = (F.huber_loss(y_pred, rate_target, delta=huber_delta)
-                                   if use_huber else F.l1_loss(y_pred, rate_target))
-
-                    y_pred_abs = _maybe_denorm(norm_in + y_pred * dt_hat, mu, sigma)
-                    """
-                    with torch.autocast(device_type=device.type, enabled=False):
-                        delta_target_f32 = (norm_tgt - norm_in).to(dtype=torch.float32)
-                        dt_hat_f32 = dt_hat.to(dtype=torch.float32)
-                        rate_target_f32 = delta_target_f32 / dt_hat_f32.clamp_min(1e-12)
-                        
-                        # compare in fp32 (more stable), then cast loss back if you want
-                        y_pred_f32 = y_pred.to(dtype=torch.float32)
-                        center_loss = (F.huber_loss(y_pred_f32, rate_target_f32, delta=huber_delta)
-                                       if use_huber else F.l1_loss(y_pred_f32, rate_target_f32))
-
-                        y_pred_abs = _maybe_denorm(
-                            norm_in.to(dtype=torch.float32) + y_pred_f32 * dt_hat_f32,
-                            mu, sigma
-                        )
-
-                    lap_loss = (laplacian_smoothness(y_pred, pei) if lap_w > 0 else y_pred.new_zeros(()))
-                    tmp_loss = (temporal_consistency(x_in, norm_tgt) if tmp_w > 0 else y_pred.new_zeros(()))
-
-                    phy_loss = y_pred.new_zeros(())
-                    if need_phy and dec_resid_w > 0.0 and (r_phy_abs is not None):
-                        with torch.autocast(device_type=device.type, enabled=False):
-                            phy_loss = dec.physics_residual_loss_delta(
-                                y_pred_abs=y_pred_abs.float(),
-                                x_in_abs=x_in_abs.float(),
-                                dt_phys=dt_phys.float(),      # <-- correct dt for this step
-                                r_phy_abs=r_phy_abs.float(),
-                                area=area.float(),
-                                sigma=(sigma.to(device, dtype=torch.float32) if (sigma is not None and torch.is_tensor(sigma)) else None),
-                                channel_mask=ch_mask,
-                            ).to(dtype=y_pred.dtype)
-
-                    loss_step = center_loss + lap_w * lap_loss + tmp_w * tmp_loss + dec_resid_w * phy_loss
-
-                return loss_step, y_pred_abs
-
-            # ===== STEP 0 =====
-            k = 0
-            pred_centers_1, pred_levels_1, pred_parents_1, pred_ei_1, mask_pred_1 = _pred_mesh_for_step_strict(k, pred_lists=pred_lists)
-            pred_ea_1 = pred_ea_list[k + 1] if pred_ea_list is not None else None
-
-            x_in_abs0  = feat_t_on_pred_list[k + 1].to(device)
-            x_tgt_abs0 = feat_tp1_on_pred_list[k + 1].to(device)
-
-            dt0 = dt_list[0]
-            dt0 = dt0.to(device=device, dtype=x_in_abs0.dtype) if torch.is_tensor(dt0) else torch.tensor(float(dt0), device=device, dtype=x_in_abs0.dtype)
-
-            loss0, y_pred_abs0 = _run_step_eval(
-                step_k=0,
-                pred_centers=pred_centers_1,
-                pred_levels=pred_levels_1,
-                pred_parents=pred_parents_1,
-                pred_ei=pred_ei_1,
-                pred_ea=pred_ea_1,
-                x_in_abs=x_in_abs0,
-                x_tgt_abs=x_tgt_abs0,
-                dt_phys=dt0,
-            )
-
-            total_loss_accum += float(loss0.detach().cpu())
-            n_steps_total += 1
-
-            t_abs0 = None
-            if t_indices is not None:
-                t_abs0 = int(t_indices[1].item()) if torch.is_tensor(t_indices) else int(t_indices[1])
-
-            _accumulate_metrics(k=0, t_abs=t_abs0, pred_abs=y_pred_abs0, gt_abs=x_tgt_abs0, pred_levels=pred_levels_1)
-
-            _append_example_step(
-                step_idx=0,
-                pred_centers=pred_centers_1,
-                pred_levels=pred_levels_1,
-                pred_parents=pred_parents_1,
-                y_pred_step_abs=y_pred_abs0,
-                centers_list=centers_list,
-                feat_list=feat_list,
-                level_list=level_list,
-                parents_list=parents_list,
-                batch=batch,
-            )
-
-            pred_feats_k = y_pred_abs0
-
-            # ===== STEPS 1..K-2 =====
-            for k in range(1, K - 1):
-                pred_centers_next, pred_levels_next, pred_parents_next, pred_ei_next, mask_pred_next = _pred_mesh_for_step_strict(k, pred_lists=pred_lists)
-                pred_ea_next = pred_ea_list[k + 1] if pred_ea_list is not None else None
-
-                idx_km1 = pred2pred_idx_list[k-1].to(device)
-                w_km1   = pred2pred_w_list[k-1].to(device)
-                x_in_abs = apply_precomputed_idw_map(idx_km1, w_km1, pred_feats_k).to(device)
-
-                x_tgt_abs = feat_tp1_on_pred_list[k + 1].to(device)
-
-                dtk = dt_list[k]
-                dtk = dtk.to(device=device, dtype=x_in_abs.dtype) if torch.is_tensor(dtk) else torch.tensor(float(dtk), device=device, dtype=x_in_abs.dtype)
-
-                loss_k, y_pred_abs_k = _run_step_eval(
-                    step_k=k,
-                    pred_centers=pred_centers_next,
-                    pred_levels=pred_levels_next,
-                    pred_parents=pred_parents_next,
-                    pred_ei=pred_ei_next,
-                    pred_ea=pred_ea_next,
-                    x_in_abs=x_in_abs,
-                    x_tgt_abs=x_tgt_abs,
-                    dt_phys=dtk,
-                )
-
-                total_loss_accum += float(loss_k.detach().cpu())
-                n_steps_total += 1
-
-                t_absk = None
-                if t_indices is not None:
-                    t_absk = int(t_indices[k + 1].item()) if torch.is_tensor(t_indices) else int(t_indices[k + 1])
-
-                _accumulate_metrics(k=k, t_abs=t_absk, pred_abs=y_pred_abs_k, gt_abs=x_tgt_abs, pred_levels=pred_levels_next)
-
-                _append_example_step(
-                    step_idx=k,
-                    pred_centers=pred_centers_next,
-                    pred_levels=pred_levels_next,
-                    pred_parents=pred_parents_next,
-                    y_pred_step_abs=y_pred_abs_k,
-                    centers_list=centers_list,
-                    feat_list=feat_list,
-                    level_list=level_list,
-                    parents_list=parents_list,
-                    batch=batch,
-                )
-
-                #pred_feats_k = y_pred_abs_k
-                pred_feats_k = _enforce_physical_state(y_pred_abs_k, rho_floor=1e-6, E_floor=1e-6)
-
-    # ---- finalize metrics ----
-    eps = 1e-12
-    S = len(step_wsum)
-    if S == 0:
-        raise RuntimeError("No steps accumulated; check loader/window_size.")
-
-    Fdim = step_mae_num[0].numel()
-    maew_feat_by_step = torch.zeros((S, Fdim), dtype=torch.float64)
-    rell2w_feat_by_step = torch.zeros((S, Fdim), dtype=torch.float64)
-    maew_by_step = []
-    rell2w_by_step = []
-
-    for k in range(S):
-        wsum = step_wsum[k]
-        if wsum <= 0:
-            maew_feat = torch.full((Fdim,), float("nan"), dtype=torch.float64)
-            rell2w_feat = torch.full((Fdim,), float("nan"), dtype=torch.float64)
-        else:
-            maew_feat = step_mae_num[k] / wsum
-            rell2w_feat = torch.sqrt(step_mse_num[k] / (step_gt2_num[k] + eps))
-        maew_feat_by_step[k] = maew_feat
-        rell2w_feat_by_step[k] = rell2w_feat
-        maew_by_step.append(float(maew_feat.mean().item()))
-        rell2w_by_step.append(float(rell2w_feat.mean().item()))
-
-    t_values = sorted(by_t.keys())
-    if len(t_values) > 0:
-        maew_feat_by_t = torch.zeros((len(t_values), Fdim), dtype=torch.float64)
-        rell2w_feat_by_t = torch.zeros((len(t_values), Fdim), dtype=torch.float64)
-        maew_by_t = []
-        rell2w_by_t = []
-        for i, t_abs in enumerate(t_values):
-            rec = by_t[t_abs]
-            wsum = rec["wsum"]
-            if wsum <= 0:
-                maew_feat = torch.full((Fdim,), float("nan"), dtype=torch.float64)
-                rell2w_feat = torch.full((Fdim,), float("nan"), dtype=torch.float64)
-            else:
-                maew_feat = rec["mae"] / wsum
-                rell2w_feat = torch.sqrt(rec["mse"] / (rec["gt2"] + eps))
-            maew_feat_by_t[i] = maew_feat
-            rell2w_feat_by_t[i] = rell2w_feat
-            maew_by_t.append(float(maew_feat.mean().item()))
-            rell2w_by_t.append(float(rell2w_feat.mean().item()))
-    else:
-        maew_feat_by_t = None
-        rell2w_feat_by_t = None
-        maew_by_t = None
-        rell2w_by_t = None
-
-    avg_loss = total_loss_accum / max(n_steps_total, 1)
-
-    stats = {
-        "num_windows": len(loader),
-        "num_steps": n_steps_total,
-        "maew_by_rollout_step": maew_by_step,
-        "rell2w_by_rollout_step": rell2w_by_step,
-        "maew_feat_by_rollout_step": maew_feat_by_step,
-        "rell2w_feat_by_rollout_step": rell2w_feat_by_step,
-        "t_values": t_values,
-        "maew_by_t": maew_by_t,
-        "rell2w_by_t": rell2w_by_t,
-        "maew_feat_by_t": maew_feat_by_t,
-        "rell2w_feat_by_t": rell2w_feat_by_t,
-    }
-    if collect_examples:
-        stats["examples"] = examples
-    return avg_loss, stats
-'''
-
 def parent_mask_from_selected(pred_parents: torch.Tensor,
                               pred_levels: torch.Tensor,
                               H: int, W: int,
@@ -4452,42 +3501,6 @@ def parent_mask_from_selected(pred_parents: torch.Tensor,
     return m.view(H, W)
 
 
-# --- put this at top-level in train_v2.py (outside any function) ---
-def identity_collate(batch):
-    # batch is a list of length == batch_size; we use batch_size=1
-    return batch[0]
-
-'''
-def build_model_from_cfg(cfg, device):
-
-    # match how you did it in main():
-    H = int(cfg["data"].get("H", 64)); W = int(cfg["data"].get("W", 64))
-    # infer F the same way as in main (using the dataset field you used there)
-    # If you want to avoid touching data here, you can instead use len(cfg["features"]["use_columns"])
-    use_cols = cfg.get("features", {}).get("use_columns", [0,1,3])
-    F = len(use_cols)
-
-    b = cfg.get("features", {}).get("build", {})
-    in_ch  = F + (2 if b.get("use_pos", True)   else 0) + (1 if b.get("use_level", True) else 0)
-    if cfg.get("loss", {}).get("parc", False) or cfg.get("loss", {}).get("parc_inputs", False):
-        # Fdim is your state feature count (4 for your main task)
-        Fdim = int(cfg.get("features", {}).get("num_features", 4))  # or however you compute F
-        extra = dec.parc_extra_in_channels(cfg, Fdim)
-        in_ch += extra
-
-    out_ch = F
-
-    model = FeatureNet(
-        in_channels=in_ch,
-        out_channels=out_ch,
-        hidden=int(cfg.get("model", {}).get("hidden", 128)),   # must match the training cfg
-        layers=int(cfg.get("model", {}).get("layers", 3)),      # must match the training cfg
-        dropout=float(cfg.get("model", {}).get("dropout", 0.1)),
-        make_score_head=True,
-    ).to(device)
-    
-    return model
-'''
 def build_model_from_cfg(cfg, device):
     use_cols = cfg.get("features", {}).get("use_columns", [0, 1, 2, 3])
     Fdim = int(cfg.get("features", {}).get("num_features", len(use_cols)))
@@ -4615,7 +3628,6 @@ def main(config_path: str | None = None):
     #device = pick_device(cfg.get("train", {}).get("device", "auto"))
     raw_dev = cfg.get("device", "cpu")
     device = torch.device(raw_dev)
-    pre_device = torch.device("cpu")  # Pretraining steps are actually faster on CPU
     #print(f"[INFO] Using device: {device}")
     set_seed(int(cfg.get("train", {}).get("seed", 42)))
 
@@ -4666,17 +3678,11 @@ def main(config_path: str | None = None):
     opt_groups = [{"params": model.parameters(), "lr": float(cfg["train"]["lr"])}]
 
     if cfg.get("train", {}).get("interp_type", "standard") == "gnn":
-        D      = int(cfg["features"].get("num_dynamic_feats", 3))
-        phid   = int(cfg.get("interp_nn", {}).get("hidden", 256))
-        pdepth = int(cfg.get("interp_nn", {}).get("depth", 2))
-
-        prolong_head     = ProlongationHead(D, hidden=phid, depth=pdepth).to(device)
-        restriction_head = RestrictionHead(D, hidden=phid, depth=pdepth).to(device)
-        N4 = build_coarse_n4(H, W, device=device)
-
-        base_lr = float(cfg.get("interp_nn", {}).get("lr", cfg.get("optim", {}).get("lr", 1e-3)))
-        opt_groups.append({"params": prolong_head.parameters(), "lr": base_lr})
-        opt_groups.append({"params": restriction_head.parameters(), "lr": base_lr})
+        raise NotImplementedError(
+            "train.interp_type='gnn' is not available in this branch: "
+            "ProlongationHead/RestrictionHead are not defined. "
+            "Use 'standard' or 'knn', or add/import those modules first."
+        )
 
     # 2) Create optimizer with *all* groups already present
     opt = optim.AdamW(opt_groups, weight_decay=float(cfg["train"].get("weight_decay", 0.0)))
@@ -4756,15 +3762,6 @@ def main(config_path: str | None = None):
         # is_processed_file can be left None; passing raw list triggers in-memory preprocess
     )
 
-    N = len(full_ds)
-    train_frac = float(cfg["split"].get("train", 0.8))
-    val_frac = float(cfg["split"].get("val_frac", 0.1))
-    test_frac = float(cfg["split"].get("test_frac", 0.1))
-    nv = max(1, int(round(val_frac * N)))
-    nt = max(1, int(round(test_frac * N)))
-    ntr = max(1, N - nv - nt)
-
-
     T = len(full_ds)  # number of windows, not raw timesteps
     idxs = np.arange(T)
 
@@ -4777,14 +3774,9 @@ def main(config_path: str | None = None):
     # now compute split sizes
     train_frac = cfg["split"].get("train", 0.8)
     val_frac   = cfg["split"].get("val", 0.1)
-    test_frac   = cfg["split"].get("test", 0.1)
-    #test_frac  = 1.0 - train_frac - val_frac
-
     n_train = int(round(train_frac * T))
     n_val   = int(round(val_frac   * T))
     # keep the rest for test
-    n_test  = T - n_train - n_val
-
     train_idx = idxs[:n_train]
     val_idx   = idxs[n_train:n_train + n_val]
     test_idx  = idxs[n_train + n_val:]
@@ -5019,10 +4011,10 @@ def main(config_path: str | None = None):
         TR, VL
     )
 
-    # -------- qualitative PDFs on test --------
+    # -------- final test evaluation --------
     print("test_loader length:", len(test_loader))
     print("=== Running test evaluation ===")
-    test_loss, test_stats = evaluate_one_epoch_multi_step(
+    test_loss, _test_stats = evaluate_one_epoch_multi_step(
         model,
         test_loader,
         cfg,
@@ -5033,114 +4025,12 @@ def main(config_path: str | None = None):
         dy=dy,
         mu=mu,
         sigma=sigma,
-        collect_examples=True,
+        collect_examples=False,
     )
 
     print(f"[TEST] loss={test_loss:.4e}")
 
-    test_examples = test_stats["examples"] 
-    num = int(cfg.get("eval", {}).get("num_examples", -1))
-    if num < 0:
-        num = len(test_examples)
-
-    # AMR mesh triptychs (existing)
-    titles = [f"sample {e['t']}" for e in test_examples[:num]]
-
-    # Build the three mask lists in a way that respects mesh_mode
-    mesh_mode = str(cfg.get("train", {}).get("mesh_mode", "predicted")).lower()
-
-    first = test_examples[0]
-    # Build coarse parent mask for predicted L1+ refinement
-    M_pred_L1 = parent_mask_from_selected(first["pred_parents"], first["pred_levels"], H, W, min_level=1)
-
-    """
-    print("[INFO] Generating qualitative PDFs...")
-    plot_predictions_from_examples_pdf(
-        os.path.join(cfg["train"]["save_dir"], "predictions_from_examples.pdf"),
-        test_examples[:num],
-        H, W,
-        bbox=tuple(cfg.get("data", {}).get("bbox", (0.0, 1.0, 0.0, 1.0))),
-        titles=[f"sample {e['t']}" for e in test_examples[:num]],
-    )
-    """
-
-    print("[INFO] Generating 2x3 feature PDFs...")
-    # Per-sample 2×3 feature pages (GT vs Pred)
-    # Prefer selected-mesh tensors if present; otherwise fall back to coarse/fine rasters
-    feat_names = (cfg.get("features", {}) or {}).get("dataset_order")
-    def _names_for(T, names):
-        if not names: return None
-        F = T.size(1) if (T is not None and hasattr(T, "size")) else len(names)
-        return names[:F]
-
-    for i, e in enumerate(test_examples[:num]):
-        out_pdf = os.path.join(cfg["train"]["save_dir"], f"qual_2x3_sample_{i:03d}.pdf")
-        title = titles[i]
-
-        # Preferred: selected-mesh values provided by evaluate_mesh_first
-        has_selected = all(k in e for k in (
-            "centers_selected", "levels_selected",
-            "gt_selected_t", "gt_selected_tp1", "pred_selected_tp1"
-        ))
-
-        # Optional: use domain bbox from cfg if you have it
-        bbox = tuple(cfg["data"]["bbox"]) if "data" in cfg and "bbox" in cfg["data"] else Non
-
-    out_pdf = os.path.join(cfg["train"]["save_dir"], "qual_with_deltas.pdf")
-    feature_names = cfg.get("features", {}).get("names", ["U", "V", "E"])
-    '''
-    print(f"[INFO] Generating qualitative PDF with deltas: {out_pdf}")
-    #for ex in test_examples:
-    #    print("t: ", int(ex["t"]))
-
-    plot_qual_pdf(
-        examples=test_examples,
-        cfg=cfg,
-        out_pdf_path=out_pdf,
-        feature_names=feature_names,
-        unify_clims=False,
-        dpi=150,
-        rasterize=True,
-        colorbars="row",
-    )
-    '''
-    # This is very computionally heavy; use only if needed
-    """
-    plot_qual_2x3_pdf_with_cells(
-        examples=test_examples,
-        cfg=cfg,
-        out_pdf_path=out_pdf,
-        feature_names=feature_names,
-        unify_clims=False,  # set True if you want global color limits across all pages
-    )
-    """
-    """
-    proj_titles = [f"sample {e['t']} [{mesh_mode}]" for e in test_examples[:num]]
-
-    # use selected-mesh outputs so resolution matches the mesh (H×W or 2H×2W)
-    centers_list = [e["centers_selected"]   for e in test_examples[:num]]
-    levels_list  = [e["levels_selected"]    for e in test_examples[:num]]
-    pred_list    = [e["pred_selected_tp1"]  for e in test_examples[:num]]
-
-    feat_names = (cfg.get("features", {}) or {}).get("dataset_order")
-    proj_pdf = os.path.join(cfg["train"]["save_dir"], "pred_x_projection.pdf")
-
-    # bbox for labeling (falls back to [0,1]×[0,1] if not provided)
-    bbox = tuple(cfg.get("data", {}).get("bbox", (0.0, 1.0, 0.0, 1.0)))
-    
-    plot_pred_projection_x_pdf(
-        proj_pdf,
-        centers_list, levels_list, pred_list,
-        H, W,
-        titles=proj_titles,
-        feature_names=feat_names,
-        bbox=bbox,
-        reduction="sum",       # "mean" or "sum"
-        max_features=3
-    )
-    """
-
-    # Save config file                                                                                                                                                        
+    # Save config file
     save_config(os.path.join(cfg["train"]["save_dir"]), cfg)
                 
 if __name__ == "__main__":
@@ -5150,4 +4040,3 @@ if __name__ == "__main__":
     args = ap.parse_args()
     print("Running main...", flush=True)
     main(args.config)
-

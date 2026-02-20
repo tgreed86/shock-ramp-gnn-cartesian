@@ -1,7 +1,6 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-import torch.nn as nn
 from torch_geometric.nn import GATConv, GraphUNet
 from torch_geometric.nn import SAGEConv
 import inspect
@@ -50,186 +49,6 @@ class FeatureNet(nn.Module):
         y_feat = self.feat_head(h)
         y_score = self.score_head(h) if self.score_head is not None else None
         return y_feat, y_score, h
-
-'''
-class FeatureNet(nn.Module):
-    def __init__(self, in_channels, out_channels=3, hidden=128, layers=3, dropout=0.1,
-                 make_score_head=True, use_residual=True, use_norm=True):
-        super().__init__()
-        self.dropout = dropout
-        self.use_residual = use_residual
-        self.use_norm = use_norm
-
-        dims = [in_channels] + [hidden] * (layers - 1)
-        self.convs = nn.ModuleList([SAGEConv(dims[i], dims[i+1]) for i in range(len(dims)-1)])
-
-        # Projection for the first residual addition (only needed if in_channels != hidden)
-        self.in_proj = nn.Linear(in_channels, hidden) if in_channels != hidden else nn.Identity()
-
-        # LayerNorm per conv output (all convs output "hidden" except possibly the first,
-        # but dims[i+1] is hidden for all convs in your construction when layers>=2)
-        if use_norm:
-            self.norms = nn.ModuleList([nn.LayerNorm(hidden) for _ in range(len(self.convs))])
-        else:
-            self.norms = None
-
-        self.feat_head = nn.Sequential(
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, out_channels)
-        )
-
-        self.score_head = None
-        if make_score_head:
-            self.score_head = nn.Sequential(
-                nn.Linear(hidden, hidden//2),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden//2, 1)
-            )
-
-    def forward(self, X, edge_index):
-        h = X
-        for i, conv in enumerate(self.convs):
-            h_in = h
-
-            h = conv(h, edge_index)
-
-            # Normalize before nonlinearity (common “pre-activation” style)
-            if self.use_norm:
-                h = self.norms[i](h)
-
-            h = F.relu(h)
-            h = F.dropout(h, p=self.dropout, training=self.training)
-
-            if self.use_residual:
-                # First residual needs projection if dimensions differ
-                if i == 0:
-                    h = h + self.in_proj(h_in)
-                else:
-                    h = h + h_in
-
-        y_feat = self.feat_head(h)
-        y_score = self.score_head(h) if self.score_head is not None else None
-        return y_feat, y_score, h
-'''
-'''
-def _make_mlp(
-    in_dim: int,
-    hidden_dim: int,
-    out_dim: int,
-    depth: int,
-    dropout: float,
-) -> nn.Sequential:
-    """
-    Builds an MLP with `depth` hidden layers:
-      (Linear -> ReLU -> Dropout) * depth, then final Linear to out_dim.
-
-    If depth == 0: returns a single Linear(in_dim, out_dim).
-    """
-    layers: list[nn.Module] = []
-    d = in_dim
-    for _ in range(depth):
-        layers.append(nn.Linear(d, hidden_dim))
-        layers.append(nn.ReLU())
-        layers.append(nn.Dropout(dropout))
-        d = hidden_dim
-    layers.append(nn.Linear(d, out_dim))
-    return nn.Sequential(*layers)
-
-
-class FeatureNet(nn.Module):
-    """
-    GraphSAGE encoder with:
-      - Residual connections + LayerNorm per message-passing layer
-      - Deeper (pointwise) MLP head(s) to increase capacity without adding more message passing
-
-    Notes on depth:
-      - Message passing depth is controlled by `mp_steps` (preferred), or by legacy `layers`
-        (where mp_steps defaults to max(layers - 1, 1) to preserve your current behavior).
-      - Head depth is controlled by `feat_head_depth` / `score_head_depth`.
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int = 3,
-        hidden: int = 128,
-        layers: int = 3,                 # legacy: mp_steps defaults to layers-1
-        dropout: float = 0.1,
-        make_score_head: bool = True,
-        mp_steps: int | None = None,     # preferred: number of SAGEConv layers
-        feat_head_depth: int = 3,        # number of hidden layers in feat head MLP
-        score_head_depth: int = 2,       # number of hidden layers in score head MLP
-        score_head_hidden: int | None = None,  # internal width for score head; default hidden//2
-    ):
-        super().__init__()
-        self.dropout = dropout
-
-        # --- message passing depth ---
-        self.mp_steps = int(mp_steps) if mp_steps is not None else max(int(layers) - 1, 1)
-
-        # --- GraphSAGE conv stack ---
-        self.convs = nn.ModuleList()
-        self.norms = nn.ModuleList()
-
-        # First conv: in_channels -> hidden
-        self.convs.append(SAGEConv(in_channels, hidden))
-        self.norms.append(nn.LayerNorm(hidden))
-
-        # Remaining convs: hidden -> hidden
-        for _ in range(self.mp_steps - 1):
-            self.convs.append(SAGEConv(hidden, hidden))
-            self.norms.append(nn.LayerNorm(hidden))
-
-        # Projection needed for the first residual (in_channels -> hidden)
-        self.in_proj = nn.Linear(in_channels, hidden) if in_channels != hidden else nn.Identity()
-
-        # --- Deeper MLP head(s) (pointwise; no neighbor mixing) ---
-        self.feat_head = _make_mlp(
-            in_dim=hidden,
-            hidden_dim=hidden,
-            out_dim=out_channels,
-            depth=int(feat_head_depth),
-            dropout=dropout,
-        )
-
-        self.score_head = None
-        if make_score_head:
-            sh = int(score_head_hidden) if score_head_hidden is not None else max(hidden // 2, 1)
-            self.score_head = _make_mlp(
-                in_dim=hidden,
-                hidden_dim=sh,
-                out_dim=1,
-                depth=int(score_head_depth),
-                dropout=dropout,
-            )
-
-    def forward(self, X: torch.Tensor, edge_index: torch.Tensor):
-        h = X
-
-        for i, conv in enumerate(self.convs):
-            h_in = h
-
-            # Message passing
-            h = conv(h, edge_index)
-
-            # LayerNorm -> ReLU -> Dropout (pre-activation style)
-            h = self.norms[i](h)
-            h = F.relu(h)
-            h = F.dropout(h, p=self.dropout, training=self.training)
-
-            # Residual / skip connection
-            if i == 0:
-                h = h + self.in_proj(h_in)
-            else:
-                h = h + h_in
-
-        y_feat = self.feat_head(h)
-        y_score = self.score_head(h) if self.score_head is not None else None
-        return y_feat, y_score, h
-'''
 
 class FeatureExtractorGNN(nn.Module):
     """
@@ -425,18 +244,6 @@ class GPARCCompat(nn.Module):
         self.global_embed_dim = int(global_embed_dim)
 
         # 1) per-node static encoder (GraphUNet + attention)
-        '''
-        self.feature_extractor = FeatureExtractorGNN(
-            in_channels=in_static,
-            hidden_channels=feat_hidden,
-            out_channels=feature_out,
-            depth=feat_depth,
-            pool_ratios=feat_pool,
-            heads=feat_heads,
-            concat=True,
-            dropout=feat_dropout,
-        )
-        '''
         self.feature_extractor = MPSFeatureExtractor(
             in_channels=in_static,
             hidden_channels=feat_hidden,
@@ -470,28 +277,7 @@ class GPARCCompat(nn.Module):
             dropout=integ_dropout,
             use_residual=integ_residual,
         )
-    '''
-    def forward(self, x_static: torch.Tensor, x_dyn: torch.Tensor, edge_index: torch.Tensor, g: torch.Tensor | None = None):
-        # Feature embedding from static geometry
-        z = self.feature_extractor(x_static, edge_index)  # [N, feature_out]
 
-        if self.global_embed_dim > 0 and g is not None:
-            if g.dim() == 1: g = g[None, :]  # [1, G]
-            g = g.expand(z.size(0), -1)      # naive broadcast
-            h_in = torch.cat([z, x_dyn, g], dim=-1)
-        else:
-            h_in = torch.cat([z, x_dyn], dim=-1)
-
-        dstate = self.derivative(h_in, edge_index)       # [N, D]
-        delta  = self.integrator(dstate, edge_index)     # [N, D]
-
-        if self.use_delta:
-            x_pred = x_dyn + delta                       # semi-implicit
-        else:
-            x_pred = delta                               # absolute state
-
-        return x_pred
-    '''
     def forward(
         self,
         x_static: torch.Tensor,
@@ -579,93 +365,6 @@ def build_model(cfg: Dict[str, Any], in_dim: int, out_dim: int):
 
 # Back-compat alias some training scripts use
 make_model = build_model
-
-'''
-class GPARCCompat(nn.Module):
-    """
-    Wraps FeatureExtractorGNN, DerivativeGNN, IntegralGNN into a single nn.Module.
-
-    forward(x_static [N,S], x_dyn [N,D], edge_index [2,E]) -> x_pred [N,D]
-    If use_delta=True, returns x_dyn + Δ; else returns absolute state.
-    """
-    def __init__(
-        self,
-        in_static: int,
-        in_dynamic: int,
-        feature_out: int = 128,
-        feat_hidden: int = 64,
-        feat_depth: int = 2,
-        feat_pool: float = 0.1,
-        feat_heads: int = 4,
-        feat_dropout: float = 0.2,
-        deriv_hidden: int = 128,
-        deriv_layers: int = 4,
-        deriv_heads: int = 8,
-        deriv_dropout: float = 0.3,
-        deriv_residual: bool = True,
-        integ_hidden: int = 128,
-        integ_layers: int = 4,
-        integ_heads: int = 8,
-        integ_dropout: float = 0.3,
-        integ_residual: bool = True,
-        use_delta: bool = True,
-        global_embed_dim: int = 0,    # bump later if you add a global embedding
-    ):
-        super().__init__()
-        self.use_delta = bool(use_delta)
-        self.in_dynamic = int(in_dynamic)
-        self.global_embed_dim = int(global_embed_dim)
-
-        # 1) static geometry encoder
-        self.feature_extractor = FeatureExtractorGNN(
-            in_channels=in_static,
-            hidden_channels=feat_hidden,
-            out_channels=feature_out,
-            depth=feat_depth,
-            pool_ratios=feat_pool,
-            heads=feat_heads,
-            concat=True,
-            dropout=feat_dropout,
-        )
-
-        # 2) derivative solver operates on [static_embed || x_dyn (|| g_embed)]
-        deriv_in = feature_out + in_dynamic + self.global_embed_dim
-        self.derivative = DerivativeGNN(
-            in_channels=deriv_in,
-            hidden_channels=deriv_hidden,
-            out_channels=in_dynamic,
-            num_layers=deriv_layers,
-            heads=deriv_heads,
-            concat=True,
-            dropout=deriv_dropout,
-            use_residual=deriv_residual,
-        )
-
-        # 3) integrator maps derivative to Δ (or absolute)
-        self.integrator = IntegralGNN(
-            in_channels=in_dynamic,
-            hidden_channels=integ_hidden,
-            out_channels=in_dynamic,
-            num_layers=integ_layers,
-            heads=integ_heads,
-            concat=True,
-            dropout=integ_dropout,
-            use_residual=integ_residual,
-        )
-
-    def forward(self, x_static: torch.Tensor, x_dyn: torch.Tensor, edge_index: torch.Tensor, g: torch.Tensor | None = None):
-        z = self.feature_extractor(x_static, edge_index)     # [N, feature_out]
-        if self.global_embed_dim > 0 and g is not None:
-            if g.dim() == 1: g = g[None, :]
-            g = g.expand(z.size(0), -1)
-            h = torch.cat([z, x_dyn, g], dim=-1)
-        else:
-            h = torch.cat([z, x_dyn], dim=-1)
-
-        dstate = self.derivative(h, edge_index)              # [N, D]
-        delta  = self.integrator(dstate, edge_index)         # [N, D]
-        return x_dyn + delta if self.use_delta else delta
-'''
 
 
 class ParcFeatureAdapter(nn.Module):
@@ -808,5 +507,4 @@ class ParcFeatureAdapter(nn.Module):
                 "adv":  float(torch.sigmoid(self.gate_adv_logit).detach().cpu()),
                 "diff": float(torch.sigmoid(self.gate_diff_logit).detach().cpu()),
             }
-
 

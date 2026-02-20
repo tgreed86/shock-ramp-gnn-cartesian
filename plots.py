@@ -16,8 +16,8 @@ import torch
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.patches import Rectangle
-from matplotlib.collections import LineCollection, PatchCollection, PolyCollection
-import os, math, copy
+from matplotlib.collections import PatchCollection, PolyCollection
+import os, copy
 from utils_geom import build_idw_map, apply_idw_map, _targeted_map_to_pred
 
 
@@ -134,6 +134,10 @@ def _subplot_field(ax, field, H, W, title, vmin=None, vmax=None):
     ax.set_xlabel("x"); ax.set_ylabel("y")
     return im
 
+def _empty_panel(ax, label: str):
+    ax.set_axis_off()
+    ax.text(0.5, 0.5, label, ha="center", va="center", transform=ax.transAxes)
+
 def _subplot_delta_field(ax, Z, H, W, title="", vmin=None, vmax=None, cmap="RdBu_r"):
     Z2d = Z.view(H, W).detach().cpu().numpy()
     if vmin is None or vmax is None:
@@ -174,7 +178,7 @@ def rasterize_piecewise_constant(
     level = torch.as_tensor(level, dtype=torch.long, device="cpu")
     ij = torch.as_tensor(ij, dtype=torch.long, device="cpu")
 
-    N, F = int(x.shape[0]), int(x.shape[1])
+    F = int(x.shape[1])
     Hf, Wf = H * (2 ** L_out), W * (2 ** L_out)
     out = np.zeros((Hf, Wf, F), dtype=np.float32)
 
@@ -406,8 +410,6 @@ def _rasterize_selected_mesh_to_grid(
     C = int(values.shape[1]) if values.dim() == 2 else 1
     vals = values if values.dim() == 2 else values.view(N, 1)
 
-    device = vals.device
-    #img = torch.zeros((HH, WW, C), device=device, dtype=vals.dtype)
     img = torch.full((HH, WW, C), torch.nan, device=vals.device, dtype=vals.dtype)
 
     # Map centers to finest-grid integer pixel coords
@@ -1321,9 +1323,6 @@ def plot_qual_2x3_pdf_with_cells(
 
             # ---- figure ----
             F = gt_t_feats.shape[1]
-            gt_t_xy   = gt_t_centers.detach().cpu().numpy()
-            pred_xy   = pred_centers.detach().cpu().numpy()
-            gt_tp1_xy = gt_tp1_centers.detach().cpu().numpy()
 
             for f in range(F):
                 fig, ax = plt.subplots(2, 3, figsize=(12, 8), constrained_layout=True)
@@ -1742,8 +1741,4 @@ def _recover_parent_mask(ex: dict, H: int, W: int) -> torch.Tensor:
     if torch.is_tensor(mp):
         return mp.to(torch.bool).view(H, W)
     return torch.ones((H, W), dtype=torch.bool)
-
-
-
-
 

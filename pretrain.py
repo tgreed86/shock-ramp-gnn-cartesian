@@ -3,28 +3,23 @@
 # ------------------------------
 # ---- rollout_precompute.py ----
 from __future__ import annotations
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any
 import os, json, hashlib, torch
-from torch.utils.data import DataLoader
-from tqdm import tqdm
 import numpy as np
 import h5py
 import matplotlib.pyplot as plt
 from matplotlib.path import Path
 from matplotlib.collections import LineCollection
-import torch.nn.functional as F
-from utils.extract_dmr_boundaries import build_amr_mesh_for_wedge, plot_amr_mesh
+from utils.extract_dmr_boundaries import build_amr_mesh_for_wedge
 
 from amr_policy import (
     predict_masks_hierarchical_from_gt_gradients, 
     _parents_from_level_ij,
-    coarse_aggregate_from_dynamic
 )
 from utils_geom import (
     dynamic_cells_from_parent_masks,
     _targeted_map_to_pred,
     parents_from_pos, build_idw_map,
-    apply_idw_map
 )
 from utils.precomp_h5 import precomp_h5_is_usable
 
@@ -84,8 +79,6 @@ def plot_precomputed_mesh_from_h5(
             raise RuntimeError(f"H5 file missing 'meta' group: {h5_path}")
 
         meta = f["meta"].attrs
-        H = int(meta["H"])
-        W = int(meta["W"])
         dx = float(meta["dx"])
         dy = float(meta["dy"])
         bbox = np.asarray(meta["bbox"], dtype=np.float64).reshape(-1)
@@ -294,8 +287,6 @@ def plot_precomputed_mesh_with_edges_from_h5(
             raise RuntimeError(f"H5 file missing 'meta' group: {h5_path}")
 
         meta = f["meta"].attrs
-        H = int(meta["H"])
-        W = int(meta["W"])
         dx0 = float(meta["dx"])
         dy0 = float(meta["dy"])
         bbox = np.asarray(meta["bbox"], dtype=np.float64).reshape(-1)
@@ -600,7 +591,6 @@ def _normalize_builder_output_to_mesh(
             parents = parents[:, 1] * W + parents[:, 0]
         parents = parents.view(-1)
 
-        '''
         if ei is not None:
             ei = _as_tensor(ei).to(torch.int64).to(device)
         else:
@@ -609,22 +599,6 @@ def _normalize_builder_output_to_mesh(
                 k_local=int(cfg.get("edges", {}).get("k_local", 4)),
                 max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
             ).to(device)
-        '''
-        if ei is not None:
-            ei = _as_tensor(ei).to(torch.int64).to(device)
-        else:
-            if use_face:
-                ei = build_amr_face_adjacency_edges(
-                    centers, levels, H, W,
-                    bbox=bbox,
-                    return_edge_attr=True,
-                ).to(device)
-            else:
-                ei = build_amr_local_knn_edges(
-                    centers, parents, H, W,
-                    k_local=int(cfg.get("edges", {}).get("k_local", 4)),
-                    max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
-                ).to(device)
         if mask_parent is None:
             mask_parent = _mask_from_parents(parents, H, W).to(device)
         else:
@@ -632,70 +606,6 @@ def _normalize_builder_output_to_mesh(
 
         return centers, levels, parents, ei, mask_parent
 
-    # ----------------------------------------
-    # Case C: list-of-cells (len is large)
-    # ----------------------------------------
-    '''
-    if isinstance(out, (tuple, list)) and len(out) > 5:
-        cells = out
-
-        # Heuristic parse: each entry is either dict-like or tuple-like.
-        c_list = []
-        l_list = []
-        p_list = []
-
-        first = cells[0]
-        # dict-like per cell
-        if isinstance(first, dict):
-            # common per-cell key aliases
-            center_keys = ("center", "centers", "pos", "xy", "c", "center_xy")
-            level_keys  = ("level", "lvl", "L", "ref_level")
-            parent_keys = ("parent", "parent_flat", "parent_idx", "p", "coarse_parent", "parent_ij")
-
-            def _pick_cell(d, keys):
-                for k in keys:
-                    if k in d:
-                        return d[k]
-                return None
-
-            for d in cells:
-                c = _pick_cell(d, center_keys)
-                l = _pick_cell(d, level_keys)
-                p = _pick_cell(d, parent_keys)
-
-                if c is None or l is None:
-                    raise RuntimeError(
-                        f"Cell dict missing center/level. First cell keys={list(first.keys())}"
-                    )
-
-                c_list.append(_as_tensor(c, torch.float32).view(2))
-                l_list.append(int(_as_tensor(l).item()))
-
-                if p is None:
-                    p_list.append(None)
-                else:
-                    pt = _as_tensor(p)
-                    # allow parent as ij pair
-                    if pt.numel() == 2:
-                        p_list.append((int(pt.view(-1)[0].item()), int(pt.view(-1)[1].item())))
-                    else:
-                        p_list.append(int(pt.item()))
-
-        else:
-            # tuple-like per cell: we assume (center, level, parent?) in first 2-3 slots
-            for item in cells:
-                if not isinstance(item, (tuple, list)) or len(item) < 2:
-                    raise RuntimeError(
-                        f"Cannot parse list-of-cells; element type={type(item)} len={len(item) if hasattr(item,'__len__') else 'NA'}"
-                    )
-                c = item[0]
-                l = item[1]
-                p = item[2] if len(item) >= 3 else None
-
-                c_list.append(_as_tensor(c, torch.float32).view(2))
-                l_list.append(int(_as_tensor(l).item()))
-                p_list.append(None if p is None else int(_as_tensor(p).item()))
-        '''
     # Case: builder returned a list of per-cell dicts (common for wedge mesh builders)
     if isinstance(out, (list, tuple)) and len(out) > 0 and isinstance(out[0], dict):
         first = out[0]
@@ -712,7 +622,6 @@ def _normalize_builder_output_to_mesh(
         ii     = torch.as_tensor([c["i"]     for c in out], dtype=torch.int64, device=device).view(-1)
         jj     = torch.as_tensor([c["j"]     for c in out], dtype=torch.int64, device=device).view(-1)
 
-        bbox = tuple(cfg["data"]["bbox"])
         centers = _centers_from_level_ij(
             levels, ii, jj, H=H, W=W, bbox=bbox, device=device
         ).to(dtype=torch.float32)
@@ -727,8 +636,7 @@ def _normalize_builder_output_to_mesh(
         # Coarse mask
         mask_parent = _mask_from_parents(parents, H, W).to(device=device, dtype=torch.bool)
 
-        # Edge index: if you don't have one from the builder, rebuild local edges
-        '''
+        # If no explicit edge list is provided by the builder, rebuild local edges.
         edge_index = build_amr_local_knn_edges(
             centers,
             parents,
@@ -737,60 +645,8 @@ def _normalize_builder_output_to_mesh(
             k_local=int(cfg.get("edges", {}).get("k_local", 4)),
             max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
         ).to(device=device, dtype=torch.int64)
-        '''
-        if edge_index.numel() == 0 or edge_index.size(1) == 0:
-            if use_face:
-                edge_index = build_amr_face_adjacency_edges(
-                    centers, levels, H, W,
-                    bbox=bbox,
-                    return_edge_attr=True,
-                )
-            else:
-                edge_index = build_amr_local_knn_edges(
-                    centers,
-                    parents,
-                    H, W,
-                    k_local=int(cfg.get("edges", {}).get("k_local", 4)),
-                    max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
-                )
 
         return centers, levels, parents, edge_index, mask_parent
-
-
-        centers = torch.stack([t.to(device) for t in c_list], dim=0).to(torch.float32)
-        levels  = torch.tensor(l_list, device=device, dtype=torch.int64)
-
-        # parents: if missing, compute from centers; else normalize and flatten ij if needed
-        if all(p is None for p in p_list):
-            parents = parents_from_pos(centers, H, W, xmin, xmax, ymin, ymax).to(device).to(torch.int64)
-        else:
-            # mix of flat ints and (i,j) tuples
-            parents_arr = []
-            for p in p_list:
-                if p is None:
-                    parents_arr.append(-1)
-                elif isinstance(p, tuple) and len(p) == 2:
-                    i, j = p
-                    parents_arr.append(j * W + i)
-                else:
-                    parents_arr.append(int(p))
-            parents = torch.tensor(parents_arr, device=device, dtype=torch.int64)
-
-            # if -1 present (shouldn’t for active cells), replace via centers-based parents
-            bad = parents < 0
-            if bad.any():
-                parents2 = parents_from_pos(centers, H, W, xmin, xmax, ymin, ymax).to(device).to(torch.int64)
-                parents = torch.where(bad, parents2, parents)
-
-        # edges + mask
-        ei = build_amr_local_knn_edges(
-            centers, parents, H, W,
-            k_local=int(cfg.get("edges", {}).get("k_local", 4)),
-            max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
-        ).to(device)
-
-        mask_parent = _mask_from_parents(parents, H, W).to(device)
-        return centers, levels, parents, ei, mask_parent
 
     raise RuntimeError(f"Unsupported builder return type: {type(out)}")
 
@@ -1156,83 +1012,6 @@ def _build_starting_mesh_from_spec(
 
     # Call it. IMPORTANT: do not fall back to fn(mesh_spec_path).
     out = fn(**kwargs) if kwargs else fn(spec)
-    '''
-    # --- normalize output to centers/levels/parents/edge_index ---
-    centers = levels = parents = edge_index = mask_parent = None
-
-    if isinstance(out, dict):
-        def pick(*names):
-            for n in names:
-                if n in out and out[n] is not None:
-                    return out[n]
-            return None
-        centers = pick("centers", "pred_centers", "pos")
-        levels  = pick("levels", "pred_levels", "level")
-        parents = pick("parents", "pred_parents", "parent", "parent_flat")
-        edge_index = pick("edge_index", "pred_ei", "ei")
-        mask_parent = pick("mask_parent", "mask", "mask_parent_hw")
-    elif isinstance(out, (tuple, list)):
-        if len(out) == 4:
-            centers, levels, parents, edge_index = out
-        elif len(out) == 5:
-            centers, levels, parents, edge_index, mask_parent = out
-        else:
-            raise RuntimeError(f"Unexpected tuple/list return from build_amr_mesh_for_wedge: len={len(out)}")
-    else:
-        raise RuntimeError(f"Unexpected return type from build_amr_mesh_for_wedge: {type(out)}")
-
-    if centers is None or levels is None:
-        raise RuntimeError(
-            "build_amr_mesh_for_wedge did not return centers/levels in a recognizable format. "
-            "Please print(type(out), out.keys()) once and I’ll adapt the pick list."
-        )
-
-    centers = centers if torch.is_tensor(centers) else torch.as_tensor(centers)
-    levels  = levels  if torch.is_tensor(levels)  else torch.as_tensor(levels)
-    centers = centers.to(device=device, dtype=torch.float32)
-    levels  = levels.to(device=device, dtype=torch.int64).view(-1)
-
-    # parents -> flat coarse parent indices
-    if parents is None:
-        xmin, xmax, ymin, ymax = bbox
-        parents = parents_from_pos(centers, H, W, xmin, xmax, ymin, ymax)
-    parents = parents if torch.is_tensor(parents) else torch.as_tensor(parents)
-    parents = parents.to(device=device, dtype=torch.int64).view(-1)
-
-    if parents.ndim == 2 and parents.size(1) == 2:
-        # (i,j) -> flat
-        parents = parents[:, 1] * W + parents[:, 0]
-        parents = parents.to(device=device, dtype=torch.int64).view(-1)
-
-    # edges
-    if edge_index is None:
-        edge_index = torch.empty((2, 0), dtype=torch.int64, device=device)
-    else:
-        edge_index = edge_index if torch.is_tensor(edge_index) else torch.as_tensor(edge_index)
-        edge_index = edge_index.to(device=device, dtype=torch.int64)
-        if edge_index.ndim != 2 or edge_index.size(0) != 2:
-            raise RuntimeError(f"edge_index must be (2,E); got {tuple(edge_index.shape)}")
-
-    # if edges are empty, build local edges
-    if edge_index.numel() == 0 or edge_index.size(1) == 0:
-        edge_index = build_amr_local_knn_edges(
-            centers,
-            parents,
-            H,
-            W,
-            k_local=int(cfg.get("edges", {}).get("k_local", 4)),
-            max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
-        )
-
-    # mask
-    if mask_parent is None:
-        mask_parent = _mask_from_parents(parents, H, W)
-    else:
-        mask_parent = mask_parent if torch.is_tensor(mask_parent) else torch.as_tensor(mask_parent)
-        mask_parent = mask_parent.to(device=device).view(H, W).to(torch.bool)
-
-    return centers, levels, parents, edge_index, mask_parent
-    '''
     # --- normalize any builder output into the canonical mesh tensors ---
     centers, levels, parents, edge_index, mask_parent = _normalize_builder_output_to_mesh(
         out,
@@ -1779,17 +1558,6 @@ def _build_pred_mesh_from_gt_gradients(
     # -------------------------------
     # 6. Ensure edges exist
     # -------------------------------
-    '''
-    if (not torch.is_tensor(pred_ei)) or pred_ei.numel() == 0:
-        pred_ei = build_amr_local_knn_edges(
-            pred_centers,
-            parent_flat,
-            H,
-            W,
-            k_local=int(cfg.get("edges", {}).get("k_local", 4)),
-            max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
-        )
-    '''
     edge_method = str(cfg.get("edges", {}).get("method", "knn")).lower()
     #print(f"[precompute] building pred_ei using method='{edge_method}'")
     if ("face" in edge_method):
@@ -1837,7 +1605,6 @@ def _map_gt_on_pred_mesh_once(
 ):
 
     src_feats = src_feats.to(device)
-    Xc = coarse_aggregate_from_dynamic(src_feats, parents_src, H, W)
     feat_on_pred, _stat = _targeted_map_to_pred(
         pred_centers=pred_centers,
         pred_levels=pred_levels,
@@ -1882,7 +1649,6 @@ def _load_wedge_path_from_spec(mesh_spec_path: str, cfg: Dict[str, Any]):
     rather than relying on spec["left"/"right"/"bottom"/"top"].
     """
     import numpy as np
-    from matplotlib.path import Path
 
     if mesh_spec_path is None:
         raise ValueError("mesh_spec_path is None in _load_wedge_path_from_spec")
@@ -2036,13 +1802,13 @@ def _clip_pred_mesh_to_wedge(
         )
 
     # ---------- Step 4: rebuild edges + mask ----------
-    k_local   = int(cfg.get("edges", {}).get("knn_k", 4))
+    k_local   = int(cfg.get("edges", {}).get("k_local", 4))
     max_local = int(cfg.get("edges", {}).get("max_local", 2048))
 
     edge_method = str(cfg.get("edges", {}).get("method", "amr_local_knn")).lower()
 
     if ("face" in edge_method):
-        pred_ei, pred_ea = build_amr_face_adjacency_edges(
+        pred_ei, _pred_ea = build_amr_face_adjacency_edges(
             pred_centers,
             pred_levels,
             H,
@@ -2051,27 +1817,16 @@ def _clip_pred_mesh_to_wedge(
             return_edge_attr=True,
         )
         pred_ei = pred_ei.to(dev, dtype=torch.long)
-        pred_ea = pred_ea.to(dev, dtype=torch.float32)
+        _pred_ea = _pred_ea.to(dev, dtype=torch.float32)
     else:
         pred_ei = build_amr_local_knn_edges(
             pred_centers,
             parent_flat,
             H,
             W,
-            k_local=int(cfg.get("edges", {}).get("k_local", 4)),
-            max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
+            k_local=k_local,
+            max_local=max_local,
         ).to(dev, dtype=torch.long)
-    '''
-    pred_ei = build_amr_local_knn_edges(
-        pred_centers,
-        parent_flat,
-        H,
-        W,
-        k_local=k_local,
-        max_local=max_local,
-    ).to(dev, dtype=torch.long)
-    '''
-
     if pred_ei.numel() == 0 or int(pred_ei.shape[1]) == 0:
         raise RuntimeError("Empty edge_index after wedge clipping/refinement.")
 
@@ -2108,382 +1863,6 @@ def debug_print_precomp_h5_meta(path: str):
             ks = sorted(list(f["steps"].keys()))
             print("[DEBUG H5] /steps first/last:", ks[:3], ks[-3:])
 
-'''
-@torch.no_grad()
-def precompute_pred_mesh_and_interps_for_rollout(
-    steps: List[Dict[str, torch.Tensor]],
-    cfg: Dict[str, Any],
-    H: int,
-    W: int,
-    dx: float,
-    dy: float,
-    device: str = "cpu",
-    progress: bool = True,
-    cache_path: str | None = None,
-    force_recompute: bool = False,
-):
-    """
-    Stream precompute outputs to ONE HDF5 file (no in-memory accumulation).
-
-    For each absolute time t = 0..T-2:
-      1) Predict mesh at t+1 via _build_pred_mesh_from_gt_gradients(...)
-      2) Clip predicted mesh to wedge via _clip_pred_mesh_to_wedge(...)
-      3) Interpolate GT(t)   -> pred(t+1)  (saved at group for dst=t+1)
-      4) Interpolate GT(t+1) -> pred(t+1)  (saved at group for dst=t+1)
-
-    Second pass:
-      - For t = 1..T-2, compute pred→pred IDW maps from pred(t) -> pred(t+1),
-        and store them in group t as:
-          pred2pred_idx_to_next  (int32) shape (N_{t+1}, k)
-          pred2pred_w_to_next    (float16) shape (N_{t+1}, k)
-
-    Output file structure:
-      /meta
-        attrs: H, W, dx, dy, bbox, T, cfg_sha1
-        dataset: cfg_json
-      /t00001
-        pred_centers                 float32 [N,2]
-        pred_levels                  int16   [N]
-        pred_parents                 int32   [N]
-        pred_ei                      int32   [2,E]
-        mask_pred_parent_flat_u8     uint8   [H*W]
-        feat_t_on_pred               float32 [N,F]
-        feat_tp1_on_pred             float32 [N,F]
-      ...
-      /t00010
-        (same as above)
-      /t00001
-        pred2pred_idx_to_next        int32   [N_{2},k]   # mapping pred(1)->pred(2)
-        pred2pred_w_to_next          float16 [N_{2},k]
-      ...
-
-    Returns a lightweight handle dict, not the full tensors:
-      {"type":"h5","path":..., "T":T, "H":H, "W":W, "dx":dx, "dy":dy, "bbox":bbox}
-    """
-    try:
-        import h5py
-    except ImportError as e:
-        raise ImportError("This streaming mode requires h5py. Install with: pip install h5py") from e
-
-    def _cfg_sha1(_cfg: dict) -> str:
-        s = json.dumps(_cfg, sort_keys=True, default=str).encode("utf-8")
-        return hashlib.sha1(s).hexdigest()
-
-    def _h5_is_usable(path: str, cfg: dict, expected_T: int) -> bool:
-        if not os.path.exists(path):
-            return False
-        try:
-            with h5py.File(path, "r") as f:
-                if "meta" not in f:
-                    return False
-                #sha = f["meta"].attrs.get("cfg_sha1", None)
-                #if sha != _cfg_sha1(cfg):
-                #    return False
-                T_in = int(f["meta"].attrs.get("T", -1))
-                if T_in != int(expected_T):
-                    print("[H5 CHECK] reject: cfg hash mismatch or missing groups")
-                    return False
-                # require that all predicted-step groups exist: 1..T-1
-                for t in range(1, expected_T):
-                    if f"t{t:05d}" not in f:
-                        print("[H5 CHECK] reject: cfg hash mismatch or missing groups")
-                        return False
-                return True
-        except Exception:
-            print("[H5 CHECK] reject: cfg hash mismatch or missing groups")
-            return False
-
-    def _ensure_group(f: "h5py.File", t: int):
-        gname = f"t{int(t):05d}"
-        if gname in f:
-            return f[gname]
-        return f.create_group(gname)
-
-    def _write_ds(g, name: str, arr: np.ndarray, *, compress=True):
-        if name in g:
-            del g[name]
-        kwargs = {}
-        if compress:
-            kwargs = dict(compression="gzip", compression_opts=4, shuffle=True, chunks=True)
-        g.create_dataset(name, data=arr, **kwargs)
-
-    def _to_np(x: torch.Tensor, dtype=None) -> np.ndarray:
-        a = x.detach().cpu().numpy()
-        if dtype is not None:
-            a = a.astype(dtype, copy=False)
-        return a
-
-    def _read_centers(f: "h5py.File", t: int) -> torch.Tensor:
-        g = f[f"t{int(t):05d}"]
-        return torch.from_numpy(g["pred_centers"][...]).to(device=torch.device("cpu"), dtype=torch.float32)
-
-    # ----------------- basic checks -----------------
-    dev = torch.device(device)
-    T = len(steps)
-    if T < 2:
-        raise RuntimeError("Need at least 2 timesteps for rollout precompute.")
-
-    # ----------------- determine HDF5 cache path -----------------
-    if cache_path is None:
-        cache_dir = cfg.get("train", {}).get("cache_dir", cfg.get("train", {}).get("save_dir", "."))
-        cache_path = os.path.join(cache_dir, "precomp_rollout.h5")
-
-    if not str(cache_path).endswith(".h5"):
-        raise ValueError(f"Streaming mode writes a single HDF5 file; cache_path must end with .h5, got: {cache_path}")
-
-    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-
-    #debug_print_precomp_h5_meta(cache_path)
-    #print("[DEBUG PRECOMP] expected_steps =", steps)
-
-    # ----------------- optional reuse -----------------
-    if (not force_recompute) and _h5_is_usable(cache_path, cfg, expected_T=T):
-        print(f"[PRECOMP] Using existing H5 cache: {cache_path}")
-        return {
-            "type": "h5",
-            "path": cache_path,
-            "T": int(T),
-            "H": int(H),
-            "W": int(W),
-            "dx": float(dx),
-            "dy": float(dy),
-            "bbox": cfg["data"]["bbox"],
-        }
-
-    print("[PRECOMP] No valid cache found; computing precomputed meshes + interps...")
-
-    # ----------------- load wedge polygon -----------------
-    mesh_cfg = cfg.get("mesh", {})
-    mesh_spec_path = mesh_cfg.get("starting_mesh_path", None)
-
-    wedge_path = None
-    if mesh_spec_path is not None:
-        wedge_path = _load_wedge_path_from_spec(mesh_spec_path, cfg=cfg)
-        print(f"[GEOM] Clipping predicted meshes to wedge spec (rescaled): {mesh_spec_path}")
-    else:
-        print("[GEOM] No mesh_spec_path provided; wedge clipping disabled.")
-
-    # ----------------- choose device for IDW mapping (GT→pred) -----------------
-    # On MPS, default to CPU to avoid fragmentation / late-iteration OOM.
-    speed = cfg.get("speed", {})
-    idw_on_cpu = bool(speed.get("idw_on_cpu", dev.type == "mps"))
-    map_dev = torch.device("cpu") if idw_on_cpu else dev
-
-    # ----------------- open HDF5 (overwrite) -----------------
-    import h5py  # local for type checker
-    f = h5py.File(cache_path, "w")
-    try:
-        # meta
-        meta = f.create_group("meta")
-        meta.attrs["H"] = int(H)
-        meta.attrs["W"] = int(W)
-        meta.attrs["dx"] = float(dx)
-        meta.attrs["dy"] = float(dy)
-        meta.attrs["bbox"] = np.asarray(cfg["data"]["bbox"], dtype=np.float64)
-        meta.attrs["T"] = int(T)
-        meta.attrs["cfg_sha1"] = _cfg_sha1(cfg)
-        #meta.create_dataset("cfg_json", data=np.string_(json.dumps(cfg, sort_keys=True, default=str)))
-        meta.create_dataset("cfg_json", data=np.bytes_(json.dumps(cfg, sort_keys=True, default=str)))
-
-
-        # progress iterator
-        it = range(T - 1)
-        if progress:
-            try:
-                from tqdm import tqdm
-                it = tqdm(it, desc="[rollout precompute] mesh @ t+1 and GT→pred mappings")
-            except Exception:
-                pass
-
-        # ---------- FIRST PASS: predict meshes + GT→pred(t+1) ----------
-        for t in it:
-            dst = t + 1
-
-            # ----------------- pull GT(t) -----------------
-            s = steps[t]
-            centers_t = s["pos"]
-            centers_t = centers_t if torch.is_tensor(centers_t) else torch.as_tensor(centers_t)
-            feat_t = s["x"]
-            feat_t = feat_t if torch.is_tensor(feat_t) else torch.as_tensor(feat_t)
-            level_t = s.get("level")
-            ij_t = s.get("ij")
-            ei_t = s.get("edge_index")
-
-            centers_t = centers_t.to(dev)
-            feat_t = feat_t.to(dev, dtype=torch.float32)
-
-            if level_t is not None and ij_t is not None:
-                parents_t = _parents_from_level_ij(level_t.to(dev), ij_t.to(dev), H, W)
-            elif "parents" in s:
-                parents_t = s["parents"].to(dev)
-            else:
-                xmin, xmax, ymin, ymax = cfg["data"]["bbox"]
-                parents_t = _parents_from_pos(centers_t, H, W, xmin, xmax, ymin, ymax).to(dev)
-
-            if "mask" in s:
-                mask_t_parent = s["mask"].to(dev).view(H, W)
-            else:
-                mask_t_parent = _mask_from_parents(parents_t, H, W)
-
-            # ----------------- predict mesh at t+1 (rectangle) -----------------
-            ex_compat = {
-                "centers_t": centers_t,
-                "center_feat_t": feat_t,
-                "level_t": level_t.to(dev) if level_t is not None else None,
-                "ij_t": ij_t.to(dev) if ij_t is not None else None,
-                "dyn_parents": parents_t,
-                "mask_t": mask_t_parent.view(-1),
-                "ei_t": ei_t.to(dev) if (ei_t is not None and torch.is_tensor(ei_t)) else None,
-                "t": s.get("t", torch.tensor(t)),
-            }
-
-            pred_c_rect, pred_l_rect, pred_p_rect, pred_e_rect, _mask_p_rect = _build_pred_mesh_from_gt_gradients(
-                ex_compat, cfg, H, W, dx, dy, dev
-            )
-
-            # ----------------- clip pred mesh to wedge -----------------
-            pred_c, pred_l, pred_p, pred_e, mask_p = _clip_pred_mesh_to_wedge(
-                pred_c_rect,
-                pred_l_rect,
-                pred_p_rect,
-                pred_e_rect,
-                H,
-                W,
-                wedge_path=wedge_path,
-                cfg=cfg,
-                device=dev,
-            )
-
-            # ----------------- pull GT(t+1) -----------------
-            s_next = steps[dst]
-            centers_tp1 = s_next["pos"]
-            centers_tp1 = centers_tp1 if torch.is_tensor(centers_tp1) else torch.as_tensor(centers_tp1)
-            feat_tp1 = s_next["x"]
-            feat_tp1 = feat_tp1 if torch.is_tensor(feat_tp1) else torch.as_tensor(feat_tp1)
-            level_tp1 = s_next.get("level")
-            ij_tp1 = s_next.get("ij")
-
-            centers_tp1 = centers_tp1.to(dev)
-            feat_tp1 = feat_tp1.to(dev, dtype=torch.float32)
-
-            if level_tp1 is not None and ij_tp1 is not None:
-                parents_tp1 = _parents_from_level_ij(level_tp1.to(dev), ij_tp1.to(dev), H, W)
-            elif "parents" in s_next:
-                parents_tp1 = s_next["parents"].to(dev)
-            else:
-                xmin, xmax, ymin, ymax = cfg["data"]["bbox"]
-                parents_tp1 = _parents_from_pos(centers_tp1, H, W, xmin, xmax, ymin, ymax).to(dev)
-
-            if "mask" in s_next:
-                mask_tp1_parent = s_next["mask"].to(dev).view(H, W)
-            else:
-                mask_tp1_parent = _mask_from_parents(parents_tp1, H, W)
-
-            # ----------------- GT(t) -> pred(t+1) -----------------
-            # (run on map_dev if configured, to avoid MPS fragmentation)
-            ft_on_pred = _map_gt_on_pred_mesh_once(
-                src_centers=centers_t.to(map_dev),
-                src_feats=feat_t.to(map_dev),
-                mask_src_parent=mask_t_parent.to(map_dev),
-                parents_src=parents_t.to(map_dev),
-                pred_centers=pred_c.to(map_dev),
-                pred_levels=pred_l.to(map_dev),
-                pred_parents=pred_p.to(map_dev),
-                mask_pred_parent=mask_p.to(map_dev),
-                H=H,
-                W=W,
-                device=map_dev,
-            )
-
-            # ----------------- GT(t+1) -> pred(t+1) -----------------
-            f1_on_pred = _map_gt_on_pred_mesh_once(
-                src_centers=centers_tp1.to(map_dev),
-                src_feats=feat_tp1.to(map_dev),
-                mask_src_parent=mask_tp1_parent.to(map_dev),
-                parents_src=parents_tp1.to(map_dev),
-                pred_centers=pred_c.to(map_dev),
-                pred_levels=pred_l.to(map_dev),
-                pred_parents=pred_p.to(map_dev),
-                mask_pred_parent=mask_p.to(map_dev),
-                H=H,
-                W=W,
-                device=map_dev,
-            )
-
-            # ----------------- write dst group immediately -----------------
-            g = _ensure_group(f, dst)
-
-            _write_ds(g, "pred_centers", _to_np(pred_c, dtype=np.float32))
-            _write_ds(g, "pred_levels",  _to_np(pred_l.to(torch.int16), dtype=np.int16))
-            _write_ds(g, "pred_parents", _to_np(pred_p.to(torch.int32), dtype=np.int32))
-            _write_ds(g, "pred_ei",      _to_np(pred_e.to(torch.int32), dtype=np.int32))
-
-            mask_flat_u8 = mask_p.view(-1).to(torch.uint8)
-            _write_ds(g, "mask_pred_parent_flat_u8", _to_np(mask_flat_u8, dtype=np.uint8))
-
-            _write_ds(g, "feat_t_on_pred",   _to_np(ft_on_pred, dtype=np.float32))
-            _write_ds(g, "feat_tp1_on_pred", _to_np(f1_on_pred, dtype=np.float32))
-
-            g.attrs["N_pred"] = int(pred_c.shape[0])
-            g.attrs["E"] = int(pred_e.shape[1]) if (pred_e is not None and pred_e.numel() > 0) else 0
-
-            f.flush()
-
-            # ----------------- free refs per-iter -----------------
-            del pred_c_rect, pred_l_rect, pred_p_rect, pred_e_rect, _mask_p_rect
-            del pred_c, pred_l, pred_p, pred_e, mask_p
-            del ft_on_pred, f1_on_pred
-            del centers_t, feat_t, parents_t, mask_t_parent
-            del centers_tp1, feat_tp1, parents_tp1, mask_tp1_parent
-
-            if dev.type == "mps":
-                torch.mps.empty_cache()
-
-        # ---------- SECOND PASS: build pred→pred IDW maps (geometry only) ----------
-        knn_k = int(cfg["loss"].get("interp_k", 8))
-        chunk = int(cfg.get("speed", {}).get("interp_chunk", 8192))
-        knn_device = torch.device("cpu")
-
-        for t in range(1, T - 1):
-            # src: pred(t), dst: pred(t+1)
-            if f"t{t:05d}" not in f or f"t{t+1:05d}" not in f:
-                continue
-
-            src_c = _read_centers(f, t).to(knn_device)
-            dst_c = _read_centers(f, t + 1).to(knn_device)
-
-            idx_map, w_map = build_idw_map(
-                dst_c,  # queries: centers at time t+1
-                src_c,  # keys: centers at time t
-                k=knn_k,
-                chunk=chunk,
-            )
-
-            g = _ensure_group(f, t)
-            _write_ds(g, "pred2pred_idx_to_next", _to_np(idx_map.to(torch.int32), dtype=np.int32))
-            _write_ds(g, "pred2pred_w_to_next",   _to_np(w_map.to(torch.float16), dtype=np.float16))
-            f.flush()
-
-            del src_c, dst_c, idx_map, w_map
-
-        f.flush()
-
-    finally:
-        f.close()
-
-    print(f"[PRECOMP] Saved H5 precompute to {cache_path}")
-
-    return {
-        "type": "h5",
-        "path": cache_path,
-        "T": int(T),
-        "H": int(H),
-        "W": int(W),
-        "dx": float(dx),
-        "dy": float(dy),
-        "bbox": cfg["data"]["bbox"],
-    }
-'''
 @torch.no_grad()
 def precompute_pred_mesh_and_interps_for_rollout(
     steps,
@@ -2920,19 +2299,6 @@ def precompute_pred_mesh_and_interps_for_rollout(
         # Build device-ready versions ONCE (avoid per-timestep .to(...) overhead)
         pred_c_cpu, pred_l_cpu, pred_p_cpu, pred_e_cpu, mask_p_cpu = static_pred
 
-        static_pred_pack = {
-            "pred_c_map": pred_c_cpu.to(map_dev),
-            "pred_l_map": pred_l_cpu.to(map_dev),
-            "pred_p_map": pred_p_cpu.to(map_dev),
-            "mask_p_hw_map": mask_p_cpu.to(map_dev).view(H, W).to(torch.bool),
-            "mask_p_flat_u8_cpu": mask_p_cpu.view(-1).to(torch.uint8),  # for H5 writing
-            "pred_e_dev": pred_e_cpu.to(dev),  # edges used on model device / stored to H5
-            "pred_c_cpu": pred_c_cpu,          # for H5 writing if you want
-            "pred_l_cpu": pred_l_cpu,
-            "pred_p_cpu": pred_p_cpu,
-            "pred_e_cpu": pred_e_cpu,
-        }
-
         print(f"[PRECOMP][STATIC] Using starting mesh refined to min_level={refine_to_level} (policy={refine_policy})")
         print(f"[PRECOMP][STATIC] N={int(pred_c.shape[0])}, E={int(pred_e.shape[1])}")
 
@@ -3341,23 +2707,4 @@ class CollateWithPrecompute:
             #         print(f"  step {j}: idx=None or w=None")
             #     else:
 #                 print(f"  step {j}: idx shape={idx_j.shape}, w shape={w_j.shape}")
-        '''
-        # ----- MLS precomputed pieces (optional) -----
-        # Works for both dict-of-lists and LazyPrecompH5/_LazyPrecompSeq
-        for k in list(self.precomp.keys()):
-            if not str(k).startswith("mls_"):
-                continue
-            seq = self.precomp[k]  # list/tuple OR _LazyPrecompSeq
-            try:
-                ex[f"{k}_list"] = [seq[i] for i in idxs]
-            except Exception:
-                # if a key exists but isn't time-indexable, ignore it
-                pass
-        '''
-
         return ex
-
-
-
-
-
