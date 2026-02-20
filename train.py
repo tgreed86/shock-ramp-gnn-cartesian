@@ -36,7 +36,7 @@ from amr_policy import coarse_aggregate_from_dynamic
 from plots import plot_loss_curves
 from utils_geom import build_idw_map, apply_idw_map, apply_precomputed_idw_map
 
-from pretrain import precompute_pred_mesh_and_interps_for_rollout, CollateWithPrecompute
+from pretrain import precompute_pred_mesh_and_interps_for_rollout, CollateWithPrecompute, CollateWithDtOnly
 
 from utils.precomp_h5 import LazyPrecompH5
 import utils.dec_ops as dec
@@ -1693,12 +1693,21 @@ def train_one_epoch_multi_step(
                if use_amp and device.type == "cuda"
                else (lambda: torch.autocast("cpu", enabled=False)))
 
+    runtime_mesh_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
+    runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
+    if runtime_mesh_enabled:
+        raise NotImplementedError(
+            "train.runtime_mesh.enabled=True is configured, but runtime mesh stepping in "
+            "train_one_epoch_multi_step is not active in this commit yet. "
+            "Use enabled=false for now; next commit wires stepwise runtime remeshing."
+        )
+
     train_one_epoch_multi_step._printed_loss_components = False
 
     for batch in loader:
         dt_list = batch.get("dt_list", None)
         if dt_list is None:
-            raise RuntimeError("Missing dt_list in batch. Ensure CollateWithPrecompute attaches dt_list.")
+            raise RuntimeError("Missing dt_list in batch. Ensure the active collate attaches dt_list.")
 
         # Required lists (existing)
         centers_list  = _require_list(batch, "centers_list")
@@ -2823,6 +2832,15 @@ def evaluate_one_epoch_multi_step(
                if use_amp and device.type == "cuda"
                else (lambda: torch.autocast("cpu", enabled=False)))
 
+    runtime_mesh_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
+    runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
+    if runtime_mesh_enabled:
+        raise NotImplementedError(
+            "train.runtime_mesh.enabled=True is configured, but runtime mesh stepping in "
+            "evaluate_one_epoch_multi_step is not active in this commit yet. "
+            "Use enabled=false for now; next commit wires stepwise runtime remeshing."
+        )
+
     # ---- metric accumulators (weighted by cell area) ----
     step_wsum = []
     step_mae_num = []
@@ -2982,7 +3000,7 @@ def evaluate_one_epoch_multi_step(
         for batch_idx, batch in enumerate(loader):
             dt_list = batch.get("dt_list", None)
             if dt_list is None:
-                raise RuntimeError("Missing dt_list in batch. Ensure CollateWithPrecompute attaches dt_list.")
+                raise RuntimeError("Missing dt_list in batch. Ensure the active collate attaches dt_list.")
 
             centers_list  = _require_list(batch, "centers_list")
             feat_list     = _require_list(batch, "feat_list")
@@ -3621,6 +3639,36 @@ def main(config_path: str | None = None):
     cfg.setdefault("speed", {}).setdefault("knn_k", 8)
     cfg.setdefault("speed", {}).setdefault("cache_interps", True)
 
+    # Runtime mesh defaults (infrastructure only in this commit)
+    runtime_mesh_cfg = cfg.setdefault("train", {}).setdefault("runtime_mesh", {})
+    runtime_mesh_cfg.setdefault("enabled", False)
+    runtime_mesh_cfg.setdefault("detach_policy_input", True)
+    runtime_mesh_cfg.setdefault("reset_to_coarse_each_step", True)
+    runtime_mesh_cfg.setdefault("refine_only", True)
+    runtime_mesh_cfg.setdefault("update_every_steps", 1)
+    runtime_mesh_cfg.setdefault("max_cells_per_step", 400_000)
+
+    runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
+    runtime_update_every = int(runtime_mesh_cfg.get("update_every_steps", 1))
+    if runtime_update_every < 1:
+        raise ValueError("train.runtime_mesh.update_every_steps must be >= 1.")
+
+    if runtime_mesh_enabled:
+        if not bool(runtime_mesh_cfg.get("reset_to_coarse_each_step", True)):
+            raise RuntimeError("Runtime mesh mode requires reset_to_coarse_each_step=true for this workflow.")
+        if not bool(runtime_mesh_cfg.get("refine_only", True)):
+            raise RuntimeError("Runtime mesh mode requires refine_only=true for this workflow.")
+
+        mesh_path_cfg = cfg.get("mesh", {}).get("starting_mesh_path", None)
+        if not mesh_path_cfg:
+            raise RuntimeError(
+                "Runtime mesh mode requires cfg['mesh']['starting_mesh_path'] to point to wedge_mesh_spec.pt."
+            )
+        mesh_path = os.path.abspath(os.path.expanduser(str(mesh_path_cfg)))
+        if not os.path.exists(mesh_path):
+            raise FileNotFoundError(f"Runtime mesh mode expected mesh spec at: {mesh_path}")
+        cfg.setdefault("mesh", {})["starting_mesh_path"] = mesh_path
+
     # Ensure dataset sees the intended columns
     if cfg.get("data", {}).get("feature_idx") and not cfg.get("features", {}).get("use_columns"):
         cfg.setdefault("features", {}).setdefault("use_columns", cfg["data"]["feature_idx"])
@@ -3785,63 +3833,69 @@ def main(config_path: str | None = None):
     val_ds   = Subset(full_ds, val_idx.tolist())
     test_ds  = Subset(full_ds, test_idx.tolist())
 
-    cache_path = cfg["train"].get("precomp_cache_path", None)
-    force_recompute = bool(cfg["train"].get("precomp_force_recompute", False))
+    precomp = None
+    if runtime_mesh_enabled:
+        print(
+            "[RUNTIME-MESH] enabled (infrastructure mode): skipping precompute and using dt-only collate."
+        )
+        collate = CollateWithDtOnly(dt_transitions=dt_transitions, dt_ref=dt_ref)
+    else:
+        cache_path = cfg["train"].get("precomp_cache_path", None)
+        force_recompute = bool(cfg["train"].get("precomp_force_recompute", False))
 
-    precomp = precompute_pred_mesh_and_interps_for_rollout(
-        full_ds.steps,
-        cfg,
-        H,
-        W,
-        dx,
-        dy,
-        device=device,
-        progress=True,
-        cache_path=cache_path,
-        force_recompute=force_recompute,
-    )
+        precomp = precompute_pred_mesh_and_interps_for_rollout(
+            full_ds.steps,
+            cfg,
+            H,
+            W,
+            dx,
+            dy,
+            device=device,
+            progress=True,
+            cache_path=cache_path,
+            force_recompute=force_recompute,
+        )
 
-    precomp = move_precomp_to_device(precomp, device="cpu")
+        precomp = move_precomp_to_device(precomp, device="cpu")
 
-    # --- DEBUG: verify DEC edge attributes exist in precomp ---
-    if cfg.get("debug", {}).get("print_dec_checks", False):
-        t = 1
-        pea = precomp["pred_edge_attr"][t] if "pred_edge_attr" in precomp else None
-        print("[DEC-CHK] loaded pred_edge_attr[t=1]:", None if pea is None else (tuple(pea.shape), pea.dtype, pea.device))
+        # --- DEBUG: verify DEC edge attributes exist in precomp ---
+        if cfg.get("debug", {}).get("print_dec_checks", False):
+            t = 1
+            pea = precomp["pred_edge_attr"][t] if "pred_edge_attr" in precomp else None
+            print("[DEC-CHK] loaded pred_edge_attr[t=1]:", None if pea is None else (tuple(pea.shape), pea.dtype, pea.device))
 
-        print("[DEC-CHK] precomp keys:", sorted(list(precomp.keys())))
+            print("[DEC-CHK] precomp keys:", sorted(list(precomp.keys())))
 
-        pea_key = "pred_edge_attr" if "pred_edge_attr" in precomp else ("pred_ea" if "pred_ea" in precomp else None)
-        if pea_key is None:
-            print("[DEC-CHK] precomp has NO pred_edge_attr/pred_ea")
-        else:
-            pea = precomp[pea_key]
-            pei = precomp["pred_ei"]
-            print(f"[DEC-CHK] precomp[{pea_key}] length={len(pea)}; precomp[pred_ei] length={len(pei)}")
-            # show one timestep shapes
-            i0 = 0
-            if torch.is_tensor(pea[i0]) and torch.is_tensor(pei[i0]):
-                print(f"[DEC-CHK] t={i0}: pred_ei shape={tuple(pei[i0].shape)} dtype={pei[i0].dtype} dev={pei[i0].device}")
-                print(f"[DEC-CHK] t={i0}: pred_ea shape={tuple(pea[i0].shape)} dtype={pea[i0].dtype} dev={pea[i0].device}")
-                if pea[i0].ndim == 2 and pea[i0].size(1) >= 5:
-                    cols = pea[i0].size(1)
-                    print(f"[DEC-CHK] pred_ea columns={cols} (expect >=5: nx,ny,face_len,dual_len,tau)")
+            pea_key = "pred_edge_attr" if "pred_edge_attr" in precomp else ("pred_ea" if "pred_ea" in precomp else None)
+            if pea_key is None:
+                print("[DEC-CHK] precomp has NO pred_edge_attr/pred_ea")
+            else:
+                pea = precomp[pea_key]
+                pei = precomp["pred_ei"]
+                print(f"[DEC-CHK] precomp[{pea_key}] length={len(pea)}; precomp[pred_ei] length={len(pei)}")
+                # show one timestep shapes
+                i0 = 0
+                if torch.is_tensor(pea[i0]) and torch.is_tensor(pei[i0]):
+                    print(f"[DEC-CHK] t={i0}: pred_ei shape={tuple(pei[i0].shape)} dtype={pei[i0].dtype} dev={pei[i0].device}")
+                    print(f"[DEC-CHK] t={i0}: pred_ea shape={tuple(pea[i0].shape)} dtype={pea[i0].dtype} dev={pea[i0].device}")
+                    if pea[i0].ndim == 2 and pea[i0].size(1) >= 5:
+                        cols = pea[i0].size(1)
+                        print(f"[DEC-CHK] pred_ea columns={cols} (expect >=5: nx,ny,face_len,dual_len,tau)")
 
-    dec_cfg = cfg.get("loss", {}) or {}
-    
-    if bool(cfg.get("loss", {}).get("dec", False)) and (
-        float(dec_cfg.get("blend_weight", 0.0)) != 0.0 or float(dec_cfg.get("residual_weight", 0.0)) != 0.0
-    ):
-        # After move_precomp_to_device(precomp, device)
-        # precomp must include a list aligned to pred_ei_list, e.g. key "pred_ea_list" or "pred_edge_attr_list"
-        if isinstance(precomp, dict):
-            if ("pred_edge_attr" not in precomp) and ("pred_ea" not in precomp):
-                raise RuntimeError(
-                    "DEC enabled but precomp is missing pred_ea_list/pred_edge_attr_list. "
-                    "Update H5->precomp loader and CollateWithPrecompute to read/store pred_edge_attr."
-                )
+        dec_cfg = cfg.get("loss", {}) or {}
+        if bool(cfg.get("loss", {}).get("dec", False)) and (
+            float(dec_cfg.get("blend_weight", 0.0)) != 0.0 or float(dec_cfg.get("residual_weight", 0.0)) != 0.0
+        ):
+            # After move_precomp_to_device(precomp, device)
+            # precomp must include a list aligned to pred_ei_list, e.g. key "pred_ea_list" or "pred_edge_attr_list"
+            if isinstance(precomp, dict):
+                if ("pred_edge_attr" not in precomp) and ("pred_ea" not in precomp):
+                    raise RuntimeError(
+                        "DEC enabled but precomp is missing pred_ea_list/pred_edge_attr_list. "
+                        "Update H5->precomp loader and CollateWithPrecompute to read/store pred_edge_attr."
+                    )
 
-    collate = CollateWithPrecompute(precomp, dt_transitions=dt_transitions, dt_ref=dt_ref)
+        collate = CollateWithPrecompute(precomp, dt_transitions=dt_transitions, dt_ref=dt_ref)
 
     train_loader = DataLoader(
         train_ds, batch_size=1, sampler=RandomSampler(train_ds),
@@ -3971,6 +4025,10 @@ def main(config_path: str | None = None):
         )
 
     def _precomp_to_cpu(precomp):
+        if precomp is None:
+            return None
+        if not hasattr(precomp, "items"):
+            return precomp
         out = {}
         for key, lst in precomp.items():
             if isinstance(lst, list):

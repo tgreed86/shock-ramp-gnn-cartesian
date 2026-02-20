@@ -2708,3 +2708,38 @@ class CollateWithPrecompute:
             #     else:
 #                 print(f"  step {j}: idx shape={idx_j.shape}, w shape={w_j.shape}")
         return ex
+
+
+class CollateWithDtOnly:
+    """
+    Lightweight collate for runtime mesh mode.
+
+    Keeps dataset window tensors untouched and only appends:
+      - dt_list: list[float], length K-1
+      - dt_ref : optional float scalar
+    """
+
+    def __init__(self, *, dt_transitions, dt_ref=None):
+        if torch.is_tensor(dt_transitions):
+            self.dt_transitions = dt_transitions.detach().cpu()
+        else:
+            self.dt_transitions = torch.as_tensor(dt_transitions, dtype=torch.float32, device="cpu")
+        self.dt_ref = dt_ref
+
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        ex0 = batch[0]
+        ex = dict(ex0)
+
+        idxs = ex["t_indices"].tolist()  # absolute time indices in this window
+        K = len(idxs)
+
+        dt_list = []
+        for j in range(K - 1):
+            t_src = idxs[j]
+            v = self.dt_transitions[t_src]
+            dt_list.append(float(v.item()) if torch.is_tensor(v) else float(v))
+
+        ex["dt_list"] = dt_list
+        if self.dt_ref is not None:
+            ex["dt_ref"] = float(self.dt_ref) if not torch.is_tensor(self.dt_ref) else float(self.dt_ref.item())
+        return ex
