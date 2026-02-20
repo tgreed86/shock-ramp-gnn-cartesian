@@ -31,12 +31,21 @@ import numpy as np
 
 from dataset import CellRefineWindowDataset
 from models import FeatureNet, ParcFeatureAdapter
-from amr_policy import coarse_aggregate_from_dynamic
+from amr_policy import coarse_aggregate_from_dynamic, predict_masks_hierarchical_from_gt_gradients
             
 from plots import plot_loss_curves
-from utils_geom import build_idw_map, apply_idw_map, apply_precomputed_idw_map
+from utils_geom import build_idw_map, apply_idw_map, apply_precomputed_idw_map, dynamic_cells_from_parent_masks
 
-from pretrain import precompute_pred_mesh_and_interps_for_rollout, CollateWithPrecompute, CollateWithDtOnly
+from pretrain import (
+    precompute_pred_mesh_and_interps_for_rollout,
+    CollateWithPrecompute,
+    CollateWithDtOnly,
+    build_amr_face_adjacency_edges,
+    build_amr_local_knn_edges,
+    dec_edge_attr_for_dyadic_quads,
+    _clip_pred_mesh_to_wedge,
+    _load_wedge_path_from_spec,
+)
 
 from utils.precomp_h5 import LazyPrecompH5
 import utils.dec_ops as dec
@@ -1356,8 +1365,7 @@ def _map_pred_to_next_pred(pred_centers_src,
     parents_dst      = parents_dst.to(dev)
     mask_pred_dst    = mask_pred_dst.to(dev)
 
-    #feats_src = feats_src.to(dev)
-    feats_src = feats_src.detach().to(dev)
+    feats_src = feats_src.to(dev)
 
     N_dst, F = pred_centers_dst.shape[0], feats_src.shape[1]
     out = feats_src.new_empty((N_dst, F), device=dev)
@@ -1402,6 +1410,154 @@ def _map_pred_to_next_pred(pred_centers_src,
     #        f"idw_points={int(q_idx.numel())}, N_dst={N_dst}")
 
     return out
+
+
+def _mask_from_parent_indices(parents: torch.Tensor, H: int, W: int, device: torch.device) -> torch.Tensor:
+    m = torch.zeros(H * W, dtype=torch.bool, device=device)
+    if parents is not None and torch.is_tensor(parents) and parents.numel() > 0:
+        p = parents.view(-1).long().clamp_(0, H * W - 1)
+        m[p] = True
+    return m.view(H, W)
+
+
+@torch.no_grad()
+def _map_gt_to_pred_mesh_once(
+    *,
+    src_centers: torch.Tensor,
+    src_feats: torch.Tensor,
+    pred_centers: torch.Tensor,
+    knn_k: int = 8,
+    chunk: int = 8192,
+) -> torch.Tensor:
+    dev = pred_centers.device
+    src_c = src_centers.to(dev, dtype=torch.float32)
+    src_f = src_feats.to(dev, dtype=torch.float32)
+    dst_c = pred_centers.to(dev, dtype=torch.float32)
+
+    idx_map, w_map = build_idw_map(dst_c, src_c, k=int(knn_k), chunk=int(chunk))
+    return apply_idw_map(idx_map, w_map, src_f)
+
+
+@torch.no_grad()
+def _runtime_build_pred_mesh_from_state(
+    *,
+    centers_t: torch.Tensor,
+    feat_t: torch.Tensor,
+    level_t: torch.Tensor,
+    parents_t: torch.Tensor,
+    cfg: Dict[str, Any],
+    H: int,
+    W: int,
+    dx: float,
+    dy: float,
+    device: torch.device,
+    wedge_path,
+    need_edge_attr: bool,
+):
+    """
+    Build next-step predicted mesh from state gradients in runtime mode.
+    Wedge clipping is mandatory for shock-ramp geometry.
+    """
+    dev = torch.device(device)
+    rt_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
+    reset_each = bool(rt_cfg.get("reset_to_coarse_each_step", True))
+    detach_policy_input = bool(rt_cfg.get("detach_policy_input", True))
+
+    centers_t = centers_t.to(dev, dtype=torch.float32)
+    feat_policy = (feat_t.detach() if detach_policy_input else feat_t).to(dev, dtype=torch.float32)
+    level_t = level_t.to(dev, dtype=torch.long).view(-1)
+    parents_t = parents_t.to(dev, dtype=torch.long).view(-1)
+
+    if wedge_path is None:
+        raise RuntimeError("Runtime mesh mode requires wedge clipping; wedge_path is None.")
+
+    if reset_each:
+        mask_t_parent = torch.zeros((H, W), dtype=torch.bool, device=dev)
+    else:
+        mask_t_parent = _mask_from_parent_indices(parents_t, H, W, dev)
+
+    batch_like = {
+        "centers_t": centers_t,
+        "center_feat_t": feat_policy,
+        "dyn_feat_t": feat_policy,
+        "dyn_parents": parents_t,
+        "mask_t": mask_t_parent.view(-1),
+        "level_t": level_t,
+    }
+
+    masks_pred_by_level = predict_masks_hierarchical_from_gt_gradients(
+        batch_like,
+        cfg,
+        H,
+        W,
+        dx,
+        dy,
+        device=dev,
+    )
+
+    xmin, xmax, ymin, ymax = _get_bbox(cfg)
+    pred_centers, pred_levels, pred_parents, pred_ei = dynamic_cells_from_parent_masks(
+        masks_pred_by_level,
+        H,
+        W,
+        xmin,
+        xmax,
+        ymin,
+        ymax,
+    )
+    parent_flat = pred_parents.view(-1).long()
+
+    edge_method = str(cfg.get("edges", {}).get("method", "knn")).lower()
+    if "face" in edge_method:
+        pred_ei, _pred_ea = build_amr_face_adjacency_edges(
+            pred_centers,
+            pred_levels,
+            H,
+            W,
+            bbox=tuple(cfg["data"]["bbox"]),
+            return_edge_attr=True,
+        )
+        pred_ei = pred_ei.to(dev, dtype=torch.long)
+    else:
+        pred_ei = build_amr_local_knn_edges(
+            pred_centers,
+            parent_flat,
+            H,
+            W,
+            k_local=int(cfg.get("edges", {}).get("k_local", 4)),
+            max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
+        ).to(dev, dtype=torch.long)
+
+    pred_centers, pred_levels, parent_flat, pred_ei, mask_pred_parent = _clip_pred_mesh_to_wedge(
+        pred_centers=pred_centers,
+        pred_levels=pred_levels,
+        pred_parents=parent_flat,
+        pred_ei=pred_ei,
+        H=H,
+        W=W,
+        wedge_path=wedge_path,
+        cfg=cfg,
+        device=dev,
+    )
+
+    pred_centers = pred_centers.to(dev, dtype=torch.float32)
+    pred_levels = pred_levels.to(dev, dtype=torch.long)
+    parent_flat = parent_flat.to(dev, dtype=torch.long)
+    pred_ei = pred_ei.to(dev, dtype=torch.long)
+    mask_pred_parent = mask_pred_parent.to(dev, dtype=torch.bool)
+
+    pred_ea = None
+    if need_edge_attr:
+        edge_attr = dec_edge_attr_for_dyadic_quads(
+            pred_centers.to("cpu", dtype=torch.float32),
+            pred_levels.to("cpu", dtype=torch.int64),
+            pred_ei.to("cpu", dtype=torch.int64),
+            dx0=float(dx),
+            dy0=float(dy),
+        )
+        pred_ea = edge_attr.to(dev, dtype=torch.float32)
+
+    return pred_centers, pred_levels, parent_flat, pred_ei, mask_pred_parent, pred_ea
 
 
 def _require_list(batch, name):
@@ -1695,12 +1851,15 @@ def train_one_epoch_multi_step(
 
     runtime_mesh_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
     runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
+    runtime_update_every = int(runtime_mesh_cfg.get("update_every_steps", 1))
+    runtime_need_edge_attr = bool(need_phy and (not use_mls))
+    runtime_wedge_path = None
     if runtime_mesh_enabled:
-        raise NotImplementedError(
-            "train.runtime_mesh.enabled=True is configured, but runtime mesh stepping in "
-            "train_one_epoch_multi_step is not active in this commit yet. "
-            "Use enabled=false for now; next commit wires stepwise runtime remeshing."
-        )
+        mesh_spec_path = cfg.get("mesh", {}).get("starting_mesh_path", None)
+        if not mesh_spec_path:
+            raise RuntimeError("Runtime mesh mode requires cfg['mesh']['starting_mesh_path'].")
+        runtime_wedge_path = _load_wedge_path_from_spec(str(mesh_spec_path), cfg)
+        print(f"[RUNTIME-MESH] train loop active (update_every_steps={runtime_update_every})")
 
     train_one_epoch_multi_step._printed_loss_components = False
 
@@ -1709,41 +1868,47 @@ def train_one_epoch_multi_step(
         if dt_list is None:
             raise RuntimeError("Missing dt_list in batch. Ensure the active collate attaches dt_list.")
 
-        # Required lists (existing)
-        centers_list  = _require_list(batch, "centers_list")
-        _ = _require_list(batch, "feat_list")
-        _ = _require_list(batch, "level_list")
-        _ = _require_list(batch, "parents_list")
+        # Base lists (always required)
+        centers_list = _require_list(batch, "centers_list")
+        feat_list = _require_list(batch, "feat_list")
+        level_list = _require_list(batch, "level_list")
+        parents_list = _require_list(batch, "parents_list")
 
-        pred_centers_list  = _require_list(batch, "pred_centers_list")
-        pred_levels_list   = _require_list(batch, "pred_levels_list")
-        pred_parents_list  = _require_list(batch, "pred_parents_list")
-        pred_ei_list       = _require_list(batch, "pred_ei_list")
-        mask_pred_list     = _require_list(batch, "mask_pred_list")
-
-        # Optional DEC edge_attr list aligned with pred_ei_list
+        # Optional precompute lists (required only in strict/precompute mode).
+        pred_centers_list = batch.get("pred_centers_list", None)
+        pred_levels_list = batch.get("pred_levels_list", None)
+        pred_parents_list = batch.get("pred_parents_list", None)
+        pred_ei_list = batch.get("pred_ei_list", None)
+        mask_pred_list = batch.get("mask_pred_list", None)
         pred_ea_list = batch.get("pred_ea_list", None) or batch.get("pred_edge_attr_list", None)
-
-        # step-0 GT→pred
-        feat_t_on_pred_list   = _require_list(batch, "feat_t_on_pred_list")
-        feat_tp1_on_pred_list = _require_list(batch, "feat_tp1_on_pred_list")
-
-        # pred→pred IDW maps
+        feat_t_on_pred_list = batch.get("feat_t_on_pred_list", None)
+        feat_tp1_on_pred_list = batch.get("feat_tp1_on_pred_list", None)
         pred2pred_idx_list = batch.get("pred2pred_idx_list", None)
-        pred2pred_w_list   = batch.get("pred2pred_w_list", None)
+        pred2pred_w_list = batch.get("pred2pred_w_list", None)
 
         K = len(centers_list)
         if K < 2:
             raise RuntimeError("window_size must be ≥ 2")
 
-        if need_phy and pred_ea_list is None:
-            raise RuntimeError(
-                "PARC/DEC enabled but batch is missing pred_ea_list / pred_edge_attr_list. "
-                "Update H5 loader + CollateWithPrecompute to attach edge_attr per step."
-            )
+        dt_ref_scalar = batch.get("dt_ref", None)
 
-        # Pack pred lists
-        pred_lists = (pred_centers_list, pred_levels_list, pred_parents_list, pred_ei_list, mask_pred_list)
+        pred_lists = None
+        if not runtime_mesh_enabled:
+            pred_centers_list = _require_list(batch, "pred_centers_list")
+            pred_levels_list = _require_list(batch, "pred_levels_list")
+            pred_parents_list = _require_list(batch, "pred_parents_list")
+            pred_ei_list = _require_list(batch, "pred_ei_list")
+            mask_pred_list = _require_list(batch, "mask_pred_list")
+            feat_t_on_pred_list = _require_list(batch, "feat_t_on_pred_list")
+            feat_tp1_on_pred_list = _require_list(batch, "feat_tp1_on_pred_list")
+
+            if need_phy and pred_ea_list is None:
+                raise RuntimeError(
+                    "PARC/DEC enabled but batch is missing pred_ea_list / pred_edge_attr_list. "
+                    "Update H5 loader + CollateWithPrecompute to attach edge_attr per step."
+                )
+
+            pred_lists = (pred_centers_list, pred_levels_list, pred_parents_list, pred_ei_list, mask_pred_list)
 
         window_loss = 0.0
         window_mae = 0.0
@@ -1752,7 +1917,7 @@ def train_one_epoch_multi_step(
         opt.zero_grad(set_to_none=True)
 
         # Only DEC needs edge_attr. MLS does not.
-        if need_phy and (not use_mls) and (pred_ea_list is None):
+        if (not runtime_mesh_enabled) and need_phy and (not use_mls) and (pred_ea_list is None):
             raise RuntimeError(
                 "DEC/PARC physics enabled but batch is missing pred_ea_list / pred_edge_attr_list. "
                 "Update loader + CollateWithPrecompute to attach edge_attr per step."
@@ -2088,6 +2253,10 @@ def train_one_epoch_multi_step(
                                             u_max=float(cfg.get("debug", {}).get("stepA_u_max", 1e3)),
                                         )
                                 if cfg.get("debug", {}).get("stepA_teacher", False):
+                                    if feat_t_on_pred_list is None:
+                                        raise RuntimeError(
+                                            "debug.stepA_teacher requires feat_t_on_pred_list from precompute collate."
+                                        )
                                     j = step_k + 1  
                                     x_in_teacher = feat_t_on_pred_list[j].to(device)  # GT(t+k) on pred(t+k+1)
 
@@ -2542,6 +2711,137 @@ def train_one_epoch_multi_step(
 
             return loss_step, y_pred_abs, x_tgt_abs
 
+        if runtime_mesh_enabled:
+            runtime_knn_k = int(cfg.get("train", {}).get("knn_k", cfg.get("loss", {}).get("interp_k", 8)))
+            runtime_chunk = int(cfg.get("speed", {}).get("interp_chunk", 8192))
+
+            state_centers = _to_dev_nb(centers_list[0], dtype=torch.float32)
+            state_levels = _to_dev_nb(level_list[0], dtype=torch.long).view(-1)
+            state_parents = _to_dev_nb(parents_list[0], dtype=torch.long).view(-1)
+            state_feat = _to_dev_nb(feat_list[0], dtype=torch.float32)
+
+            active_pred_centers = None
+            active_pred_levels = None
+            active_pred_parents = None
+            active_pred_ei = None
+            active_pred_mask = None
+            active_pred_ea = None
+
+            for k in range(0, K - 1):
+                step_idx = k + 1
+                do_rebuild = (k == 0) or ((step_idx % runtime_update_every) == 0)
+
+                if do_rebuild:
+                    (
+                        active_pred_centers,
+                        active_pred_levels,
+                        active_pred_parents,
+                        active_pred_ei,
+                        active_pred_mask,
+                        active_pred_ea,
+                    ) = _runtime_build_pred_mesh_from_state(
+                        centers_t=state_centers,
+                        feat_t=state_feat,
+                        level_t=state_levels,
+                        parents_t=state_parents,
+                        cfg=cfg,
+                        H=H,
+                        W=W,
+                        dx=float(dx),
+                        dy=float(dy),
+                        device=device,
+                        wedge_path=runtime_wedge_path,
+                        need_edge_attr=runtime_need_edge_attr,
+                    )
+
+                    if k == 0:
+                        x_in_abs = _map_gt_to_pred_mesh_once(
+                            src_centers=state_centers,
+                            src_feats=state_feat,
+                            pred_centers=active_pred_centers,
+                            knn_k=runtime_knn_k,
+                            chunk=runtime_chunk,
+                        )
+                    else:
+                        x_in_abs = _map_pred_to_next_pred(
+                            pred_centers_src=state_centers,
+                            feats_src=state_feat,
+                            levels_src=state_levels,
+                            parents_src=state_parents,
+                            pred_centers_dst=active_pred_centers,
+                            levels_dst=active_pred_levels,
+                            parents_dst=active_pred_parents,
+                            mask_pred_dst=active_pred_mask.view(-1),
+                            H=H,
+                            W=W,
+                            knn_k=runtime_knn_k,
+                            chunk=runtime_chunk,
+                        )
+                else:
+                    if active_pred_centers is None:
+                        raise RuntimeError("Runtime mesh state is not initialized before a reuse step.")
+                    x_in_abs = state_feat
+
+                gt_centers_tp1 = _to_dev_nb(centers_list[k + 1], dtype=torch.float32)
+                gt_feat_tp1 = _to_dev_nb(feat_list[k + 1], dtype=torch.float32)
+                x_tgt_abs = _map_gt_to_pred_mesh_once(
+                    src_centers=gt_centers_tp1,
+                    src_feats=gt_feat_tp1,
+                    pred_centers=active_pred_centers,
+                    knn_k=runtime_knn_k,
+                    chunk=runtime_chunk,
+                )
+
+                dtk = dt_list[k]
+                if torch.is_tensor(dtk):
+                    dtk = dtk.to(device=device, dtype=x_in_abs.dtype, non_blocking=True)
+                else:
+                    dtk = torch.tensor(float(dtk), device=device, dtype=x_in_abs.dtype)
+
+                loss_k, y_pred_abs_k, _ = _run_step(
+                    step_k=k,
+                    pred_centers=active_pred_centers,
+                    pred_levels=active_pred_levels,
+                    pred_parents=active_pred_parents,
+                    pred_ei=active_pred_ei,
+                    pred_ea=active_pred_ea,
+                    x_in_abs=x_in_abs,
+                    x_tgt_abs=x_tgt_abs,
+                    dt_phys=dtk,
+                    dt_ref_scalar=dt_ref_scalar,
+                    x_ops_abs=None,
+                )
+
+                window_loss += float(loss_k.detach().cpu())
+                window_mae += float(torch.mean(torch.abs(y_pred_abs_k.detach() - x_tgt_abs)).cpu())
+                n_steps += 1
+                window_loss_graph = loss_k if window_loss_graph is None else (window_loss_graph + loss_k)
+
+                state_feat = _enforce_physical_state(y_pred_abs_k, cfg, rho_floor=1e-6, E_floor=1e-6)
+                state_centers = active_pred_centers
+                state_levels = active_pred_levels
+                state_parents = active_pred_parents
+
+            # ===== backward + step once per window =====
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if window_loss_graph is not None:
+                if scaler is not None:
+                    scaler.scale(window_loss_graph).backward()
+                    scaler.unscale_(opt)  # <-- required before clipping
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(opt)
+                    scaler.update()
+                else:
+                    window_loss_graph.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    opt.step()
+            else:
+                opt.step()
+
+            total_loss_accum += window_loss
+            mae_accum += window_mae
+            continue
+
         # ======================
         # STEP 0 (k=0)
         # ======================
@@ -2834,12 +3134,15 @@ def evaluate_one_epoch_multi_step(
 
     runtime_mesh_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
     runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
+    runtime_update_every = int(runtime_mesh_cfg.get("update_every_steps", 1))
+    runtime_need_edge_attr = bool(need_phy and (not use_mls))
+    runtime_wedge_path = None
     if runtime_mesh_enabled:
-        raise NotImplementedError(
-            "train.runtime_mesh.enabled=True is configured, but runtime mesh stepping in "
-            "evaluate_one_epoch_multi_step is not active in this commit yet. "
-            "Use enabled=false for now; next commit wires stepwise runtime remeshing."
-        )
+        mesh_spec_path = cfg.get("mesh", {}).get("starting_mesh_path", None)
+        if not mesh_spec_path:
+            raise RuntimeError("Runtime mesh mode requires cfg['mesh']['starting_mesh_path'].")
+        runtime_wedge_path = _load_wedge_path_from_spec(str(mesh_spec_path), cfg)
+        print(f"[RUNTIME-MESH] eval loop active (update_every_steps={runtime_update_every})")
 
     # ---- metric accumulators (weighted by cell area) ----
     step_wsum = []
@@ -3007,16 +3310,15 @@ def evaluate_one_epoch_multi_step(
             level_list    = _require_list(batch, "level_list")
             parents_list  = _require_list(batch, "parents_list")
 
-            pred_centers_list  = _require_list(batch, "pred_centers_list")
-            pred_levels_list   = _require_list(batch, "pred_levels_list")
-            pred_parents_list  = _require_list(batch, "pred_parents_list")
-            pred_ei_list       = _require_list(batch, "pred_ei_list")
-            mask_pred_list     = _require_list(batch, "mask_pred_list")
-
+            pred_centers_list = batch.get("pred_centers_list", None)
+            pred_levels_list = batch.get("pred_levels_list", None)
+            pred_parents_list = batch.get("pred_parents_list", None)
+            pred_ei_list = batch.get("pred_ei_list", None)
+            mask_pred_list = batch.get("mask_pred_list", None)
             pred_ea_list = batch.get("pred_ea_list", None) or batch.get("pred_edge_attr_list", None)
 
-            feat_t_on_pred_list   = _require_list(batch, "feat_t_on_pred_list")
-            feat_tp1_on_pred_list = _require_list(batch, "feat_tp1_on_pred_list")
+            feat_t_on_pred_list = batch.get("feat_t_on_pred_list", None)
+            feat_tp1_on_pred_list = batch.get("feat_tp1_on_pred_list", None)
 
             pred2pred_idx_list = batch.get("pred2pred_idx_list", None)
             pred2pred_w_list   = batch.get("pred2pred_w_list", None)
@@ -3027,13 +3329,24 @@ def evaluate_one_epoch_multi_step(
             if K < 2:
                 raise RuntimeError("window_size must be ≥ 2")
 
-            if need_phy and pred_ea_list is None:
-                raise RuntimeError(
-                    "PARC/DEC enabled but batch is missing pred_ea_list / pred_edge_attr_list."
-                )
-
-            pred_lists = (pred_centers_list, pred_levels_list, pred_parents_list, pred_ei_list, mask_pred_list)
             dt_ref_scalar = batch.get("dt_ref", None)
+
+            pred_lists = None
+            if not runtime_mesh_enabled:
+                pred_centers_list = _require_list(batch, "pred_centers_list")
+                pred_levels_list = _require_list(batch, "pred_levels_list")
+                pred_parents_list = _require_list(batch, "pred_parents_list")
+                pred_ei_list = _require_list(batch, "pred_ei_list")
+                mask_pred_list = _require_list(batch, "mask_pred_list")
+                feat_t_on_pred_list = _require_list(batch, "feat_t_on_pred_list")
+                feat_tp1_on_pred_list = _require_list(batch, "feat_tp1_on_pred_list")
+
+                if need_phy and pred_ea_list is None:
+                    raise RuntimeError(
+                        "PARC/DEC enabled but batch is missing pred_ea_list / pred_edge_attr_list."
+                    )
+
+                pred_lists = (pred_centers_list, pred_levels_list, pred_parents_list, pred_ei_list, mask_pred_list)
 
             # helper closure for one step (mirrors train)
             def _run_step_eval(
@@ -3259,6 +3572,202 @@ def evaluate_one_epoch_multi_step(
                     loss_step = center_loss + lap_w * lap_loss + tmp_w * tmp_loss + dec_resid_w * phy_loss
 
                 return loss_step, y_pred_abs
+
+            if runtime_mesh_enabled:
+                runtime_knn_k = int(cfg.get("train", {}).get("knn_k", cfg.get("loss", {}).get("interp_k", 8)))
+                runtime_chunk = int(cfg.get("speed", {}).get("interp_chunk", 8192))
+
+                state_centers = centers_list[0].to(device=device, dtype=torch.float32)
+                state_levels = level_list[0].to(device=device, dtype=torch.long).view(-1)
+                state_parents = parents_list[0].to(device=device, dtype=torch.long).view(-1)
+                state_feat = feat_list[0].to(device=device, dtype=torch.float32)
+
+                active_pred_centers = None
+                active_pred_levels = None
+                active_pred_parents = None
+                active_pred_ei = None
+                active_pred_mask = None
+                active_pred_ea = None
+
+                for k in range(0, K - 1):
+                    step_idx = k + 1
+                    do_rebuild = (k == 0) or ((step_idx % runtime_update_every) == 0)
+
+                    if do_rebuild:
+                        (
+                            active_pred_centers,
+                            active_pred_levels,
+                            active_pred_parents,
+                            active_pred_ei,
+                            active_pred_mask,
+                            active_pred_ea,
+                        ) = _runtime_build_pred_mesh_from_state(
+                            centers_t=state_centers,
+                            feat_t=state_feat,
+                            level_t=state_levels,
+                            parents_t=state_parents,
+                            cfg=cfg,
+                            H=H,
+                            W=W,
+                            dx=float(dx),
+                            dy=float(dy),
+                            device=device,
+                            wedge_path=runtime_wedge_path,
+                            need_edge_attr=runtime_need_edge_attr,
+                        )
+
+                        if k == 0:
+                            x_in_abs = _map_gt_to_pred_mesh_once(
+                                src_centers=state_centers,
+                                src_feats=state_feat,
+                                pred_centers=active_pred_centers,
+                                knn_k=runtime_knn_k,
+                                chunk=runtime_chunk,
+                            )
+                        else:
+                            x_in_abs = _map_pred_to_next_pred(
+                                pred_centers_src=state_centers,
+                                feats_src=state_feat,
+                                levels_src=state_levels,
+                                parents_src=state_parents,
+                                pred_centers_dst=active_pred_centers,
+                                levels_dst=active_pred_levels,
+                                parents_dst=active_pred_parents,
+                                mask_pred_dst=active_pred_mask.view(-1),
+                                H=H,
+                                W=W,
+                                knn_k=runtime_knn_k,
+                                chunk=runtime_chunk,
+                            )
+                    else:
+                        if active_pred_centers is None:
+                            raise RuntimeError("Runtime mesh state is not initialized before a reuse step.")
+                        x_in_abs = state_feat
+
+                    gt_centers_tp1 = centers_list[k + 1].to(device=device, dtype=torch.float32)
+                    gt_feat_tp1 = feat_list[k + 1].to(device=device, dtype=torch.float32)
+                    x_tgt_abs = _map_gt_to_pred_mesh_once(
+                        src_centers=gt_centers_tp1,
+                        src_feats=gt_feat_tp1,
+                        pred_centers=active_pred_centers,
+                        knn_k=runtime_knn_k,
+                        chunk=runtime_chunk,
+                    )
+
+                    dtk = dt_list[k]
+                    dtk = (
+                        dtk.to(device=device, dtype=x_in_abs.dtype)
+                        if torch.is_tensor(dtk)
+                        else torch.tensor(float(dtk), device=device, dtype=x_in_abs.dtype)
+                    )
+
+                    loss_k, y_pred_abs_k = _run_step_eval(
+                        step_k=k,
+                        pred_centers=active_pred_centers,
+                        pred_levels=active_pred_levels,
+                        pred_parents=active_pred_parents,
+                        pred_ei=active_pred_ei,
+                        pred_ea=active_pred_ea,
+                        x_in_abs=x_in_abs,
+                        x_tgt_abs=x_tgt_abs,
+                        dt_phys=dtk,
+                    )
+
+                    total_loss_accum += float(loss_k.detach().cpu())
+                    n_steps_total += 1
+
+                    t_absk = None
+                    if t_indices is not None:
+                        t_absk = int(t_indices[k + 1].item()) if torch.is_tensor(t_indices) else int(t_indices[k + 1])
+
+                    _accumulate_metrics(
+                        k=k,
+                        t_abs=t_absk,
+                        pred_abs=y_pred_abs_k,
+                        gt_abs=x_tgt_abs,
+                        pred_levels=active_pred_levels,
+                    )
+
+                    if write_budgets and (t_absk is not None):
+                        gt_tp1_abs = feat_list[k + 1].to(device)
+                        gt_tp1_lev = level_list[k + 1].to(device)
+
+                        area, mass, mom_x, mom_y, energy = _compute_budget_row(
+                            x_abs=gt_tp1_abs,
+                            levels=gt_tp1_lev,
+                            dx0=float(dx),
+                            dy0=float(dy),
+                            cfg=cfg,
+                        )
+                        budget_rows.append({
+                            "t_abs": int(t_absk),
+                            "step_k": int(k),
+                            "kind": "gt_on_gt_mesh_tp1",
+                            "mass": mass,
+                            "mom_x": mom_x,
+                            "mom_y": mom_y,
+                            "energy": energy,
+                            "area": area,
+                        })
+
+                        if k == 0:
+                            t_abs_t = int(t_indices[0].item()) if (t_indices is not None and torch.is_tensor(t_indices)) else (int(t_indices[0]) if t_indices is not None else None)
+                            if t_abs_t is not None:
+                                gt_t_abs = feat_list[0].to(device)
+                                gt_t_lev = level_list[0].to(device)
+                                area, mass, mom_x, mom_y, energy = _compute_budget_row(
+                                    x_abs=gt_t_abs,
+                                    levels=gt_t_lev,
+                                    dx0=float(dx),
+                                    dy0=float(dy),
+                                    cfg=cfg,
+                                )
+                                budget_rows.append({
+                                    "t_abs": int(t_abs_t),
+                                    "step_k": -1,
+                                    "kind": "gt_on_gt_mesh_t",
+                                    "mass": mass,
+                                    "mom_x": mom_x,
+                                    "mom_y": mom_y,
+                                    "energy": energy,
+                                    "area": area,
+                                })
+
+                    _append_example_step(
+                        step_idx=k,
+                        pred_centers=active_pred_centers,
+                        pred_levels=active_pred_levels,
+                        pred_parents=active_pred_parents,
+                        y_pred_step_abs=y_pred_abs_k,
+                        centers_list=centers_list,
+                        feat_list=feat_list,
+                        level_list=level_list,
+                        parents_list=parents_list,
+                        batch=batch,
+                    )
+
+                    if write_budgets and (t_absk is not None):
+                        _append_budget_row(
+                            t_abs=t_absk,
+                            step_k=k,
+                            kind="gt_on_pred_mesh_tp1",
+                            x_abs=x_tgt_abs,
+                            pred_levels=active_pred_levels,
+                        )
+                        _append_budget_row(
+                            t_abs=t_absk,
+                            step_k=k,
+                            kind="pred_on_pred_mesh_tp1",
+                            x_abs=y_pred_abs_k,
+                            pred_levels=active_pred_levels,
+                        )
+
+                    state_feat = _enforce_physical_state(y_pred_abs_k, cfg, rho_floor=1e-6, E_floor=1e-6)
+                    state_centers = active_pred_centers
+                    state_levels = active_pred_levels
+                    state_parents = active_pred_parents
+
+                continue
 
             # ===== STEP 0 =====
             k = 0
