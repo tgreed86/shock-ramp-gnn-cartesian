@@ -20,7 +20,7 @@ Also produces qualitative PDFs of feature fields per sample using
 from __future__ import annotations
 print("[train.py] module import started", flush=True)
 from typing import Dict, Any, List, Tuple, Optional, Sequence
-import os, io, json, time, zipfile, random, sys, csv
+import os, io, json, time, zipfile, random, sys, csv, datetime
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler, Subset
@@ -61,7 +61,7 @@ def _compute_norm_stats_from_loader(loader, device):
     mean = None
     M2 = None
 
-    for batch in loader:
+    for batch_idx, batch in enumerate(loader):
         # Prefer the distribution the model actually trains on (pred-mesh mapped)
         xs = []
 
@@ -1338,6 +1338,197 @@ def _get_bbox(cfg: Dict[str,Any]) -> Tuple[float,float,float,float]:
     return xmin, xmax, ymin, ymax
 
 
+def _select_idw_backend(
+    *,
+    src_n: int,
+    requested_chunk: int,
+    out_device: torch.device,
+) -> tuple[torch.device, int]:
+    """
+    Choose a safer device/chunk for IDW cdist blocks.
+    - On MPS, run IDW on CPU to avoid large MPS cdist allocations.
+    - Cap chunk so chunk*src_n pairwise matrix stays bounded.
+    """
+    out_dev = torch.device(out_device)
+    idw_dev = torch.device("cpu") if out_dev.type == "mps" else out_dev
+
+    if src_n <= 0:
+        return idw_dev, max(1, int(requested_chunk))
+
+    # Approximate cap on pairwise distance matrix elements (float32).
+    # CPU can tolerate a larger temporary than GPU backends.
+    max_pair_elems = 64_000_000 if idw_dev.type == "cpu" else 32_000_000
+    cap_chunk = max(1, int(max_pair_elems // int(src_n)))
+    eff_chunk = max(1, min(int(requested_chunk), cap_chunk))
+    return idw_dev, eff_chunk
+
+
+_RUNTIME_STEP_LOG_FIELDS = [
+    "wall_time",
+    "split",
+    "epoch",
+    "batch_idx",
+    "step_k",
+    "t_abs",
+    "used_precomp_step0",
+    "do_rebuild",
+    "update_every_steps",
+    "device",
+    "n_state",
+    "n_pred",
+    "e_pred",
+    "n_gt_src",
+    "idw_dev_xin",
+    "idw_chunk_xin",
+    "n_src_xin",
+    "n_dst_xin",
+    "idw_dev_tgt",
+    "idw_chunk_tgt",
+    "n_src_tgt",
+    "n_dst_tgt",
+    "t_rebuild_s",
+    "t_xin_map_s",
+    "t_xtgt_map_s",
+    "t_model_s",
+    "t_step_total_s",
+    "loss",
+    "mae",
+    "mem_alloc_mb",
+    "mem_reserved_mb",
+]
+
+
+def _runtime_step_log_settings(cfg: Dict[str, Any]) -> tuple[bool, str, bool]:
+    rt_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
+    step_log_cfg = rt_cfg.get("step_log", {}) or {}
+    enabled = bool(step_log_cfg.get("enabled", False))
+    path_default = os.path.join(cfg.get("train", {}).get("save_dir", "."), "runtime_step_log.csv")
+    path = os.path.abspath(os.path.expanduser(str(step_log_cfg.get("path", path_default))))
+    append = bool(step_log_cfg.get("append", False))
+    return enabled, path, append
+
+
+def _runtime_memory_snapshot_mb(device: torch.device) -> tuple[float, float]:
+    dev = torch.device(device)
+    if dev.type == "cuda" and torch.cuda.is_available():
+        didx = dev.index if dev.index is not None else torch.cuda.current_device()
+        alloc = float(torch.cuda.memory_allocated(didx)) / (1024.0 * 1024.0)
+        reserv = float(torch.cuda.memory_reserved(didx)) / (1024.0 * 1024.0)
+        return alloc, reserv
+    if dev.type == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "current_allocated_memory"):
+        try:
+            alloc = float(torch.mps.current_allocated_memory()) / (1024.0 * 1024.0)
+            return alloc, float("nan")
+        except Exception:
+            return float("nan"), float("nan")
+    return float("nan"), float("nan")
+
+
+def _runtime_step_log_write(cfg: Dict[str, Any], row: Dict[str, Any]) -> None:
+    enabled, path, append = _runtime_step_log_settings(cfg)
+    if not enabled:
+        return
+
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    if not hasattr(_runtime_step_log_write, "_initialized_paths"):
+        _runtime_step_log_write._initialized_paths = set()
+
+    init_set = _runtime_step_log_write._initialized_paths
+    if path not in init_set:
+        needs_header = (not append) or (not os.path.exists(path)) or (os.path.getsize(path) == 0)
+        if needs_header:
+            with open(path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=_RUNTIME_STEP_LOG_FIELDS)
+                writer.writeheader()
+        init_set.add(path)
+
+    row_out = {k: row.get(k, "") for k in _RUNTIME_STEP_LOG_FIELDS}
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_RUNTIME_STEP_LOG_FIELDS)
+        writer.writerow(row_out)
+
+
+def _runtime_step_log_write_summary(csv_path: str, summary_path: str) -> None:
+    if not os.path.exists(csv_path):
+        return
+
+    with open(csv_path, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
+    if len(rows) == 0:
+        return
+
+    metrics = [
+        "t_rebuild_s",
+        "t_xin_map_s",
+        "t_xtgt_map_s",
+        "t_model_s",
+        "t_step_total_s",
+        "n_state",
+        "n_pred",
+        "e_pred",
+        "n_gt_src",
+        "n_src_xin",
+        "n_dst_xin",
+        "n_src_tgt",
+        "n_dst_tgt",
+        "loss",
+        "mae",
+        "mem_alloc_mb",
+        "mem_reserved_mb",
+    ]
+
+    groups: dict[str, list[dict[str, str]]] = {"all": rows}
+    for r in rows:
+        sp = str(r.get("split", "unknown"))
+        groups.setdefault(sp, []).append(r)
+
+    def _to_finite(vals: list[str]) -> list[float]:
+        out = []
+        for v in vals:
+            try:
+                x = float(v)
+            except Exception:
+                continue
+            if np.isfinite(x):
+                out.append(x)
+        return out
+
+    def _pct(values: list[float], p: float) -> float:
+        if not values:
+            return float("nan")
+        xs = sorted(values)
+        i = int(round((len(xs) - 1) * p))
+        i = max(0, min(i, len(xs) - 1))
+        return float(xs[i])
+
+    parent = os.path.dirname(summary_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    with open(summary_path, "w") as f:
+        f.write(f"runtime_step_log: {csv_path}\n")
+        f.write(f"rows: {len(rows)}\n\n")
+        for gname in ["all"] + [k for k in groups.keys() if k != "all"]:
+            grows = groups[gname]
+            f.write(f"[{gname}] rows={len(grows)}\n")
+            for m in metrics:
+                vals = _to_finite([r.get(m, "") for r in grows])
+                if not vals:
+                    continue
+                n = len(vals)
+                mean = float(np.mean(vals))
+                vmin = float(np.min(vals))
+                vmax = float(np.max(vals))
+                p95 = _pct(vals, 0.95)
+                f.write(
+                    f"  {m}: n={n} mean={mean:.6g} min={vmin:.6g} max={vmax:.6g} p95={p95:.6g}\n"
+                )
+            f.write("\n")
+
+
 def _map_pred_to_next_pred(pred_centers_src,
                            feats_src,
                            levels_src,
@@ -1356,6 +1547,11 @@ def _map_pred_to_next_pred(pred_centers_src,
     All tensors are moved to the device of feats_src.
     """
     dev = feats_src.device
+    idw_dev, idw_chunk = _select_idw_backend(
+        src_n=int(pred_centers_src.shape[0]),
+        requested_chunk=int(chunk),
+        out_device=dev,
+    )
 
     pred_centers_src = pred_centers_src.to(dev)
     pred_centers_dst = pred_centers_dst.to(dev)
@@ -1399,10 +1595,11 @@ def _map_pred_to_next_pred(pred_centers_src,
     # ---- 2) IDW for the remaining nodes -----------------------------------
     q_idx = need_idw.nonzero(as_tuple=True)[0]
     if q_idx.numel() > 0:
-        q_pts = pred_centers_dst[q_idx]  # (Q,2)
-        idx_map, w_map = build_idw_map(q_pts, pred_centers_src,
-                                        k=knn_k, chunk=chunk)
-        vals = apply_idw_map(idx_map, w_map, feats_src)  # (Q,F)
+        q_pts = pred_centers_dst[q_idx].to(idw_dev, dtype=torch.float32)  # (Q,2)
+        src_pts = pred_centers_src.to(idw_dev, dtype=torch.float32)
+        src_feats = feats_src.to(idw_dev)
+        idx_map, w_map = build_idw_map(q_pts, src_pts, k=knn_k, chunk=idw_chunk)
+        vals = apply_idw_map(idx_map, w_map, src_feats).to(dev)  # (Q,F)
         out[q_idx] = vals
 
     #if cfg.get("debug", {}).get("idw_stats", False):
@@ -1429,13 +1626,20 @@ def _map_gt_to_pred_mesh_once(
     knn_k: int = 8,
     chunk: int = 8192,
 ) -> torch.Tensor:
-    dev = pred_centers.device
-    src_c = src_centers.to(dev, dtype=torch.float32)
-    src_f = src_feats.to(dev, dtype=torch.float32)
-    dst_c = pred_centers.to(dev, dtype=torch.float32)
+    out_dev = pred_centers.device
+    idw_dev, idw_chunk = _select_idw_backend(
+        src_n=int(src_centers.shape[0]),
+        requested_chunk=int(chunk),
+        out_device=out_dev,
+    )
 
-    idx_map, w_map = build_idw_map(dst_c, src_c, k=int(knn_k), chunk=int(chunk))
-    return apply_idw_map(idx_map, w_map, src_f)
+    src_c = src_centers.to(idw_dev, dtype=torch.float32)
+    src_f = src_feats.to(idw_dev, dtype=torch.float32)
+    dst_c = pred_centers.to(idw_dev, dtype=torch.float32)
+
+    idx_map, w_map = build_idw_map(dst_c, src_c, k=int(knn_k), chunk=int(idw_chunk))
+    mapped = apply_idw_map(idx_map, w_map, src_f)
+    return mapped.to(out_dev)
 
 
 @torch.no_grad()
@@ -1666,24 +1870,22 @@ def sanitize_state_for_ops(x_abs: torch.Tensor, cfg: dict, rho_floor=1e-6, E_flo
     u_clip = float(loss.get("u_clip", 1e3))
 
     idx = dec.infer_feature_indices(cfg, x_abs.size(1))
-    out = x_abs.clone()
-
-    rho = out[:, idx["rho"]].clamp_min(rho_floor)
-    E   = out[:, idx["E"]].clamp_min(E_floor)
-
-    mx = out[:, idx["mx"]]
-    my = out[:, idx["my"]]
+    rho = x_abs[:, idx["rho"]].clamp_min(rho_floor)
+    E = x_abs[:, idx["E"]].clamp_min(E_floor)
+    mx = x_abs[:, idx["mx"]]
+    my = x_abs[:, idx["my"]]
 
     # enforce |u| <= u_clip by clamping momenta given rho
     if u_clip > 0:
         mx = mx.clamp(-u_clip * rho, u_clip * rho)
         my = my.clamp(-u_clip * rho, u_clip * rho)
 
-    out[:, idx["rho"]] = rho
-    out[:, idx["E"]]   = E
-    out[:, idx["mx"]]  = mx
-    out[:, idx["my"]]  = my
-    return out
+    cols = [x_abs[:, j] for j in range(x_abs.size(1))]
+    cols[idx["rho"]] = rho
+    cols[idx["E"]] = E
+    cols[idx["mx"]] = mx
+    cols[idx["my"]] = my
+    return torch.stack(cols, dim=1)
 
 def _enforce_physical_state(
     x_abs: torch.Tensor,
@@ -1703,10 +1905,28 @@ def _enforce_physical_state(
     Fdim = int(x_abs.size(1))
     idx = dec.infer_feature_indices(cfg, Fdim)
 
-    x = x_abs.clone()
-    x[:, idx["rho"]] = x[:, idx["rho"]].clamp_min(rho_floor)
-    x[:, idx["E"]]   = x[:, idx["E"]].clamp_min(E_floor)
-    return x
+    cols = [x_abs[:, j] for j in range(Fdim)]
+    cols[idx["rho"]] = cols[idx["rho"]].clamp_min(rho_floor)
+    cols[idx["E"]] = cols[idx["E"]].clamp_min(E_floor)
+    return torch.stack(cols, dim=1)
+
+def _resolve_time_integrator(cfg: dict) -> str:
+    """
+    Resolve the rollout time integrator.
+    Supported: "euler" (default), "rk4".
+    """
+    train_cfg = cfg.get("train", {}) or {}
+    loss_cfg = cfg.get("loss", {}) or {}
+    raw = str(train_cfg.get("time_integrator", loss_cfg.get("time_integrator", "euler"))).strip().lower()
+    aliases = {
+        "euler": "euler",
+        "rk4": "rk4",
+        "runge-kutta4": "rk4",
+        "rungekutta4": "rk4",
+    }
+    if raw not in aliases:
+        raise RuntimeError(f"Unsupported time integrator '{raw}'. Use 'euler' or 'rk4'.")
+    return aliases[raw]
 
 
 def train_one_epoch_multi_step(
@@ -1723,6 +1943,7 @@ def train_one_epoch_multi_step(
     scaler=None,
     mu=None,
     sigma=None,
+    epoch_idx: int | None = None,
 ):
     """
     STRICT multi-step mesh-first training with:
@@ -1824,6 +2045,7 @@ def train_one_epoch_multi_step(
     predict_type = str(cfg.get("model", {}).get("predict_type", "rate")).lower()
     if predict_type != "rate":
         raise RuntimeError(f"PARC/Variant-B implementation below assumes predict_type='rate', got '{predict_type}'")
+    time_integrator = _resolve_time_integrator(cfg)
 
     # DEC / PARC controls
     loss_cfg = cfg.get("loss", {}) or {}
@@ -1863,7 +2085,7 @@ def train_one_epoch_multi_step(
 
     train_one_epoch_multi_step._printed_loss_components = False
 
-    for batch in loader:
+    for batch_idx, batch in enumerate(loader):
         dt_list = batch.get("dt_list", None)
         if dt_list is None:
             raise RuntimeError("Missing dt_list in batch. Ensure the active collate attaches dt_list.")
@@ -1891,9 +2113,20 @@ def train_one_epoch_multi_step(
             raise RuntimeError("window_size must be ≥ 2")
 
         dt_ref_scalar = batch.get("dt_ref", None)
+        t_indices = batch.get("t_indices", None)
+
+        has_precomp_lists = (
+            (pred_centers_list is not None)
+            and (pred_levels_list is not None)
+            and (pred_parents_list is not None)
+            and (pred_ei_list is not None)
+            and (mask_pred_list is not None)
+            and (feat_t_on_pred_list is not None)
+            and (feat_tp1_on_pred_list is not None)
+        )
 
         pred_lists = None
-        if not runtime_mesh_enabled:
+        if (not runtime_mesh_enabled) or has_precomp_lists:
             pred_centers_list = _require_list(batch, "pred_centers_list")
             pred_levels_list = _require_list(batch, "pred_levels_list")
             pred_parents_list = _require_list(batch, "pred_parents_list")
@@ -1902,7 +2135,7 @@ def train_one_epoch_multi_step(
             feat_t_on_pred_list = _require_list(batch, "feat_t_on_pred_list")
             feat_tp1_on_pred_list = _require_list(batch, "feat_tp1_on_pred_list")
 
-            if need_phy and pred_ea_list is None:
+            if (not runtime_mesh_enabled) and need_phy and pred_ea_list is None:
                 raise RuntimeError(
                     "PARC/DEC enabled but batch is missing pred_ea_list / pred_edge_attr_list. "
                     "Update H5 loader + CollateWithPrecompute to attach edge_attr per step."
@@ -2369,7 +2602,16 @@ def train_one_epoch_multi_step(
                             if not adv_step_gate:
                                 da = int(model.parc_adapter.dim_adv)
                                 if da > 0:
-                                    parc_extra[:, :da] = 0.0
+                                    if da >= int(parc_extra.size(1)):
+                                        parc_extra = torch.zeros_like(parc_extra)
+                                    else:
+                                        parc_extra = torch.cat(
+                                            [
+                                                torch.zeros_like(parc_extra[:, :da]),
+                                                parc_extra[:, da:],
+                                            ],
+                                            dim=1,
+                                        )
 
                         x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
 
@@ -2604,6 +2846,163 @@ def train_one_epoch_multi_step(
                         _mark_printed()
                     _assert_finite("y_pred", y_pred)
 
+                r_phy_for_loss = r_phy_abs
+
+                # Optional higher-order integration in normalized-rate space.
+                if time_integrator == "rk4":
+                    def _predict_rate_for_norm_state(
+                        norm_state: torch.Tensor,
+                        *,
+                        update_adapter_stats: bool,
+                    ):
+                        x_state_abs = _maybe_denorm(norm_state, mu, sigma)
+                        r_adv_stage = r_diff_stage = r_phy_stage = None
+                        ch_mask_stage = ch_mask
+
+                        if need_phy:
+                            with torch.autocast(device_type=device.type, enabled=False):
+                                adv_all_steps_stage = bool(loss_cfg.get("adv_all_steps", True))
+                                adv_step_gate_stage = (step_k == 0) if (not adv_all_steps_stage) else True
+
+                                adv_w_stage = float(loss_cfg.get("adv_weight", 1.0))
+                                diff_w_stage = float(loss_cfg.get("diff_weight", 1.0))
+                                include_adv_cfg_stage = bool(loss_cfg.get("parc_include_adv", True))
+                                include_diff_cfg_stage = bool(loss_cfg.get("parc_include_diff", True))
+                                need_adv_stage = (adv_step_gate_stage and include_adv_cfg_stage and (adv_w_stage != 0.0))
+                                need_diff_stage = (include_diff_cfg_stage and (diff_w_stage != 0.0))
+
+                                x_for_ops_stage = sanitize_state_for_ops(x_state_abs, cfg, rho_floor=1e-6, E_floor=1e-6)
+
+                                if use_mls:
+                                    r_adv_stage, r_diff_stage, _ = mls_advdiff_terms_abs_faceadj(
+                                        x_abs=x_for_ops_stage.float(),
+                                        pos=pred_centers,
+                                        edge_index=pei.long(),
+                                        levels=pred_levels,
+                                        dx0=float(dx),
+                                        dy0=float(dy),
+                                        cfg=cfg,
+                                        compute_adv=need_adv_stage,
+                                        compute_diff=need_diff_stage,
+                                    )
+                                else:
+                                    r_adv_stage, r_diff_stage, _ = dec.dec_advdiff_terms_abs(
+                                        x_abs=x_for_ops_stage.float(),
+                                        edge_index=pei.long(),
+                                        pred_ea=pea.float(),
+                                        levels=pred_levels.long().to(device),
+                                        dx0=float(dx),
+                                        dy0=float(dy),
+                                        cfg=cfg,
+                                        compute_adv=need_adv_stage,
+                                        compute_diff=need_diff_stage,
+                                    )
+
+                                if not adv_step_gate_stage:
+                                    r_adv_stage = None
+
+                                if ch_mask_stage is None:
+                                    Fdim_stage = x_state_abs.size(1)
+                                    sel_adv_stage = dec.parc_select_feature_indices_adv(cfg, Fdim_stage)
+                                    sel_diff_stage = dec.parc_select_feature_indices_diff(cfg, Fdim_stage)
+                                    sel_stage = sorted(set(sel_adv_stage + sel_diff_stage))
+                                    ch_mask_stage = torch.zeros((Fdim_stage,), device=device, dtype=torch.float32)
+                                    if len(sel_stage) > 0:
+                                        ch_mask_stage[torch.as_tensor(sel_stage, device=device)] = 1.0
+
+                                if (dec_blend_w != 0.0) or (dec_resid_w != 0.0):
+                                    if need_diff_stage and (r_diff_stage is not None):
+                                        base_stage = diff_w_stage * r_diff_stage
+                                    else:
+                                        ref_stage = r_diff_stage if (r_diff_stage is not None) else r_adv_stage
+                                        if ref_stage is None:
+                                            ref_stage = x_state_abs.float()
+                                        base_stage = torch.zeros_like(ref_stage)
+
+                                    if need_adv_stage and (r_adv_stage is not None):
+                                        base_stage = base_stage + adv_w_stage * r_adv_stage
+                                    r_phy_stage = base_stage
+
+                        x_stage_in = _build_X(norm_state, pred_centers, pred_levels, cfg)
+                        if parc_use and ((r_adv_stage is not None) or (r_diff_stage is not None)):
+                            ref_stage = r_diff_stage if (r_diff_stage is not None) else r_adv_stage
+                            r_adv_in_stage = r_adv_stage if (r_adv_stage is not None) else torch.zeros_like(ref_stage)
+                            r_diff_in_stage = r_diff_stage if (r_diff_stage is not None) else torch.zeros_like(ref_stage)
+
+                            if ch_mask_stage is not None:
+                                cm_stage = ch_mask_stage.to(device=device, dtype=torch.float32).view(1, -1)
+                                r_adv_in_stage = r_adv_in_stage * cm_stage
+                                r_diff_in_stage = r_diff_in_stage * cm_stage
+
+                            parc_extra_stage = dec.parc_terms_to_node_inputs(
+                                r_adv_in_stage.to(device=device, dtype=torch.float32),
+                                r_diff_in_stage.to(device=device, dtype=torch.float32),
+                                dt_phys=dt_phys_f32,
+                                dt_ref=dt_ref_f32,
+                                sigma=sigma_f32,
+                                predict_type=predict_type,
+                                cfg=cfg,
+                                dtype=x_stage_in.dtype,
+                                detach=True,
+                            )
+
+                            if parc_extra_stage is not None and parc_extra_stage.numel() > 0:
+                                if hasattr(model, "parc_adapter") and (model.parc_adapter is not None) and use_adapter:
+                                    adv_active_stage = (r_adv_stage is not None)
+                                    diff_active_stage = (r_diff_stage is not None)
+                                    parc_extra_stage = model.parc_adapter(
+                                        parc_extra_stage,
+                                        update_adv_stats=bool(adv_active_stage and update_adapter_stats),
+                                        update_diff_stats=bool(diff_active_stage and update_adapter_stats),
+                                    )
+
+                                    adv_all_steps_stage = bool(loss_cfg.get("adv_all_steps", True))
+                                    adv_step_gate_stage = (step_k == 0) if (not adv_all_steps_stage) else True
+                                    if not adv_step_gate_stage:
+                                        da = int(model.parc_adapter.dim_adv)
+                                        if da > 0:
+                                            if da >= int(parc_extra_stage.size(1)):
+                                                parc_extra_stage = torch.zeros_like(parc_extra_stage)
+                                            else:
+                                                parc_extra_stage = torch.cat(
+                                                    [
+                                                        torch.zeros_like(parc_extra_stage[:, :da]),
+                                                        parc_extra_stage[:, da:],
+                                                    ],
+                                                    dim=1,
+                                                )
+
+                                x_stage_in = torch.cat([x_stage_in, parc_extra_stage.to(dtype=x_stage_in.dtype)], dim=1)
+
+                        y_corr_stage = _forward_main_head_with_edge_attr(model, x_stage_in, pei, edge_attr=pea)
+                        y_stage = y_corr_stage
+
+                        if need_phy and (dec_blend_w != 0.0) and (r_phy_stage is not None):
+                            with torch.autocast(device_type=device.type, enabled=False):
+                                phy_units_stage = dec.physics_to_model_units(
+                                    r_phy_stage.to(device=device, dtype=torch.float32),
+                                    dt_phys=dt_phys_f32,
+                                    dt_ref=dt_ref_f32,
+                                    sigma=sigma_f32,
+                                    predict_type=predict_type,
+                                )
+                                if ch_mask_stage is not None:
+                                    phy_units_stage = phy_units_stage * ch_mask_stage.view(1, -1).to(
+                                        device=device, dtype=torch.float32
+                                    )
+                            y_stage = y_corr_stage + dec_blend_w * phy_units_stage.to(dtype=y_corr_stage.dtype)
+
+                        return y_stage, r_phy_stage
+
+                    k1 = y_pred
+                    k2, r_phy_k2 = _predict_rate_for_norm_state(norm_in + (0.5 * dt_hat) * k1, update_adapter_stats=False)
+                    k3, r_phy_k3 = _predict_rate_for_norm_state(norm_in + (0.5 * dt_hat) * k2, update_adapter_stats=False)
+                    k4, r_phy_k4 = _predict_rate_for_norm_state(norm_in + dt_hat * k3, update_adapter_stats=False)
+
+                    y_pred = (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
+                    if (r_phy_abs is not None) and (r_phy_k2 is not None) and (r_phy_k3 is not None) and (r_phy_k4 is not None):
+                        r_phy_for_loss = (r_phy_abs + 2.0 * r_phy_k2 + 2.0 * r_phy_k3 + r_phy_k4) / 6.0
+                    _assert_finite("y_pred_rk4", y_pred)
 
                 # ----- supervision target -----
                 delta_target = norm_tgt - norm_in
@@ -2674,13 +3073,13 @@ def train_one_epoch_multi_step(
 
                 # ----- optional physics residual loss (delta-form) -----
                 phy_loss = y_pred.new_zeros(())
-                if need_phy and dec_resid_w > 0.0 and (r_phy_abs is not None):
+                if need_phy and dec_resid_w > 0.0 and (r_phy_for_loss is not None):
                     with torch.autocast(device_type=device.type, enabled=False):
                         phy_loss = dec.physics_residual_loss_delta(
                             y_pred_abs=y_pred_abs.float(),
                             x_in_abs=x_in_abs.float(),
                             dt_phys=dt_phys.float(),          # <-- correct dt for this step
-                            r_phy_abs=r_phy_abs.float(),
+                            r_phy_abs=r_phy_for_loss.float(),
                             area=area.float(),
                             #sigma=(sigma.to(device, dtype=torch.float32) if (sigma is not None and torch.is_tensor(sigma)) else None),
                             sigma=sigma_f32,
@@ -2727,70 +3126,151 @@ def train_one_epoch_multi_step(
             active_pred_mask = None
             active_pred_ea = None
 
+            runtime_has_step0_precomp = (
+                (pred_lists is not None)
+                and (feat_t_on_pred_list is not None)
+                and (feat_tp1_on_pred_list is not None)
+                and (len(feat_t_on_pred_list) > 1)
+                and (len(feat_tp1_on_pred_list) > 1)
+            )
+
             for k in range(0, K - 1):
-                step_idx = k + 1
-                do_rebuild = (k == 0) or ((step_idx % runtime_update_every) == 0)
+                step_wall_t0 = time.perf_counter()
+                used_precomp_step0 = False
+                do_rebuild = False
+                t_rebuild_s = 0.0
+                t_xin_map_s = 0.0
+                t_xtgt_map_s = 0.0
+                t_model_s = 0.0
+                idw_dev_xin = ""
+                idw_chunk_xin = -1
+                n_src_xin = -1
+                n_dst_xin = -1
+                idw_dev_tgt = ""
+                idw_chunk_tgt = -1
+                n_src_tgt = -1
+                n_dst_tgt = -1
 
-                if do_rebuild:
-                    (
-                        active_pred_centers,
-                        active_pred_levels,
-                        active_pred_parents,
-                        active_pred_ei,
-                        active_pred_mask,
-                        active_pred_ea,
-                    ) = _runtime_build_pred_mesh_from_state(
-                        centers_t=state_centers,
-                        feat_t=state_feat,
-                        level_t=state_levels,
-                        parents_t=state_parents,
-                        cfg=cfg,
-                        H=H,
-                        W=W,
-                        dx=float(dx),
-                        dy=float(dy),
-                        device=device,
-                        wedge_path=runtime_wedge_path,
-                        need_edge_attr=runtime_need_edge_attr,
+                if (k == 0) and runtime_has_step0_precomp:
+                    used_precomp_step0 = True
+                    pred_centers_1, pred_levels_1, pred_parents_1, pred_ei_1, mask_pred_1 = _pred_mesh_for_step_strict(
+                        0, pred_lists=pred_lists
                     )
+                    active_pred_centers = _to_dev_nb(pred_centers_1, dtype=torch.float32)
+                    active_pred_levels = _to_dev_nb(pred_levels_1, dtype=torch.long).view(-1)
+                    active_pred_parents = _to_dev_nb(pred_parents_1, dtype=torch.long).view(-1)
+                    active_pred_ei = _to_dev_nb(pred_ei_1, dtype=torch.long)
+                    active_pred_mask = _to_dev_nb(mask_pred_1, dtype=torch.bool)
+                    pred_ea_step0 = pred_ea_list[1] if (pred_ea_list is not None and len(pred_ea_list) > 1) else None
+                    active_pred_ea = _to_dev_nb(pred_ea_step0, dtype=torch.float32)
 
-                    if k == 0:
-                        x_in_abs = _map_gt_to_pred_mesh_once(
-                            src_centers=state_centers,
-                            src_feats=state_feat,
-                            pred_centers=active_pred_centers,
-                            knn_k=runtime_knn_k,
-                            chunk=runtime_chunk,
-                        )
-                    else:
-                        x_in_abs = _map_pred_to_next_pred(
-                            pred_centers_src=state_centers,
-                            feats_src=state_feat,
-                            levels_src=state_levels,
-                            parents_src=state_parents,
-                            pred_centers_dst=active_pred_centers,
-                            levels_dst=active_pred_levels,
-                            parents_dst=active_pred_parents,
-                            mask_pred_dst=active_pred_mask.view(-1),
+                    if runtime_need_edge_attr and active_pred_ea is None:
+                        active_pred_ea = dec_edge_attr_for_dyadic_quads(
+                            active_pred_centers.to("cpu", dtype=torch.float32),
+                            active_pred_levels.to("cpu", dtype=torch.int64),
+                            active_pred_ei.to("cpu", dtype=torch.int64),
+                            dx0=float(dx),
+                            dy0=float(dy),
+                        ).to(device=device, dtype=torch.float32)
+
+                    x_in_abs = _to_dev_nb(feat_t_on_pred_list[1], dtype=torch.float32)
+                    x_tgt_abs = _to_dev_nb(feat_tp1_on_pred_list[1], dtype=torch.float32)
+                else:
+                    step_idx = k + 1
+                    do_rebuild = (k == 0) or ((step_idx % runtime_update_every) == 0)
+
+                    if do_rebuild:
+                        t_rebuild_t0 = time.perf_counter()
+                        (
+                            active_pred_centers,
+                            active_pred_levels,
+                            active_pred_parents,
+                            active_pred_ei,
+                            active_pred_mask,
+                            active_pred_ea,
+                        ) = _runtime_build_pred_mesh_from_state(
+                            centers_t=state_centers,
+                            feat_t=state_feat,
+                            level_t=state_levels,
+                            parents_t=state_parents,
+                            cfg=cfg,
                             H=H,
                             W=W,
-                            knn_k=runtime_knn_k,
-                            chunk=runtime_chunk,
+                            dx=float(dx),
+                            dy=float(dy),
+                            device=device,
+                            wedge_path=runtime_wedge_path,
+                            need_edge_attr=runtime_need_edge_attr,
                         )
-                else:
-                    if active_pred_centers is None:
-                        raise RuntimeError("Runtime mesh state is not initialized before a reuse step.")
-                    x_in_abs = state_feat
+                        t_rebuild_s = time.perf_counter() - t_rebuild_t0
 
-                gt_centers_tp1 = _to_dev_nb(centers_list[k + 1], dtype=torch.float32)
-                gt_feat_tp1 = _to_dev_nb(feat_list[k + 1], dtype=torch.float32)
-                x_tgt_abs = _map_gt_to_pred_mesh_once(
-                    src_centers=gt_centers_tp1,
-                    src_feats=gt_feat_tp1,
-                    pred_centers=active_pred_centers,
-                    knn_k=runtime_knn_k,
-                    chunk=runtime_chunk,
-                )
+                        if k == 0:
+                            n_src_xin = int(state_centers.shape[0])
+                            n_dst_xin = int(active_pred_centers.shape[0])
+                            idw_dev_xin_t, idw_chunk_xin = _select_idw_backend(
+                                src_n=n_src_xin,
+                                requested_chunk=int(runtime_chunk),
+                                out_device=device,
+                            )
+                            idw_dev_xin = idw_dev_xin_t.type
+                            t_xin_t0 = time.perf_counter()
+                            x_in_abs = _map_gt_to_pred_mesh_once(
+                                src_centers=state_centers,
+                                src_feats=state_feat,
+                                pred_centers=active_pred_centers,
+                                knn_k=runtime_knn_k,
+                                chunk=runtime_chunk,
+                            )
+                            t_xin_map_s = time.perf_counter() - t_xin_t0
+                        else:
+                            n_src_xin = int(state_centers.shape[0])
+                            n_dst_xin = int(active_pred_centers.shape[0])
+                            idw_dev_xin_t, idw_chunk_xin = _select_idw_backend(
+                                src_n=n_src_xin,
+                                requested_chunk=int(runtime_chunk),
+                                out_device=device,
+                            )
+                            idw_dev_xin = idw_dev_xin_t.type
+                            t_xin_t0 = time.perf_counter()
+                            x_in_abs = _map_pred_to_next_pred(
+                                pred_centers_src=state_centers,
+                                feats_src=state_feat,
+                                levels_src=state_levels,
+                                parents_src=state_parents,
+                                pred_centers_dst=active_pred_centers,
+                                levels_dst=active_pred_levels,
+                                parents_dst=active_pred_parents,
+                                mask_pred_dst=active_pred_mask.view(-1),
+                                H=H,
+                                W=W,
+                                knn_k=runtime_knn_k,
+                                chunk=runtime_chunk,
+                            )
+                            t_xin_map_s = time.perf_counter() - t_xin_t0
+                    else:
+                        if active_pred_centers is None:
+                            raise RuntimeError("Runtime mesh state is not initialized before a reuse step.")
+                        x_in_abs = state_feat
+
+                    gt_centers_tp1 = _to_dev_nb(centers_list[k + 1], dtype=torch.float32)
+                    gt_feat_tp1 = _to_dev_nb(feat_list[k + 1], dtype=torch.float32)
+                    n_src_tgt = int(gt_centers_tp1.shape[0])
+                    n_dst_tgt = int(active_pred_centers.shape[0])
+                    idw_dev_tgt_t, idw_chunk_tgt = _select_idw_backend(
+                        src_n=n_src_tgt,
+                        requested_chunk=int(runtime_chunk),
+                        out_device=device,
+                    )
+                    idw_dev_tgt = idw_dev_tgt_t.type
+                    t_xtgt_t0 = time.perf_counter()
+                    x_tgt_abs = _map_gt_to_pred_mesh_once(
+                        src_centers=gt_centers_tp1,
+                        src_feats=gt_feat_tp1,
+                        pred_centers=active_pred_centers,
+                        knn_k=runtime_knn_k,
+                        chunk=runtime_chunk,
+                    )
+                    t_xtgt_map_s = time.perf_counter() - t_xtgt_t0
 
                 dtk = dt_list[k]
                 if torch.is_tensor(dtk):
@@ -2798,6 +3278,7 @@ def train_one_epoch_multi_step(
                 else:
                     dtk = torch.tensor(float(dtk), device=device, dtype=x_in_abs.dtype)
 
+                t_model_t0 = time.perf_counter()
                 loss_k, y_pred_abs_k, _ = _run_step(
                     step_k=k,
                     pred_centers=active_pred_centers,
@@ -2811,9 +3292,11 @@ def train_one_epoch_multi_step(
                     dt_ref_scalar=dt_ref_scalar,
                     x_ops_abs=None,
                 )
+                t_model_s = time.perf_counter() - t_model_t0
 
                 window_loss += float(loss_k.detach().cpu())
-                window_mae += float(torch.mean(torch.abs(y_pred_abs_k.detach() - x_tgt_abs)).cpu())
+                step_mae = float(torch.mean(torch.abs(y_pred_abs_k.detach() - x_tgt_abs)).cpu())
+                window_mae += step_mae
                 n_steps += 1
                 window_loss_graph = loss_k if window_loss_graph is None else (window_loss_graph + loss_k)
 
@@ -2821,6 +3304,47 @@ def train_one_epoch_multi_step(
                 state_centers = active_pred_centers
                 state_levels = active_pred_levels
                 state_parents = active_pred_parents
+
+                step_t_abs = -1
+                if t_indices is not None:
+                    step_t_abs = int(t_indices[k + 1].item()) if torch.is_tensor(t_indices) else int(t_indices[k + 1])
+                mem_alloc_mb, mem_reserved_mb = _runtime_memory_snapshot_mb(device)
+                _runtime_step_log_write(
+                    cfg,
+                    {
+                        "wall_time": datetime.datetime.now().isoformat(timespec="seconds"),
+                        "split": "train",
+                        "epoch": (int(epoch_idx) if epoch_idx is not None else -1),
+                        "batch_idx": int(batch_idx),
+                        "step_k": int(k),
+                        "t_abs": int(step_t_abs),
+                        "used_precomp_step0": int(used_precomp_step0),
+                        "do_rebuild": int(do_rebuild),
+                        "update_every_steps": int(runtime_update_every),
+                        "device": str(device),
+                        "n_state": int(x_in_abs.shape[0]) if torch.is_tensor(x_in_abs) else -1,
+                        "n_pred": int(active_pred_centers.shape[0]) if torch.is_tensor(active_pred_centers) else -1,
+                        "e_pred": int(active_pred_ei.shape[1]) if (torch.is_tensor(active_pred_ei) and active_pred_ei.ndim == 2) else -1,
+                        "n_gt_src": int(centers_list[k + 1].shape[0]) if torch.is_tensor(centers_list[k + 1]) else -1,
+                        "idw_dev_xin": idw_dev_xin,
+                        "idw_chunk_xin": int(idw_chunk_xin),
+                        "n_src_xin": int(n_src_xin),
+                        "n_dst_xin": int(n_dst_xin),
+                        "idw_dev_tgt": idw_dev_tgt,
+                        "idw_chunk_tgt": int(idw_chunk_tgt),
+                        "n_src_tgt": int(n_src_tgt),
+                        "n_dst_tgt": int(n_dst_tgt),
+                        "t_rebuild_s": float(t_rebuild_s),
+                        "t_xin_map_s": float(t_xin_map_s),
+                        "t_xtgt_map_s": float(t_xtgt_map_s),
+                        "t_model_s": float(t_model_s),
+                        "t_step_total_s": float(time.perf_counter() - step_wall_t0),
+                        "loss": float(loss_k.detach().cpu()),
+                        "mae": float(step_mae),
+                        "mem_alloc_mb": float(mem_alloc_mb),
+                        "mem_reserved_mb": float(mem_reserved_mb),
+                    },
+                )
 
             # ===== backward + step once per window =====
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -3088,6 +3612,7 @@ def evaluate_one_epoch_multi_step(
     collect_examples: bool = False,
     budget_csv_path: str | None = None,
     write_budgets: bool = False,
+    epoch_idx: int | None = None,
 ):
 
     model.eval()
@@ -3114,6 +3639,7 @@ def evaluate_one_epoch_multi_step(
     predict_type = str(cfg.get("model", {}).get("predict_type", "rate")).lower()
     if predict_type != "rate":
         raise RuntimeError(f"PARC/Variant-B implementation below assumes predict_type='rate', got '{predict_type}'")
+    time_integrator = _resolve_time_integrator(cfg)
 
     loss_cfg = cfg.get("loss", {}) or {}
     dec_use = bool(loss_cfg.get("dec", False))
@@ -3331,8 +3857,18 @@ def evaluate_one_epoch_multi_step(
 
             dt_ref_scalar = batch.get("dt_ref", None)
 
+            has_precomp_lists = (
+                (pred_centers_list is not None)
+                and (pred_levels_list is not None)
+                and (pred_parents_list is not None)
+                and (pred_ei_list is not None)
+                and (mask_pred_list is not None)
+                and (feat_t_on_pred_list is not None)
+                and (feat_tp1_on_pred_list is not None)
+            )
+
             pred_lists = None
-            if not runtime_mesh_enabled:
+            if (not runtime_mesh_enabled) or has_precomp_lists:
                 pred_centers_list = _require_list(batch, "pred_centers_list")
                 pred_levels_list = _require_list(batch, "pred_levels_list")
                 pred_parents_list = _require_list(batch, "pred_parents_list")
@@ -3341,7 +3877,7 @@ def evaluate_one_epoch_multi_step(
                 feat_t_on_pred_list = _require_list(batch, "feat_t_on_pred_list")
                 feat_tp1_on_pred_list = _require_list(batch, "feat_tp1_on_pred_list")
 
-                if need_phy and pred_ea_list is None:
+                if (not runtime_mesh_enabled) and need_phy and pred_ea_list is None:
                     raise RuntimeError(
                         "PARC/DEC enabled but batch is missing pred_ea_list / pred_edge_attr_list."
                     )
@@ -3514,7 +4050,16 @@ def evaluate_one_epoch_multi_step(
                                 if not adv_step_gate:
                                     da = int(model.parc_adapter.dim_adv)
                                     if da > 0:
-                                        parc_extra[:, :da] = 0.0                                
+                                        if da >= int(parc_extra.size(1)):
+                                            parc_extra = torch.zeros_like(parc_extra)
+                                        else:
+                                            parc_extra = torch.cat(
+                                                [
+                                                    torch.zeros_like(parc_extra[:, :da]),
+                                                    parc_extra[:, da:],
+                                                ],
+                                                dim=1,
+                                            )
 
                             x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
 
@@ -3537,6 +4082,150 @@ def evaluate_one_epoch_multi_step(
                         phy_units = phy_units_f32.to(dtype=y_corr.dtype)
                         y_pred = y_corr + dec_blend_w * phy_units
 
+                    r_phy_for_loss = r_phy_abs
+
+                    if time_integrator == "rk4":
+                        def _predict_rate_for_norm_state_eval(norm_state: torch.Tensor):
+                            x_state_abs = _maybe_denorm(norm_state, mu, sigma)
+                            r_adv_stage = r_diff_stage = r_phy_stage = None
+                            ch_mask_stage = ch_mask
+
+                            if need_phy:
+                                with torch.autocast(device_type=device.type, enabled=False):
+                                    adv_all_steps_stage = bool(loss_cfg.get("adv_all_steps", True))
+                                    adv_step_gate_stage = (step_k == 0) if (not adv_all_steps_stage) else True
+                                    adv_w_stage = float(loss_cfg.get("adv_weight", 1.0))
+                                    diff_w_stage = float(loss_cfg.get("diff_weight", 1.0))
+                                    include_adv_cfg_stage = bool(loss_cfg.get("parc_include_adv", True))
+                                    include_diff_cfg_stage = bool(loss_cfg.get("parc_include_diff", True))
+                                    need_adv_stage = (adv_step_gate_stage and include_adv_cfg_stage and (adv_w_stage != 0.0))
+                                    need_diff_stage = (include_diff_cfg_stage and (diff_w_stage != 0.0))
+
+                                    x_for_ops_stage = sanitize_state_for_ops(x_state_abs, cfg, rho_floor=1e-6, E_floor=1e-6)
+
+                                    if use_mls:
+                                        r_adv_stage, r_diff_stage, _ = mls_advdiff_terms_abs_faceadj(
+                                            x_abs=x_for_ops_stage.float(),
+                                            pos=pred_centers.to(device=device, dtype=torch.float32),
+                                            edge_index=pei.long(),
+                                            levels=pred_levels.to(device=device),
+                                            dx0=float(dx),
+                                            dy0=float(dy),
+                                            cfg=cfg,
+                                            compute_adv=need_adv_stage,
+                                            compute_diff=need_diff_stage,
+                                        )
+                                    else:
+                                        r_adv_stage, r_diff_stage, _ = dec.dec_advdiff_terms_abs(
+                                            x_abs=x_for_ops_stage.float(),
+                                            edge_index=pei.long(),
+                                            pred_ea=pea.float(),
+                                            levels=pred_levels.long().to(device),
+                                            dx0=float(dx),
+                                            dy0=float(dy),
+                                            cfg=cfg,
+                                            compute_adv=need_adv_stage,
+                                            compute_diff=need_diff_stage,
+                                        )
+
+                                    if not adv_step_gate_stage:
+                                        r_adv_stage = None
+
+                                    if ch_mask_stage is None:
+                                        Fdim_stage = x_state_abs.size(1)
+                                        sel_adv_stage = dec.parc_select_feature_indices_adv(cfg, Fdim_stage)
+                                        sel_diff_stage = dec.parc_select_feature_indices_diff(cfg, Fdim_stage)
+                                        sel_stage = sorted(set(sel_adv_stage + sel_diff_stage))
+                                        ch_mask_stage = torch.zeros((Fdim_stage,), device=device, dtype=torch.float32)
+                                        if len(sel_stage) > 0:
+                                            ch_mask_stage[torch.as_tensor(sel_stage, device=device)] = 1.0
+
+                                    if (dec_blend_w != 0.0) or (dec_resid_w != 0.0):
+                                        if need_diff_stage and (r_diff_stage is not None):
+                                            base_stage = diff_w_stage * r_diff_stage
+                                        else:
+                                            ref_stage = r_diff_stage if (r_diff_stage is not None) else r_adv_stage
+                                            if ref_stage is None:
+                                                ref_stage = x_state_abs.float()
+                                            base_stage = torch.zeros_like(ref_stage)
+                                        if need_adv_stage and (r_adv_stage is not None):
+                                            base_stage = base_stage + adv_w_stage * r_adv_stage
+                                        r_phy_stage = base_stage
+
+                            x_stage_in = _build_X(norm_state, pred_centers, pred_levels, cfg)
+                            if parc_use and ((r_adv_stage is not None) or (r_diff_stage is not None)):
+                                ref_stage = r_diff_stage if (r_diff_stage is not None) else r_adv_stage
+                                r_adv_in_stage = r_adv_stage if (r_adv_stage is not None) else torch.zeros_like(ref_stage)
+                                r_diff_in_stage = r_diff_stage if (r_diff_stage is not None) else torch.zeros_like(ref_stage)
+
+                                if ch_mask_stage is not None:
+                                    cm_stage = ch_mask_stage.view(1, -1).to(device=device, dtype=torch.float32)
+                                    r_adv_in_stage = r_adv_in_stage * cm_stage
+                                    r_diff_in_stage = r_diff_in_stage * cm_stage
+
+                                parc_extra_stage = dec.parc_terms_to_node_inputs(
+                                    r_adv_in_stage.to(device=device, dtype=torch.float32),
+                                    r_diff_in_stage.to(device=device, dtype=torch.float32),
+                                    dt_phys=dt_phys_f32,
+                                    dt_ref=dt_ref_f32,
+                                    sigma=sigma_f32,
+                                    predict_type=predict_type,
+                                    cfg=cfg,
+                                    dtype=x_stage_in.dtype,
+                                    detach=True,
+                                )
+                                if parc_extra_stage is not None and parc_extra_stage.numel() > 0:
+                                    if hasattr(model, "parc_adapter") and (model.parc_adapter is not None) and use_adapter:
+                                        parc_extra_stage = model.parc_adapter(
+                                            parc_extra_stage,
+                                            update_adv_stats=False,
+                                            update_diff_stats=False,
+                                        )
+
+                                        adv_all_steps_stage = bool(loss_cfg.get("adv_all_steps", True))
+                                        adv_step_gate_stage = (step_k == 0) if (not adv_all_steps_stage) else True
+                                        if not adv_step_gate_stage:
+                                            da = int(model.parc_adapter.dim_adv)
+                                            if da > 0:
+                                                if da >= int(parc_extra_stage.size(1)):
+                                                    parc_extra_stage = torch.zeros_like(parc_extra_stage)
+                                                else:
+                                                    parc_extra_stage = torch.cat(
+                                                        [
+                                                            torch.zeros_like(parc_extra_stage[:, :da]),
+                                                            parc_extra_stage[:, da:],
+                                                        ],
+                                                        dim=1,
+                                                    )
+
+                                    x_stage_in = torch.cat([x_stage_in, parc_extra_stage.to(dtype=x_stage_in.dtype)], dim=1)
+
+                            y_corr_stage = _forward_main_head_with_edge_attr(model, x_stage_in, pei, edge_attr=pea)
+                            y_stage = y_corr_stage
+
+                            if need_phy and (dec_blend_w != 0.0) and (r_phy_stage is not None):
+                                with torch.autocast(device_type=device.type, enabled=False):
+                                    phy_units_stage = dec.physics_to_model_units(
+                                        r_phy_stage.to(dtype=torch.float32),
+                                        dt_phys=dt_phys_f32,
+                                        dt_ref=dt_ref_f32,
+                                        sigma=sigma_f32,
+                                        predict_type=predict_type,
+                                    )
+                                    if ch_mask_stage is not None:
+                                        phy_units_stage = phy_units_stage * ch_mask_stage.view(1, -1).to(dtype=torch.float32)
+                                y_stage = y_corr_stage + dec_blend_w * phy_units_stage.to(dtype=y_corr_stage.dtype)
+
+                            return y_stage, r_phy_stage
+
+                        k1 = y_pred
+                        k2, r_phy_k2 = _predict_rate_for_norm_state_eval(norm_in + (0.5 * dt_hat) * k1)
+                        k3, r_phy_k3 = _predict_rate_for_norm_state_eval(norm_in + (0.5 * dt_hat) * k2)
+                        k4, r_phy_k4 = _predict_rate_for_norm_state_eval(norm_in + dt_hat * k3)
+                        y_pred = (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
+                        if (r_phy_abs is not None) and (r_phy_k2 is not None) and (r_phy_k3 is not None) and (r_phy_k4 is not None):
+                            r_phy_for_loss = (r_phy_abs + 2.0 * r_phy_k2 + 2.0 * r_phy_k3 + r_phy_k4) / 6.0
+
                     # targets / loss in fp32 for stability
                     with torch.autocast(device_type=device.type, enabled=False):
                         delta_target_f32 = (norm_tgt - norm_in).to(dtype=torch.float32)
@@ -3556,13 +4245,13 @@ def evaluate_one_epoch_multi_step(
                     tmp_loss = (temporal_consistency(x_in, norm_tgt) if tmp_w > 0 else y_pred.new_zeros(()))
 
                     phy_loss = y_pred.new_zeros(())
-                    if need_phy and dec_resid_w > 0.0 and (r_phy_abs is not None):
+                    if need_phy and dec_resid_w > 0.0 and (r_phy_for_loss is not None):
                         with torch.autocast(device_type=device.type, enabled=False):
                             phy_loss = dec.physics_residual_loss_delta(
                                 y_pred_abs=y_pred_abs.float(),
                                 x_in_abs=x_in_abs.float(),
                                 dt_phys=dt_phys.float(),
-                                r_phy_abs=r_phy_abs.float(),
+                                r_phy_abs=r_phy_for_loss.float(),
                                 area=area.float(),
                                 #sigma=(sigma.to(device, dtype=torch.float32) if (sigma is not None and torch.is_tensor(sigma)) else None),
                                 sigma=sigma_f32,
@@ -3589,70 +4278,155 @@ def evaluate_one_epoch_multi_step(
                 active_pred_mask = None
                 active_pred_ea = None
 
-                for k in range(0, K - 1):
-                    step_idx = k + 1
-                    do_rebuild = (k == 0) or ((step_idx % runtime_update_every) == 0)
+                runtime_has_step0_precomp = (
+                    (pred_lists is not None)
+                    and (feat_t_on_pred_list is not None)
+                    and (feat_tp1_on_pred_list is not None)
+                    and (len(feat_t_on_pred_list) > 1)
+                    and (len(feat_tp1_on_pred_list) > 1)
+                )
 
-                    if do_rebuild:
-                        (
-                            active_pred_centers,
-                            active_pred_levels,
-                            active_pred_parents,
-                            active_pred_ei,
-                            active_pred_mask,
-                            active_pred_ea,
-                        ) = _runtime_build_pred_mesh_from_state(
-                            centers_t=state_centers,
-                            feat_t=state_feat,
-                            level_t=state_levels,
-                            parents_t=state_parents,
-                            cfg=cfg,
-                            H=H,
-                            W=W,
-                            dx=float(dx),
-                            dy=float(dy),
-                            device=device,
-                            wedge_path=runtime_wedge_path,
-                            need_edge_attr=runtime_need_edge_attr,
+                for k in range(0, K - 1):
+                    step_wall_t0 = time.perf_counter()
+                    used_precomp_step0 = False
+                    do_rebuild = False
+                    t_rebuild_s = 0.0
+                    t_xin_map_s = 0.0
+                    t_xtgt_map_s = 0.0
+                    t_model_s = 0.0
+                    idw_dev_xin = ""
+                    idw_chunk_xin = -1
+                    n_src_xin = -1
+                    n_dst_xin = -1
+                    idw_dev_tgt = ""
+                    idw_chunk_tgt = -1
+                    n_src_tgt = -1
+                    n_dst_tgt = -1
+
+                    if (k == 0) and runtime_has_step0_precomp:
+                        used_precomp_step0 = True
+                        pred_centers_1, pred_levels_1, pred_parents_1, pred_ei_1, mask_pred_1 = _pred_mesh_for_step_strict(
+                            0, pred_lists=pred_lists
+                        )
+                        active_pred_centers = pred_centers_1.to(device=device, dtype=torch.float32)
+                        active_pred_levels = pred_levels_1.to(device=device, dtype=torch.long).view(-1)
+                        active_pred_parents = pred_parents_1.to(device=device, dtype=torch.long).view(-1)
+                        active_pred_ei = pred_ei_1.to(device=device, dtype=torch.long)
+                        active_pred_mask = mask_pred_1.to(device=device, dtype=torch.bool)
+                        pred_ea_step0 = pred_ea_list[1] if (pred_ea_list is not None and len(pred_ea_list) > 1) else None
+                        active_pred_ea = (
+                            pred_ea_step0.to(device=device, dtype=torch.float32)
+                            if torch.is_tensor(pred_ea_step0)
+                            else None
                         )
 
-                        if k == 0:
-                            x_in_abs = _map_gt_to_pred_mesh_once(
-                                src_centers=state_centers,
-                                src_feats=state_feat,
-                                pred_centers=active_pred_centers,
-                                knn_k=runtime_knn_k,
-                                chunk=runtime_chunk,
-                            )
-                        else:
-                            x_in_abs = _map_pred_to_next_pred(
-                                pred_centers_src=state_centers,
-                                feats_src=state_feat,
-                                levels_src=state_levels,
-                                parents_src=state_parents,
-                                pred_centers_dst=active_pred_centers,
-                                levels_dst=active_pred_levels,
-                                parents_dst=active_pred_parents,
-                                mask_pred_dst=active_pred_mask.view(-1),
+                        if runtime_need_edge_attr and active_pred_ea is None:
+                            active_pred_ea = dec_edge_attr_for_dyadic_quads(
+                                active_pred_centers.to("cpu", dtype=torch.float32),
+                                active_pred_levels.to("cpu", dtype=torch.int64),
+                                active_pred_ei.to("cpu", dtype=torch.int64),
+                                dx0=float(dx),
+                                dy0=float(dy),
+                            ).to(device=device, dtype=torch.float32)
+
+                        x_in_abs = feat_t_on_pred_list[1].to(device=device, dtype=torch.float32)
+                        x_tgt_abs = feat_tp1_on_pred_list[1].to(device=device, dtype=torch.float32)
+                    else:
+                        step_idx = k + 1
+                        do_rebuild = (k == 0) or ((step_idx % runtime_update_every) == 0)
+
+                        if do_rebuild:
+                            t_rebuild_t0 = time.perf_counter()
+                            (
+                                active_pred_centers,
+                                active_pred_levels,
+                                active_pred_parents,
+                                active_pred_ei,
+                                active_pred_mask,
+                                active_pred_ea,
+                            ) = _runtime_build_pred_mesh_from_state(
+                                centers_t=state_centers,
+                                feat_t=state_feat,
+                                level_t=state_levels,
+                                parents_t=state_parents,
+                                cfg=cfg,
                                 H=H,
                                 W=W,
-                                knn_k=runtime_knn_k,
-                                chunk=runtime_chunk,
+                                dx=float(dx),
+                                dy=float(dy),
+                                device=device,
+                                wedge_path=runtime_wedge_path,
+                                need_edge_attr=runtime_need_edge_attr,
                             )
-                    else:
-                        if active_pred_centers is None:
-                            raise RuntimeError("Runtime mesh state is not initialized before a reuse step.")
-                        x_in_abs = state_feat
+                            t_rebuild_s = time.perf_counter() - t_rebuild_t0
 
-                    gt_centers_tp1 = centers_list[k + 1].to(device=device, dtype=torch.float32)
-                    gt_feat_tp1 = feat_list[k + 1].to(device=device, dtype=torch.float32)
-                    x_tgt_abs = _map_gt_to_pred_mesh_once(
-                        src_centers=gt_centers_tp1,
-                        src_feats=gt_feat_tp1,
-                        pred_centers=active_pred_centers,
-                        knn_k=runtime_knn_k,
-                        chunk=runtime_chunk,
-                    )
+                            if k == 0:
+                                n_src_xin = int(state_centers.shape[0])
+                                n_dst_xin = int(active_pred_centers.shape[0])
+                                idw_dev_xin_t, idw_chunk_xin = _select_idw_backend(
+                                    src_n=n_src_xin,
+                                    requested_chunk=int(runtime_chunk),
+                                    out_device=device,
+                                )
+                                idw_dev_xin = idw_dev_xin_t.type
+                                t_xin_t0 = time.perf_counter()
+                                x_in_abs = _map_gt_to_pred_mesh_once(
+                                    src_centers=state_centers,
+                                    src_feats=state_feat,
+                                    pred_centers=active_pred_centers,
+                                    knn_k=runtime_knn_k,
+                                    chunk=runtime_chunk,
+                                )
+                                t_xin_map_s = time.perf_counter() - t_xin_t0
+                            else:
+                                n_src_xin = int(state_centers.shape[0])
+                                n_dst_xin = int(active_pred_centers.shape[0])
+                                idw_dev_xin_t, idw_chunk_xin = _select_idw_backend(
+                                    src_n=n_src_xin,
+                                    requested_chunk=int(runtime_chunk),
+                                    out_device=device,
+                                )
+                                idw_dev_xin = idw_dev_xin_t.type
+                                t_xin_t0 = time.perf_counter()
+                                x_in_abs = _map_pred_to_next_pred(
+                                    pred_centers_src=state_centers,
+                                    feats_src=state_feat,
+                                    levels_src=state_levels,
+                                    parents_src=state_parents,
+                                    pred_centers_dst=active_pred_centers,
+                                    levels_dst=active_pred_levels,
+                                    parents_dst=active_pred_parents,
+                                    mask_pred_dst=active_pred_mask.view(-1),
+                                    H=H,
+                                    W=W,
+                                    knn_k=runtime_knn_k,
+                                    chunk=runtime_chunk,
+                                )
+                                t_xin_map_s = time.perf_counter() - t_xin_t0
+                        else:
+                            if active_pred_centers is None:
+                                raise RuntimeError("Runtime mesh state is not initialized before a reuse step.")
+                            x_in_abs = state_feat
+
+                        gt_centers_tp1 = centers_list[k + 1].to(device=device, dtype=torch.float32)
+                        gt_feat_tp1 = feat_list[k + 1].to(device=device, dtype=torch.float32)
+                        n_src_tgt = int(gt_centers_tp1.shape[0])
+                        n_dst_tgt = int(active_pred_centers.shape[0])
+                        idw_dev_tgt_t, idw_chunk_tgt = _select_idw_backend(
+                            src_n=n_src_tgt,
+                            requested_chunk=int(runtime_chunk),
+                            out_device=device,
+                        )
+                        idw_dev_tgt = idw_dev_tgt_t.type
+                        t_xtgt_t0 = time.perf_counter()
+                        x_tgt_abs = _map_gt_to_pred_mesh_once(
+                            src_centers=gt_centers_tp1,
+                            src_feats=gt_feat_tp1,
+                            pred_centers=active_pred_centers,
+                            knn_k=runtime_knn_k,
+                            chunk=runtime_chunk,
+                        )
+                        t_xtgt_map_s = time.perf_counter() - t_xtgt_t0
 
                     dtk = dt_list[k]
                     dtk = (
@@ -3661,6 +4435,7 @@ def evaluate_one_epoch_multi_step(
                         else torch.tensor(float(dtk), device=device, dtype=x_in_abs.dtype)
                     )
 
+                    t_model_t0 = time.perf_counter()
                     loss_k, y_pred_abs_k = _run_step_eval(
                         step_k=k,
                         pred_centers=active_pred_centers,
@@ -3672,6 +4447,7 @@ def evaluate_one_epoch_multi_step(
                         x_tgt_abs=x_tgt_abs,
                         dt_phys=dtk,
                     )
+                    t_model_s = time.perf_counter() - t_model_t0
 
                     total_loss_accum += float(loss_k.detach().cpu())
                     n_steps_total += 1
@@ -3686,6 +4462,45 @@ def evaluate_one_epoch_multi_step(
                         pred_abs=y_pred_abs_k,
                         gt_abs=x_tgt_abs,
                         pred_levels=active_pred_levels,
+                    )
+
+                    step_mae = float(torch.mean(torch.abs(y_pred_abs_k.detach() - x_tgt_abs)).cpu())
+                    mem_alloc_mb, mem_reserved_mb = _runtime_memory_snapshot_mb(device)
+                    _runtime_step_log_write(
+                        cfg,
+                        {
+                            "wall_time": datetime.datetime.now().isoformat(timespec="seconds"),
+                            "split": "eval",
+                            "epoch": (int(epoch_idx) if epoch_idx is not None else -1),
+                            "batch_idx": int(batch_idx),
+                            "step_k": int(k),
+                            "t_abs": int(t_absk) if t_absk is not None else -1,
+                            "used_precomp_step0": int(used_precomp_step0),
+                            "do_rebuild": int(do_rebuild),
+                            "update_every_steps": int(runtime_update_every),
+                            "device": str(device),
+                            "n_state": int(x_in_abs.shape[0]) if torch.is_tensor(x_in_abs) else -1,
+                            "n_pred": int(active_pred_centers.shape[0]) if torch.is_tensor(active_pred_centers) else -1,
+                            "e_pred": int(active_pred_ei.shape[1]) if (torch.is_tensor(active_pred_ei) and active_pred_ei.ndim == 2) else -1,
+                            "n_gt_src": int(centers_list[k + 1].shape[0]) if torch.is_tensor(centers_list[k + 1]) else -1,
+                            "idw_dev_xin": idw_dev_xin,
+                            "idw_chunk_xin": int(idw_chunk_xin),
+                            "n_src_xin": int(n_src_xin),
+                            "n_dst_xin": int(n_dst_xin),
+                            "idw_dev_tgt": idw_dev_tgt,
+                            "idw_chunk_tgt": int(idw_chunk_tgt),
+                            "n_src_tgt": int(n_src_tgt),
+                            "n_dst_tgt": int(n_dst_tgt),
+                            "t_rebuild_s": float(t_rebuild_s),
+                            "t_xin_map_s": float(t_xin_map_s),
+                            "t_xtgt_map_s": float(t_xtgt_map_s),
+                            "t_model_s": float(t_model_s),
+                            "t_step_total_s": float(time.perf_counter() - step_wall_t0),
+                            "loss": float(loss_k.detach().cpu()),
+                            "mae": float(step_mae),
+                            "mem_alloc_mb": float(mem_alloc_mb),
+                            "mem_reserved_mb": float(mem_reserved_mb),
+                        },
                     )
 
                     if write_budgets and (t_absk is not None):
@@ -4148,14 +4963,24 @@ def main(config_path: str | None = None):
     cfg.setdefault("speed", {}).setdefault("knn_k", 8)
     cfg.setdefault("speed", {}).setdefault("cache_interps", True)
 
+    train_cfg = cfg.setdefault("train", {})
+    train_cfg.setdefault("validation_every_epochs", 1)
+
     # Runtime mesh defaults (infrastructure only in this commit)
-    runtime_mesh_cfg = cfg.setdefault("train", {}).setdefault("runtime_mesh", {})
+    runtime_mesh_cfg = train_cfg.setdefault("runtime_mesh", {})
     runtime_mesh_cfg.setdefault("enabled", False)
     runtime_mesh_cfg.setdefault("detach_policy_input", True)
     runtime_mesh_cfg.setdefault("reset_to_coarse_each_step", True)
     runtime_mesh_cfg.setdefault("refine_only", True)
+    runtime_mesh_cfg.setdefault("warm_start_from_precompute", True)
     runtime_mesh_cfg.setdefault("update_every_steps", 1)
     runtime_mesh_cfg.setdefault("max_cells_per_step", 400_000)
+    step_log_cfg = runtime_mesh_cfg.setdefault("step_log", {})
+    if not isinstance(step_log_cfg, dict):
+        raise ValueError("train.runtime_mesh.step_log must be a JSON object when provided.")
+    step_log_cfg.setdefault("enabled", False)
+    step_log_cfg.setdefault("path", os.path.join(cfg.get("train", {}).get("save_dir", "."), "runtime_step_log.csv"))
+    step_log_cfg.setdefault("append", False)
 
     runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
     runtime_update_every = int(runtime_mesh_cfg.get("update_every_steps", 1))
@@ -4177,6 +5002,9 @@ def main(config_path: str | None = None):
         if not os.path.exists(mesh_path):
             raise FileNotFoundError(f"Runtime mesh mode expected mesh spec at: {mesh_path}")
         cfg.setdefault("mesh", {})["starting_mesh_path"] = mesh_path
+        if bool(step_log_cfg.get("enabled", False)):
+            _enabled, step_log_path, _append = _runtime_step_log_settings(cfg)
+            print(f"[RUNTIME-MESH] step log enabled: {step_log_path}")
 
     # Ensure dataset sees the intended columns
     if cfg.get("data", {}).get("feature_idx") and not cfg.get("features", {}).get("use_columns"):
@@ -4343,12 +5171,10 @@ def main(config_path: str | None = None):
     test_ds  = Subset(full_ds, test_idx.tolist())
 
     precomp = None
-    if runtime_mesh_enabled:
-        print(
-            "[RUNTIME-MESH] enabled (infrastructure mode): skipping precompute and using dt-only collate."
-        )
-        collate = CollateWithDtOnly(dt_transitions=dt_transitions, dt_ref=dt_ref)
-    else:
+    runtime_warm_start_precomp = bool(runtime_mesh_cfg.get("warm_start_from_precompute", True))
+    use_precomp_collate = (not runtime_mesh_enabled) or runtime_warm_start_precomp
+
+    if use_precomp_collate:
         cache_path = cfg["train"].get("precomp_cache_path", None)
         force_recompute = bool(cfg["train"].get("precomp_force_recompute", False))
 
@@ -4397,14 +5223,25 @@ def main(config_path: str | None = None):
         ):
             # After move_precomp_to_device(precomp, device)
             # precomp must include a list aligned to pred_ei_list, e.g. key "pred_ea_list" or "pred_edge_attr_list"
-            if isinstance(precomp, dict):
+            if (not runtime_mesh_enabled) and isinstance(precomp, dict):
                 if ("pred_edge_attr" not in precomp) and ("pred_ea" not in precomp):
                     raise RuntimeError(
                         "DEC enabled but precomp is missing pred_ea_list/pred_edge_attr_list. "
                         "Update H5->precomp loader and CollateWithPrecompute to read/store pred_edge_attr."
                     )
 
+        if runtime_mesh_enabled:
+            print(
+                "[RUNTIME-MESH] warm-start enabled: using precomputed step-0 meshes/maps, "
+                "then runtime remeshing for later steps."
+            )
+
         collate = CollateWithPrecompute(precomp, dt_transitions=dt_transitions, dt_ref=dt_ref)
+    else:
+        print(
+            "[RUNTIME-MESH] enabled: skipping precompute and using dt-only collate."
+        )
+        collate = CollateWithDtOnly(dt_transitions=dt_transitions, dt_ref=dt_ref)
 
     train_loader = DataLoader(
         train_ds, batch_size=1, sampler=RandomSampler(train_ds),
@@ -4483,32 +5320,43 @@ def main(config_path: str | None = None):
         f.write("epoch,split,loss,mae\n")
 
     print("[INFO] Starting training...")
+    total_epochs = int(cfg["train"]["epochs"])
+    val_every = int(cfg.get("train", {}).get("validation_every_epochs", 1))
+    if val_every < 1:
+        raise ValueError("train.validation_every_epochs must be >= 1.")
+    print(f"[INFO] Validation cadence: every {val_every} epoch(s) + final epoch.")
+
     best_val = float("inf")
     TR, VL = [], []
-    for epoch in range(1, int(cfg["train"]["epochs"]) + 1):
+    for epoch in range(1, total_epochs + 1):
         t0 = time.time()
         #batch = next(iter(train_loader))
 
         # unpack: loss, mae, stats
         tr_loss, tr_mae, tr_stats = train_one_epoch_multi_step(
             model, train_loader, opt, cfg, device,
-            H=H, W=W, dx=dx, dy=dy, mu=mu, sigma=sigma
+            H=H, W=W, dx=dx, dy=dy, mu=mu, sigma=sigma, epoch_idx=epoch
         )
-        vl_loss, vl_stats = evaluate_one_epoch_multi_step(
-            model, val_loader, cfg, device,
-            H=H, W=W, dx=dx, dy=dy, mu=mu, sigma=sigma,
-            collect_examples=False
-        )
+        run_validation = ((epoch % val_every) == 0) or (epoch == total_epochs)
+        vl_loss = float("nan")
+        vl_stats = None
+        if run_validation:
+            vl_loss, vl_stats = evaluate_one_epoch_multi_step(
+                model, val_loader, cfg, device,
+                H=H, W=W, dx=dx, dy=dy, mu=mu, sigma=sigma,
+                collect_examples=False, epoch_idx=epoch
+            )
 
         TR.append(tr_loss)
-        VL.append(vl_loss)
+        VL.append(vl_loss if run_validation else float("nan"))
         with open(log_csv, "a") as f:
             # epoch, split, loss, mae
             f.write(f"{epoch},train,{tr_loss:.10f},{tr_mae:.10f}\n")
-            f.write(f"{epoch},val,{vl_loss:.6f}\n")
+            if run_validation:
+                f.write(f"{epoch},val,{vl_loss:.6f}\n")
 
         # track best model by validation loss
-        if vl_loss < best_val:
+        if run_validation and (vl_loss < best_val):
             best_val = vl_loss
             torch.save(model.state_dict(),
                     os.path.join(cfg["train"]["save_dir"], "best_model.pt"))
@@ -4523,15 +5371,26 @@ def main(config_path: str | None = None):
                 )
                 scheduler.min_lrs = [base_min] * len(opt.param_groups)
 
-        if scheduler is not None:
+        if scheduler is not None and run_validation:
             scheduler.step(vl_loss)
 
-        print(
-            f"[INFO] Epoch {epoch:03d}: "
-            f"train {tr_loss:.6f} (MAE {tr_mae:.6f}) | "
-            f"val {vl_loss:.6f} | "
-            f"{dt:.1f}s | lr={_get_lr(opt):.3e}"
-        )
+        if run_validation:
+            print(
+                f"[INFO] Epoch {epoch:03d}: "
+                f"train {tr_loss:.6f} (MAE {tr_mae:.6f}) | "
+                f"val {vl_loss:.6f} | "
+                f"{dt:.1f}s | lr={_get_lr(opt):.3e}"
+            )
+        else:
+            next_val_epoch = epoch + (val_every - (epoch % val_every))
+            if next_val_epoch > total_epochs:
+                next_val_epoch = total_epochs
+            print(
+                f"[INFO] Epoch {epoch:03d}: "
+                f"train {tr_loss:.6f} (MAE {tr_mae:.6f}) | "
+                f"val skipped (every {val_every}; next {next_val_epoch:03d}) | "
+                f"{dt:.1f}s | lr={_get_lr(opt):.3e}"
+            )
 
     def _precomp_to_cpu(precomp):
         if precomp is None:
@@ -4596,6 +5455,15 @@ def main(config_path: str | None = None):
     )
 
     print(f"[TEST] loss={test_loss:.4e}")
+
+    step_log_enabled, step_log_path, _step_log_append = _runtime_step_log_settings(cfg)
+    if step_log_enabled:
+        summary_path = os.path.splitext(step_log_path)[0] + "_summary.txt"
+        try:
+            _runtime_step_log_write_summary(step_log_path, summary_path)
+            print(f"[RUNTIME-MESH] step log summary written: {summary_path}")
+        except Exception as e:
+            print(f"[RUNTIME-MESH][WARN] failed to write step log summary: {e!r}")
 
     # Save config file
     save_config(os.path.join(cfg["train"]["save_dir"]), cfg)

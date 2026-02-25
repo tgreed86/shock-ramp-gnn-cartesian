@@ -53,6 +53,7 @@ import torch
 import matplotlib
 matplotlib.use("Agg")  # critical on macOS for headless/stability
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
 
 import imageio.v2 as imageio
 from torch.utils.data import DataLoader, SequentialSampler, Subset
@@ -211,6 +212,258 @@ def _sym_lims_from_abs(a: np.ndarray, abs_q: float, max_n: Optional[int]) -> Tup
     if not np.isfinite(lim) or lim == 0.0:
         lim = 1e-12
     return -lim, lim
+
+
+# ----------------- Mesh GIF helpers (mesh_gif.py style) ----------------- #
+
+def _mesh_segments_from_centers_levels(
+    centers: np.ndarray,  # (N,2)
+    levels: np.ndarray,   # (N,)
+    dx0: float,
+    dy0: float,
+) -> np.ndarray:
+    """Build axis-aligned quad edge segments implied by AMR (center, level)."""
+    c = np.asarray(centers, dtype=np.float32)
+    L = np.asarray(levels, dtype=np.int64)
+    if c.size == 0:
+        return np.empty((0, 2, 2), dtype=np.float32)
+
+    scale = np.power(2.0, L.astype(np.float32))
+    hx = (dx0 / scale) * 0.5
+    hy = (dy0 / scale) * 0.5
+
+    x = c[:, 0]
+    y = c[:, 1]
+    x0 = x - hx
+    x1 = x + hx
+    y0 = y - hy
+    y1 = y + hy
+
+    N = c.shape[0]
+    segs = np.empty((4 * N, 2, 2), dtype=np.float32)
+
+    # bottom
+    segs[0 * N:1 * N, 0, 0] = x0
+    segs[0 * N:1 * N, 0, 1] = y0
+    segs[0 * N:1 * N, 1, 0] = x1
+    segs[0 * N:1 * N, 1, 1] = y0
+    # right
+    segs[1 * N:2 * N, 0, 0] = x1
+    segs[1 * N:2 * N, 0, 1] = y0
+    segs[1 * N:2 * N, 1, 0] = x1
+    segs[1 * N:2 * N, 1, 1] = y1
+    # top
+    segs[2 * N:3 * N, 0, 0] = x1
+    segs[2 * N:3 * N, 0, 1] = y1
+    segs[2 * N:3 * N, 1, 0] = x0
+    segs[2 * N:3 * N, 1, 1] = y1
+    # left
+    segs[3 * N:4 * N, 0, 0] = x0
+    segs[3 * N:4 * N, 0, 1] = y1
+    segs[3 * N:4 * N, 1, 0] = x0
+    segs[3 * N:4 * N, 1, 1] = y0
+    return segs
+
+
+def _mesh_sample_cells(
+    centers: np.ndarray,
+    levels: np.ndarray,
+    max_cells: int,
+    seed: int,
+    strategy: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Downsample cells for rendering speed; mirrors mesh_gif.py behavior."""
+    N = int(centers.shape[0])
+    if max_cells <= 0 or N <= max_cells:
+        return centers, levels
+
+    rng = np.random.default_rng(seed)
+
+    if strategy == "first":
+        idx = np.arange(max_cells, dtype=np.int64)
+    elif strategy == "random":
+        idx = rng.choice(N, size=max_cells, replace=False)
+    elif strategy == "per_level":
+        L = np.asarray(levels, dtype=np.int64)
+        uniq = np.unique(L)
+        counts = np.array([(L == u).sum() for u in uniq], dtype=np.int64)
+        frac = counts / max(1, counts.sum())
+        alloc = np.maximum(1, np.floor(frac * max_cells).astype(np.int64))
+
+        while alloc.sum() > max_cells:
+            j = int(np.argmax(alloc))
+            if alloc[j] > 1:
+                alloc[j] -= 1
+            else:
+                break
+        while alloc.sum() < max_cells:
+            j = int(np.argmax(counts))
+            alloc[j] += 1
+
+        picks = []
+        for u, a in zip(uniq, alloc):
+            idx_u = np.flatnonzero(L == u)
+            if idx_u.size == 0:
+                continue
+            if idx_u.size <= a:
+                picks.append(idx_u)
+            else:
+                picks.append(rng.choice(idx_u, size=int(a), replace=False))
+
+        idx = np.concatenate(picks, axis=0)
+        if idx.size > max_cells:
+            idx = rng.choice(idx, size=max_cells, replace=False)
+    else:
+        raise ValueError(f"Unknown mesh sample strategy: {strategy}")
+
+    return centers[idx], levels[idx]
+
+
+def _render_mesh_frame(
+    centers: np.ndarray,
+    levels: np.ndarray,
+    *,
+    dx0: float,
+    dy0: float,
+    bbox: Tuple[float, float, float, float],
+    title: str,
+    linewidth: float,
+    color_by_level: bool,
+    fig_w: float,
+    fig_h: float,
+    dpi: int,
+) -> np.ndarray:
+    """Render one mesh-only frame in the same visual style as utils/mesh_gif.py."""
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=int(dpi))
+    segs = _mesh_segments_from_centers_levels(centers, levels, dx0=dx0, dy0=dy0)
+
+    if color_by_level:
+        L = np.asarray(levels, dtype=np.int64)
+        Lmin = int(L.min()) if L.size else 0
+        Lmax = int(L.max()) if L.size else 1
+        denom = max(1, (Lmax - Lmin))
+        t = (L - Lmin) / denom
+        cmap = plt.get_cmap("viridis")
+        colors = np.repeat(cmap(t), repeats=4, axis=0)
+        lc = LineCollection(segs, colors=colors, linewidths=linewidth, antialiased=True)
+    else:
+        lc = LineCollection(segs, colors="black", linewidths=linewidth, antialiased=True)
+
+    ax.add_collection(lc)
+    xmin, xmax, ymin, ymax = bbox
+    ax.set_xlim(float(xmin), float(xmax))
+    ax.set_ylim(float(ymin), float(ymax))
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_title(title, fontsize=10)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_frame_on(False)
+
+    fig.tight_layout(pad=0.1)
+    fig.canvas.draw()
+    buf = np.asarray(fig.canvas.buffer_rgba())
+    frame = np.ascontiguousarray(buf[..., :3])
+    plt.close(fig)
+    return frame
+
+
+@torch.inference_mode()
+def make_rollout_mesh_gif(
+    examples,
+    out_gif: str,
+    *,
+    fps: float = 4.0,
+    dpi: int = 120,
+    fig_w: float = 6.5,
+    fig_h: float = 6.5,
+    linewidth: float = 0.20,
+    max_cells: int = 200_000,
+    sample_strategy: str = "per_level",
+    seed: int = 0,
+    color_by_level: bool = False,
+    progress_every: int = 1,
+):
+    """Write a mesh-only rollout GIF using per-step predicted mesh geometry."""
+    if not examples:
+        log("[WARN] make_rollout_mesh_gif: no examples provided; nothing to do.")
+        return
+
+    examples = sorted(examples, key=lambda e: int(e.get("t", 0)))
+    os.makedirs(os.path.dirname(out_gif) or ".", exist_ok=True)
+
+    duration = 1.0 / float(fps) if float(fps) > 0 else 0.1
+    writer = imageio.get_writer(out_gif, mode="I", duration=duration)
+    frames_written = 0
+
+    try:
+        for step, ex in enumerate(examples):
+            centers_t = ex.get("pred_centers", None)
+            levels_t = ex.get("pred_levels", None)
+            if centers_t is None or levels_t is None:
+                continue
+
+            centers = torch.as_tensor(centers_t).detach().cpu().to(torch.float32).numpy()
+            levels = torch.as_tensor(levels_t).detach().cpu().to(torch.int64).numpy().reshape(-1)
+            if centers.ndim != 2 or centers.shape[1] != 2 or levels.ndim != 1:
+                continue
+
+            if centers.shape[0] != levels.shape[0]:
+                n = min(int(centers.shape[0]), int(levels.shape[0]))
+                centers = centers[:n]
+                levels = levels[:n]
+
+            H = int(ex.get("H", 64))
+            W = int(ex.get("W", 64))
+            bbox_raw = ex.get("bbox", (0.0, 1.0, 0.0, 1.0))
+            try:
+                bbox = tuple(float(v) for v in bbox_raw)
+                if len(bbox) != 4:
+                    raise ValueError
+            except Exception:
+                bbox = (0.0, 1.0, 0.0, 1.0)
+
+            xmin, xmax, ymin, ymax = bbox
+            if H <= 0 or W <= 0 or xmax <= xmin or ymax <= ymin:
+                continue
+            dx0 = (xmax - xmin) / float(W)
+            dy0 = (ymax - ymin) / float(H)
+
+            centers_s, levels_s = _mesh_sample_cells(
+                centers=centers,
+                levels=levels,
+                max_cells=int(max_cells),
+                seed=int(seed) + int(step),
+                strategy=str(sample_strategy),
+            )
+
+            t_abs = int(ex.get("t", step))
+            lmax = int(levels_s.max()) if levels_s.size else 0
+            title = f"t={t_abs} | N={centers_s.shape[0]} | Lmax={lmax}"
+
+            frame = _render_mesh_frame(
+                centers_s,
+                levels_s,
+                dx0=float(dx0),
+                dy0=float(dy0),
+                bbox=bbox,
+                title=title,
+                linewidth=float(linewidth),
+                color_by_level=bool(color_by_level),
+                fig_w=float(fig_w),
+                fig_h=float(fig_h),
+                dpi=int(dpi),
+            )
+            writer.append_data(frame)
+            frames_written += 1
+
+            if (step + 1) % max(1, int(progress_every)) == 0:
+                log(f"[MESH-GIF] wrote {step + 1}/{len(examples)} frames")
+    finally:
+        writer.close()
+
+    if frames_written == 0:
+        raise RuntimeError("make_rollout_mesh_gif produced no frames (missing pred_centers/pred_levels in examples).")
+    log(f"[INFO] wrote {out_gif}")
 
 
 # ----------------- GIF creation (fast + streaming) ----------------- #
@@ -1449,6 +1702,29 @@ def main():
                     help="Matplotlib DPI for frames.")
     ap.add_argument("--progress-every", type=int, default=1,
                     help="Print progress every N rollout steps.")
+    ap.add_argument("--no-mesh-gif", action="store_true",
+                    help="Disable mesh-only GIF generation for predicted rollout meshes.")
+    ap.add_argument("--mesh-gif-name", type=str, default="rollout_mesh.gif",
+                    help="Filename (inside out-dir) for the mesh-only GIF.")
+    ap.add_argument("--mesh-fps", type=float, default=None,
+                    help="Mesh GIF FPS (defaults to --fps).")
+    ap.add_argument("--mesh-dpi", type=int, default=None,
+                    help="Mesh GIF DPI (defaults to --dpi).")
+    ap.add_argument("--mesh-fig-w", type=float, default=6.5,
+                    help="Mesh GIF figure width in inches.")
+    ap.add_argument("--mesh-fig-h", type=float, default=6.5,
+                    help="Mesh GIF figure height in inches.")
+    ap.add_argument("--mesh-linewidth", type=float, default=0.20,
+                    help="Mesh edge linewidth in the mesh-only GIF.")
+    ap.add_argument("--mesh-max-cells", type=int, default=200000,
+                    help="Max cells rendered per mesh frame (<=0 disables downsampling).")
+    ap.add_argument("--mesh-sample-strategy", type=str, default="per_level",
+                    choices=["first", "random", "per_level"],
+                    help="Cell downsampling strategy for mesh GIF when N is large.")
+    ap.add_argument("--mesh-seed", type=int, default=0,
+                    help="Sampling seed for mesh GIF downsampling.")
+    ap.add_argument("--mesh-color-by-level", action="store_true",
+                    help="Color mesh edges by level in mesh-only GIF (default is black edges).")
 
     # DataLoader
     ap.add_argument("--num-workers", type=int, default=0,
@@ -1776,6 +2052,28 @@ def main():
             delta_scale=str(args.delta_scale),
             progress_every=int(args.progress_every),
         )
+
+    if not bool(args.no_mesh_gif):
+        mesh_gif_path = os.path.join(out_dir, str(args.mesh_gif_name))
+        mesh_fps = float(args.mesh_fps) if args.mesh_fps is not None else float(args.fps)
+        mesh_dpi = int(args.mesh_dpi) if args.mesh_dpi is not None else int(args.dpi)
+
+        log("[INFO] Making rollout mesh GIF (predicted mesh evolution)...")
+        with Timer("make_rollout_mesh_gif"):
+            make_rollout_mesh_gif(
+                examples=examples,
+                out_gif=mesh_gif_path,
+                fps=mesh_fps,
+                dpi=mesh_dpi,
+                fig_w=float(args.mesh_fig_w),
+                fig_h=float(args.mesh_fig_h),
+                linewidth=float(args.mesh_linewidth),
+                max_cells=int(args.mesh_max_cells),
+                sample_strategy=str(args.mesh_sample_strategy),
+                seed=int(args.mesh_seed),
+                color_by_level=bool(args.mesh_color_by_level),
+                progress_every=int(args.progress_every),
+            )
 
     log(f"[INFO] Done. GIFs are in: {out_dir}")
     

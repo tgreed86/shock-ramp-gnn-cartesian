@@ -9,7 +9,7 @@
     "L_max": 3,
     "bbox": [0.0, 1.0, 0.0, 1.0],
     "pre_train_dir": "./precomp_cache",
-    "window_size": 10,
+    "window_size": 4,
     "stride": 1,
     "num_workers": 0
   },
@@ -25,7 +25,8 @@
   "train": {
     "precomp_cache_path": "./cache/all/shock_ramp_precomp_pLow85_pHigh95_faceAdj_DEC.h5",
     "precomp_force_recompute": false,
-    "epochs": 10,
+    "epochs": 2,
+    "validation_every_epochs": 1,
     "batch_size": 1,
     "lr": 0.0001,
     "weight_decay": 0.0,
@@ -41,8 +42,24 @@
     "multi_step_K": 2,
     "uniform_H": 256,
     "uniform_W": 256,
+    "time_integrator": "euler",
     "teacher_forcing_uniform": false,
-    "uniform_diag_edges": false
+    "uniform_diag_edges": false,
+    "validation_every_epochs": 5,
+    "runtime_mesh": {
+      "enabled": false,
+      "warm_start_from_precompute": true,
+      "update_every_steps": 1,
+      "detach_policy_input": true,
+      "reset_to_coarse_each_step": true,
+      "refine_only": true,
+      "max_cells_per_step": 400000,
+      "step_log": {
+        "enabled": true,
+        "path": "./runs_mesh_first/runtime_step_log.csv",
+        "append": false
+      }
+    }
   },
 
   "edges": {
@@ -94,7 +111,7 @@
     "dec": true,
     "parc": true,
     "parc_detach_inputs": true,
-    "physics_backend": "mls",
+    "physics_backend": "dec",
     "_comment_physics_backend": "dec (default) or mls (moving least squares)",
 
     "mls_ops_device": "cpu",
@@ -151,6 +168,7 @@
     "name": "FeatureNet",
     "hidden": 128,
     "layers": 3,
+    "dropout": 0.1,
     "predict_type": "rate",
     "_comment_predict_type": "absolute, delta, or rate"
   },
