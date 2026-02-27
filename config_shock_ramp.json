@@ -9,7 +9,7 @@
     "L_max": 3,
     "bbox": [0.0, 1.0, 0.0, 1.0],
     "pre_train_dir": "./precomp_cache",
-    "window_size": 4,
+    "window_size": 5,
     "stride": 1,
     "num_workers": 0
   },
@@ -25,12 +25,14 @@
   "train": {
     "precomp_cache_path": "./cache/all/shock_ramp_precomp_pLow85_pHigh95_faceAdj_DEC.h5",
     "precomp_force_recompute": false,
-    "epochs": 2,
+    "epochs": 20,
     "validation_every_epochs": 1,
     "batch_size": 1,
     "lr": 0.0001,
     "weight_decay": 0.0,
-    "grad_clip": 1.0,
+    "grad_clip": 0.5,
+    "rate_clip_norm": 50.0,
+    "delta_clip_norm": 5.0,
     "interp_type": "standard", 
     "_comment_interp_type": "overlay or knn",
     "overlay_fill": "value",  
@@ -42,7 +44,9 @@
     "multi_step_K": 2,
     "uniform_H": 256,
     "uniform_W": 256,
-    "time_integrator": "euler",
+    "time_integrator": "rk4",
+    "rk4_start_epoch": 10,
+    "rk4_ramp_epochs": 5,
     "teacher_forcing_uniform": false,
     "uniform_diag_edges": false,
     "validation_every_epochs": 5,
@@ -69,7 +73,7 @@
   },
 
   "scheduler": {
-    "use": true,
+    "use": false,
     "mode": "min",
     "factor": 0.5,
     "patience": 5,
@@ -130,6 +134,10 @@
     "parc_include_adv": true,
     "advection_type": "euler",
     "euler_flux_scheme": "rusanov",
+    "advection_reconstruction": "first_order",
+    "_comment_advection_reconstruction": "first_order (default) or muscl (second order)",
+    "muscl_limiter": "minmod",
+    "_comment_muscl_limiter": "minmod, mc, or vanleer (used when advection_reconstruction=muscl)",
     "gamma": 1.4,
     "p_floor": 0.0,
     "adv_channels": ["density", "x_momentum", "y_momentum", "energy"],
@@ -150,7 +158,15 @@
     "parc_feat_clip_post": 10.0,
     "parc_feat_norm_momentum": 0.02,
     "parc_gate_init": -3.0,
-    "parc_gate_per_channel": false
+    "parc_gate_per_channel": false,
+
+    "ops_term_clip": 1e6,
+    "state_rho_max": 1e6,
+    "state_E_max": 1e8,
+    "state_m_max": 1e9,
+    "ops_rho_max": 1e6,
+    "ops_E_max": 1e8,
+    "ops_m_max": 1e9
   },
 
   "eval": {

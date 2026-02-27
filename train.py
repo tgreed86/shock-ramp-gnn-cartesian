@@ -1865,13 +1865,97 @@ def _assert_finite(name: str, t: torch.Tensor, crash: bool = True):
             raise RuntimeError(f"Non-finite detected in {name}")
     return ok
 
+def _sanitize_float_tensor(
+    t: torch.Tensor | None,
+    *,
+    clip_abs: float = 0.0,
+    fill_value: float = 0.0,
+    nonneg: bool = False,
+) -> torch.Tensor | None:
+    """
+    Make floating tensors safe for downstream ops:
+      - replace NaN/Inf
+      - optional magnitude clipping
+    """
+    if t is None or (not torch.is_tensor(t)):
+        return t
+    if not t.dtype.is_floating_point:
+        return t
+
+    c = float(clip_abs)
+    if c > 0.0:
+        t = torch.nan_to_num(t, nan=fill_value, posinf=c, neginf=-c)
+        if nonneg:
+            t = t.clamp(min=0.0, max=c)
+        else:
+            t = t.clamp(min=-c, max=c)
+    else:
+        t = torch.nan_to_num(t, nan=fill_value, posinf=fill_value, neginf=fill_value)
+        if nonneg:
+            t = t.clamp_min(0.0)
+    return t
+
+def _sanitize_ops_term(t: torch.Tensor | None, cfg: dict) -> torch.Tensor | None:
+    """
+    Guard DEC/MLS operator terms against catastrophic values.
+    """
+    loss = cfg.get("loss", {}) or {}
+    clip_abs = float(loss.get("ops_term_clip", 0.0))
+    return _sanitize_float_tensor(t, clip_abs=clip_abs, fill_value=0.0, nonneg=False)
+
+def _sanitize_parc_extra_tensor(
+    t: torch.Tensor | None,
+    cfg: dict,
+    *,
+    post_adapter: bool = False,
+) -> torch.Tensor | None:
+    """
+    Keep PARC feature block bounded even when adapter is disabled.
+    """
+    loss = cfg.get("loss", {}) or {}
+    if post_adapter:
+        clip_abs = float(loss.get("parc_feat_clip_post", loss.get("parc_feat_clip_pre", 0.0)))
+    else:
+        clip_abs = float(loss.get("parc_feat_clip_pre", 0.0))
+    return _sanitize_float_tensor(t, clip_abs=clip_abs, fill_value=0.0, nonneg=False)
+
+def _apply_rate_guardrails(y_rate: torch.Tensor, dt_hat: torch.Tensor | float, cfg: dict) -> torch.Tensor:
+    """
+    Optional clipping in model-rate space to limit rollout explosions.
+    """
+    train_cfg = cfg.get("train", {}) or {}
+    rate_clip = float(train_cfg.get("rate_clip_norm", 0.0))
+    delta_clip = float(train_cfg.get("delta_clip_norm", 0.0))
+
+    y = y_rate
+    if rate_clip > 0.0:
+        y = y.clamp(min=-rate_clip, max=rate_clip)
+
+    if delta_clip > 0.0:
+        if torch.is_tensor(dt_hat):
+            dt = dt_hat.to(device=y.device, dtype=y.dtype)
+        else:
+            dt = torch.tensor(float(dt_hat), device=y.device, dtype=y.dtype)
+        dt_safe = dt.abs().clamp_min(1e-12)
+        delta = (y * dt).clamp(min=-delta_clip, max=delta_clip)
+        y = delta / dt_safe
+
+    return y
+
 def sanitize_state_for_ops(x_abs: torch.Tensor, cfg: dict, rho_floor=1e-6, E_floor=1e-6):
     loss = cfg.get("loss", {}) or {}
     u_clip = float(loss.get("u_clip", 1e3))
+    rho_max = float(loss.get("ops_rho_max", loss.get("state_rho_max", 0.0)))
+    E_max = float(loss.get("ops_E_max", loss.get("state_E_max", 0.0)))
+    m_max = float(loss.get("ops_m_max", loss.get("state_m_max", 0.0)))
 
     idx = dec.infer_feature_indices(cfg, x_abs.size(1))
     rho = x_abs[:, idx["rho"]].clamp_min(rho_floor)
     E = x_abs[:, idx["E"]].clamp_min(E_floor)
+    if rho_max > 0.0:
+        rho = rho.clamp_max(rho_max)
+    if E_max > 0.0:
+        E = E.clamp_max(E_max)
     mx = x_abs[:, idx["mx"]]
     my = x_abs[:, idx["my"]]
 
@@ -1879,6 +1963,14 @@ def sanitize_state_for_ops(x_abs: torch.Tensor, cfg: dict, rho_floor=1e-6, E_flo
     if u_clip > 0:
         mx = mx.clamp(-u_clip * rho, u_clip * rho)
         my = my.clamp(-u_clip * rho, u_clip * rho)
+    if m_max > 0.0:
+        mx = mx.clamp(min=-m_max, max=m_max)
+        my = my.clamp(min=-m_max, max=m_max)
+
+    rho = _sanitize_float_tensor(rho, clip_abs=rho_max, fill_value=rho_floor, nonneg=True)
+    E = _sanitize_float_tensor(E, clip_abs=E_max, fill_value=E_floor, nonneg=True)
+    mx = _sanitize_float_tensor(mx, clip_abs=m_max, fill_value=0.0, nonneg=False)
+    my = _sanitize_float_tensor(my, clip_abs=m_max, fill_value=0.0, nonneg=False)
 
     cols = [x_abs[:, j] for j in range(x_abs.size(1))]
     cols[idx["rho"]] = rho
@@ -1904,10 +1996,33 @@ def _enforce_physical_state(
 
     Fdim = int(x_abs.size(1))
     idx = dec.infer_feature_indices(cfg, Fdim)
+    loss = cfg.get("loss", {}) or {}
+    u_clip = float(loss.get("u_clip", 1e3))
+    rho_max = float(loss.get("state_rho_max", 0.0))
+    E_max = float(loss.get("state_E_max", 0.0))
+    m_max = float(loss.get("state_m_max", 0.0))
 
     cols = [x_abs[:, j] for j in range(Fdim)]
-    cols[idx["rho"]] = cols[idx["rho"]].clamp_min(rho_floor)
-    cols[idx["E"]] = cols[idx["E"]].clamp_min(E_floor)
+    rho = cols[idx["rho"]].clamp_min(rho_floor)
+    E = cols[idx["E"]].clamp_min(E_floor)
+    if rho_max > 0.0:
+        rho = rho.clamp_max(rho_max)
+    if E_max > 0.0:
+        E = E.clamp_max(E_max)
+
+    mx = cols[idx["mx"]]
+    my = cols[idx["my"]]
+    if u_clip > 0.0:
+        mx = mx.clamp(min=-u_clip * rho, max=u_clip * rho)
+        my = my.clamp(min=-u_clip * rho, max=u_clip * rho)
+    if m_max > 0.0:
+        mx = mx.clamp(min=-m_max, max=m_max)
+        my = my.clamp(min=-m_max, max=m_max)
+
+    cols[idx["rho"]] = _sanitize_float_tensor(rho, clip_abs=rho_max, fill_value=rho_floor, nonneg=True)
+    cols[idx["E"]] = _sanitize_float_tensor(E, clip_abs=E_max, fill_value=E_floor, nonneg=True)
+    cols[idx["mx"]] = _sanitize_float_tensor(mx, clip_abs=m_max, fill_value=0.0, nonneg=False)
+    cols[idx["my"]] = _sanitize_float_tensor(my, clip_abs=m_max, fill_value=0.0, nonneg=False)
     return torch.stack(cols, dim=1)
 
 def _resolve_time_integrator(cfg: dict) -> str:
@@ -1927,6 +2042,52 @@ def _resolve_time_integrator(cfg: dict) -> str:
     if raw not in aliases:
         raise RuntimeError(f"Unsupported time integrator '{raw}'. Use 'euler' or 'rk4'.")
     return aliases[raw]
+
+def _resolve_time_integrator_for_epoch(
+    cfg: dict,
+    *,
+    epoch_idx: int | None,
+    base_integrator: str | None = None,
+) -> tuple[str, float]:
+    """
+    Epoch-aware integrator schedule.
+
+    Returns:
+      (effective_integrator, rk4_alpha)
+      - effective_integrator: "euler" or "rk4"
+      - rk4_alpha: blend weight in [0,1] used when base integrator is rk4.
+    """
+    base = _resolve_time_integrator(cfg) if base_integrator is None else str(base_integrator).lower()
+    if base != "rk4":
+        return base, 0.0
+
+    train_cfg = cfg.get("train", {}) or {}
+    loss_cfg = cfg.get("loss", {}) or {}
+
+    start_epoch = int(train_cfg.get("rk4_start_epoch", loss_cfg.get("rk4_start_epoch", 1)))
+    ramp_epochs = int(train_cfg.get("rk4_ramp_epochs", loss_cfg.get("rk4_ramp_epochs", 0)))
+
+    if start_epoch < 1:
+        raise RuntimeError(f"rk4_start_epoch must be >= 1, got {start_epoch}")
+    if ramp_epochs < 0:
+        raise RuntimeError(f"rk4_ramp_epochs must be >= 0, got {ramp_epochs}")
+
+    # If epoch is unknown (e.g., final test call), use the configured base integrator.
+    if epoch_idx is None:
+        return "rk4", 1.0
+
+    ep = int(epoch_idx)
+    if ep < start_epoch:
+        return "euler", 0.0
+
+    if ramp_epochs == 0:
+        return "rk4", 1.0
+
+    alpha = float(ep - start_epoch) / float(ramp_epochs)
+    alpha = max(0.0, min(1.0, alpha))
+    if alpha <= 0.0:
+        return "euler", 0.0
+    return "rk4", alpha
 
 
 def train_one_epoch_multi_step(
@@ -2023,7 +2184,7 @@ def train_one_epoch_multi_step(
             )
 
         # now do the actual clamp using your existing helper
-        return _enforce_physical_state(x_abs, rho_floor=rho_floor, E_floor=E_floor)
+        return _enforce_physical_state(x_abs, cfg, rho_floor=rho_floor, E_floor=E_floor)
 
     # ---- dx,dy ----
     if dx is None or dy is None:
@@ -2041,11 +2202,15 @@ def train_one_epoch_multi_step(
     lap_w  = float(cfg["loss"].get("laplacian_weight", 0.0))
     tmp_w  = float(cfg["loss"].get("temporal_weight", 0.0))
     use_huber = bool(cfg["loss"].get("use_huber", True))
+    grad_clip = float(cfg.get("train", {}).get("grad_clip", 1.0))
 
     predict_type = str(cfg.get("model", {}).get("predict_type", "rate")).lower()
     if predict_type != "rate":
         raise RuntimeError(f"PARC/Variant-B implementation below assumes predict_type='rate', got '{predict_type}'")
     time_integrator = _resolve_time_integrator(cfg)
+    _time_integrator_eff, rk4_alpha = _resolve_time_integrator_for_epoch(
+        cfg, epoch_idx=epoch_idx, base_integrator=time_integrator
+    )
 
     # DEC / PARC controls
     loss_cfg = cfg.get("loss", {}) or {}
@@ -2447,6 +2612,10 @@ def train_one_epoch_multi_step(
                                 if (r_diff_abs is None) and need_diff:
                                     raise RuntimeError("dec_advdiff_terms_abs returned r_diff_abs=None but need_diff=True")
 
+                                r_adv_abs = _sanitize_ops_term(r_adv_abs, cfg)
+                                r_diff_abs = _sanitize_ops_term(r_diff_abs, cfg)
+                                area = _sanitize_float_tensor(area, clip_abs=0.0, fill_value=1.0, nonneg=True)
+
                                 if not adv_step_gate:
                                     r_adv_abs = None
 
@@ -2467,7 +2636,7 @@ def train_one_epoch_multi_step(
                                     if need_adv and (r_adv_abs is not None):
                                         base = base + adv_w * r_adv_abs
 
-                                    r_phy_abs = base
+                                    r_phy_abs = _sanitize_ops_term(base, cfg)
 
                                 if cfg.get("debug", {}).get("stepA_star", False):
                                     if step_k >= int(cfg.get("debug", {}).get("stepA_star_kmin", 5)):
@@ -2583,6 +2752,7 @@ def train_one_epoch_multi_step(
                             dtype=x_in.dtype,
                             detach=True,
                         )
+                        parc_extra = _sanitize_parc_extra_tensor(parc_extra, cfg, post_adapter=False)
 
                     #if (parc_extra is not None) and (parc_extra.numel() > 0):
                         # parc_extra should already be dtype=x_in.dtype per your call, but keep this safe
@@ -2613,6 +2783,9 @@ def train_one_epoch_multi_step(
                                             dim=1,
                                         )
 
+                        parc_extra = _sanitize_parc_extra_tensor(
+                            parc_extra, cfg, post_adapter=bool(use_adapter)
+                        )
                         x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
 
 
@@ -2849,7 +3022,7 @@ def train_one_epoch_multi_step(
                 r_phy_for_loss = r_phy_abs
 
                 # Optional higher-order integration in normalized-rate space.
-                if time_integrator == "rk4":
+                if rk4_alpha > 0.0:
                     def _predict_rate_for_norm_state(
                         norm_state: torch.Tensor,
                         *,
@@ -2898,6 +3071,9 @@ def train_one_epoch_multi_step(
                                         compute_diff=need_diff_stage,
                                     )
 
+                                r_adv_stage = _sanitize_ops_term(r_adv_stage, cfg)
+                                r_diff_stage = _sanitize_ops_term(r_diff_stage, cfg)
+
                                 if not adv_step_gate_stage:
                                     r_adv_stage = None
 
@@ -2921,7 +3097,7 @@ def train_one_epoch_multi_step(
 
                                     if need_adv_stage and (r_adv_stage is not None):
                                         base_stage = base_stage + adv_w_stage * r_adv_stage
-                                    r_phy_stage = base_stage
+                                    r_phy_stage = _sanitize_ops_term(base_stage, cfg)
 
                         x_stage_in = _build_X(norm_state, pred_centers, pred_levels, cfg)
                         if parc_use and ((r_adv_stage is not None) or (r_diff_stage is not None)):
@@ -2945,6 +3121,7 @@ def train_one_epoch_multi_step(
                                 dtype=x_stage_in.dtype,
                                 detach=True,
                             )
+                            parc_extra_stage = _sanitize_parc_extra_tensor(parc_extra_stage, cfg, post_adapter=False)
 
                             if parc_extra_stage is not None and parc_extra_stage.numel() > 0:
                                 if hasattr(model, "parc_adapter") and (model.parc_adapter is not None) and use_adapter:
@@ -2972,6 +3149,9 @@ def train_one_epoch_multi_step(
                                                     dim=1,
                                                 )
 
+                                parc_extra_stage = _sanitize_parc_extra_tensor(
+                                    parc_extra_stage, cfg, post_adapter=bool(use_adapter)
+                                )
                                 x_stage_in = torch.cat([x_stage_in, parc_extra_stage.to(dtype=x_stage_in.dtype)], dim=1)
 
                         y_corr_stage = _forward_main_head_with_edge_attr(model, x_stage_in, pei, edge_attr=pea)
@@ -2999,10 +3179,22 @@ def train_one_epoch_multi_step(
                     k3, r_phy_k3 = _predict_rate_for_norm_state(norm_in + (0.5 * dt_hat) * k2, update_adapter_stats=False)
                     k4, r_phy_k4 = _predict_rate_for_norm_state(norm_in + dt_hat * k3, update_adapter_stats=False)
 
-                    y_pred = (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
+                    y_pred_rk4 = (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
+
+                    r_phy_rk4 = None
                     if (r_phy_abs is not None) and (r_phy_k2 is not None) and (r_phy_k3 is not None) and (r_phy_k4 is not None):
-                        r_phy_for_loss = (r_phy_abs + 2.0 * r_phy_k2 + 2.0 * r_phy_k3 + r_phy_k4) / 6.0
-                    _assert_finite("y_pred_rk4", y_pred)
+                        r_phy_rk4 = (r_phy_abs + 2.0 * r_phy_k2 + 2.0 * r_phy_k3 + r_phy_k4) / 6.0
+
+                    if rk4_alpha >= (1.0 - 1e-12):
+                        y_pred = y_pred_rk4
+                        if r_phy_rk4 is not None:
+                            r_phy_for_loss = r_phy_rk4
+                    else:
+                        y_pred = (1.0 - rk4_alpha) * k1 + rk4_alpha * y_pred_rk4
+                        if (r_phy_abs is not None) and (r_phy_rk4 is not None):
+                            r_phy_for_loss = (1.0 - rk4_alpha) * r_phy_abs + rk4_alpha * r_phy_rk4
+
+                    _assert_finite("y_pred_rk_sched", y_pred)
 
                 # ----- supervision target -----
                 delta_target = norm_tgt - norm_in
@@ -3021,6 +3213,8 @@ def train_one_epoch_multi_step(
                     with torch.no_grad():
                         _tstats("rate_target", rate_target)
                         _tstats("y_pred", y_pred)
+
+                y_pred = _apply_rate_guardrails(y_pred, dt_hat, cfg)
 
 
                 # ==========================================================
@@ -3347,17 +3541,18 @@ def train_one_epoch_multi_step(
                 )
 
             # ===== backward + step once per window =====
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if window_loss_graph is not None:
                 if scaler is not None:
                     scaler.scale(window_loss_graph).backward()
                     scaler.unscale_(opt)  # <-- required before clipping
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    if grad_clip > 0.0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                     scaler.step(opt)
                     scaler.update()
                 else:
                     window_loss_graph.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    if grad_clip > 0.0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                     opt.step()
             else:
                 opt.step()
@@ -3576,17 +3771,18 @@ def train_one_epoch_multi_step(
             pred_feats_k = _enforce_physical_state(y_pred_abs_k, cfg, rho_floor=1e-6, E_floor=1e-6)
 
         # ===== backward + step once per window =====
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         if window_loss_graph is not None:
             if scaler is not None:
                 scaler.scale(window_loss_graph).backward()
                 scaler.unscale_(opt)  # <-- required before clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                if grad_clip > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 scaler.step(opt)
                 scaler.update()
             else:
                 window_loss_graph.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                if grad_clip > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 opt.step()
         else:
             opt.step()
@@ -3640,6 +3836,9 @@ def evaluate_one_epoch_multi_step(
     if predict_type != "rate":
         raise RuntimeError(f"PARC/Variant-B implementation below assumes predict_type='rate', got '{predict_type}'")
     time_integrator = _resolve_time_integrator(cfg)
+    _time_integrator_eff, rk4_alpha = _resolve_time_integrator_for_epoch(
+        cfg, epoch_idx=epoch_idx, base_integrator=time_integrator
+    )
 
     loss_cfg = cfg.get("loss", {}) or {}
     dec_use = bool(loss_cfg.get("dec", False))
@@ -3968,6 +4167,10 @@ def evaluate_one_epoch_multi_step(
                                     compute_diff=need_diff,
                                 )
 
+                            r_adv_abs = _sanitize_ops_term(r_adv_abs, cfg)
+                            r_diff_abs = _sanitize_ops_term(r_diff_abs, cfg)
+                            area = _sanitize_float_tensor(area, clip_abs=0.0, fill_value=1.0, nonneg=True)
+
                             # Belt-and-suspenders: ensure adv absent for k>0
                             if not adv_step_gate:
                                 r_adv_abs = None
@@ -3999,7 +4202,7 @@ def evaluate_one_epoch_multi_step(
                                 if need_adv and (r_adv_abs is not None):
                                     base = base + adv_w * r_adv_abs
 
-                                r_phy_abs = base
+                                r_phy_abs = _sanitize_ops_term(base, cfg)
 
                     # Build node inputs
                     x_in = _build_X(norm_in, pred_centers, pred_levels, cfg)
@@ -4032,6 +4235,7 @@ def evaluate_one_epoch_multi_step(
                                 dtype=x_in.dtype,
                                 detach=True,
                             )
+                            parc_extra = _sanitize_parc_extra_tensor(parc_extra, cfg, post_adapter=False)
 
                         #if (parc_extra is not None) and (parc_extra.numel() > 0):
                         #    x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
@@ -4061,6 +4265,9 @@ def evaluate_one_epoch_multi_step(
                                                 dim=1,
                                             )
 
+                            parc_extra = _sanitize_parc_extra_tensor(
+                                parc_extra, cfg, post_adapter=bool(use_adapter)
+                            )
                             x_in = torch.cat([x_in, parc_extra.to(dtype=x_in.dtype)], dim=1)
 
 
@@ -4084,7 +4291,7 @@ def evaluate_one_epoch_multi_step(
 
                     r_phy_for_loss = r_phy_abs
 
-                    if time_integrator == "rk4":
+                    if rk4_alpha > 0.0:
                         def _predict_rate_for_norm_state_eval(norm_state: torch.Tensor):
                             x_state_abs = _maybe_denorm(norm_state, mu, sigma)
                             r_adv_stage = r_diff_stage = r_phy_stage = None
@@ -4128,6 +4335,9 @@ def evaluate_one_epoch_multi_step(
                                             compute_diff=need_diff_stage,
                                         )
 
+                                    r_adv_stage = _sanitize_ops_term(r_adv_stage, cfg)
+                                    r_diff_stage = _sanitize_ops_term(r_diff_stage, cfg)
+
                                     if not adv_step_gate_stage:
                                         r_adv_stage = None
 
@@ -4150,7 +4360,7 @@ def evaluate_one_epoch_multi_step(
                                             base_stage = torch.zeros_like(ref_stage)
                                         if need_adv_stage and (r_adv_stage is not None):
                                             base_stage = base_stage + adv_w_stage * r_adv_stage
-                                        r_phy_stage = base_stage
+                                        r_phy_stage = _sanitize_ops_term(base_stage, cfg)
 
                             x_stage_in = _build_X(norm_state, pred_centers, pred_levels, cfg)
                             if parc_use and ((r_adv_stage is not None) or (r_diff_stage is not None)):
@@ -4173,6 +4383,9 @@ def evaluate_one_epoch_multi_step(
                                     cfg=cfg,
                                     dtype=x_stage_in.dtype,
                                     detach=True,
+                                )
+                                parc_extra_stage = _sanitize_parc_extra_tensor(
+                                    parc_extra_stage, cfg, post_adapter=False
                                 )
                                 if parc_extra_stage is not None and parc_extra_stage.numel() > 0:
                                     if hasattr(model, "parc_adapter") and (model.parc_adapter is not None) and use_adapter:
@@ -4198,6 +4411,9 @@ def evaluate_one_epoch_multi_step(
                                                         dim=1,
                                                     )
 
+                                    parc_extra_stage = _sanitize_parc_extra_tensor(
+                                        parc_extra_stage, cfg, post_adapter=bool(use_adapter)
+                                    )
                                     x_stage_in = torch.cat([x_stage_in, parc_extra_stage.to(dtype=x_stage_in.dtype)], dim=1)
 
                             y_corr_stage = _forward_main_head_with_edge_attr(model, x_stage_in, pei, edge_attr=pea)
@@ -4222,9 +4438,22 @@ def evaluate_one_epoch_multi_step(
                         k2, r_phy_k2 = _predict_rate_for_norm_state_eval(norm_in + (0.5 * dt_hat) * k1)
                         k3, r_phy_k3 = _predict_rate_for_norm_state_eval(norm_in + (0.5 * dt_hat) * k2)
                         k4, r_phy_k4 = _predict_rate_for_norm_state_eval(norm_in + dt_hat * k3)
-                        y_pred = (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
+                        y_pred_rk4 = (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
+
+                        r_phy_rk4 = None
                         if (r_phy_abs is not None) and (r_phy_k2 is not None) and (r_phy_k3 is not None) and (r_phy_k4 is not None):
-                            r_phy_for_loss = (r_phy_abs + 2.0 * r_phy_k2 + 2.0 * r_phy_k3 + r_phy_k4) / 6.0
+                            r_phy_rk4 = (r_phy_abs + 2.0 * r_phy_k2 + 2.0 * r_phy_k3 + r_phy_k4) / 6.0
+
+                        if rk4_alpha >= (1.0 - 1e-12):
+                            y_pred = y_pred_rk4
+                            if r_phy_rk4 is not None:
+                                r_phy_for_loss = r_phy_rk4
+                        else:
+                            y_pred = (1.0 - rk4_alpha) * k1 + rk4_alpha * y_pred_rk4
+                            if (r_phy_abs is not None) and (r_phy_rk4 is not None):
+                                r_phy_for_loss = (1.0 - rk4_alpha) * r_phy_abs + rk4_alpha * r_phy_rk4
+
+                    y_pred = _apply_rate_guardrails(y_pred, dt_hat, cfg)
 
                     # targets / loss in fp32 for stability
                     with torch.autocast(device_type=device.type, enabled=False):

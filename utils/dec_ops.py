@@ -97,16 +97,152 @@ def pressure_from_conservative_state(
         p = p.clamp_min(float(clamp_min))
     return p
 
+def _normalize_reconstruction_kind(name: str) -> str:
+    n = str(name).strip().lower()
+    if n in ("first_order", "first-order", "first", "none", "piecewise_constant", "piecewise-constant"):
+        return "first_order"
+    if n in ("muscl", "tvd", "second_order", "second-order", "2nd"):
+        return "muscl"
+    raise RuntimeError(f"Unsupported advection_reconstruction='{name}'. Use 'first_order' or 'muscl'.")
+
+def _normalize_limiter_name(name: str) -> str:
+    n = str(name).strip().lower()
+    if n in ("minmod", "mc", "vanleer", "van_leer", "van-leer"):
+        return "vanleer" if n in ("van_leer", "van-leer") else n
+    raise RuntimeError(f"Unsupported muscl_limiter='{name}'. Use one of: minmod, mc, vanleer.")
+
+def _minmod(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    same_sign = (a * b) > 0
+    return torch.where(same_sign, torch.sign(a) * torch.minimum(a.abs(), b.abs()), torch.zeros_like(a))
+
+def _minmod3(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    return _minmod(_minmod(a, b), c)
+
+def _apply_tvd_limiter(a: torch.Tensor, b: torch.Tensor, limiter: str) -> torch.Tensor:
+    """
+    Limit slope pair (a,b) with a TVD limiter.
+      a: reconstructed directional slope
+      b: one-sided edge slope
+    """
+    lim = _normalize_limiter_name(limiter)
+    if lim == "minmod":
+        return _minmod(a, b)
+    if lim == "mc":
+        return _minmod3(2.0 * a, 0.5 * (a + b), 2.0 * b)
+    # van Leer
+    prod = a * b
+    denom = (a + b).abs().clamp_min(1e-12)
+    out = 2.0 * prod / denom * torch.sign(a + b)
+    return torch.where(prod > 0.0, out, torch.zeros_like(a))
+
+def _compute_node_gradients_ls(
+    phi: torch.Tensor,          # [N,F]
+    edge_index: torch.Tensor,   # [2,E]
+    nx: torch.Tensor,           # [E]
+    ny: torch.Tensor,           # [E]
+    edge_dist: torch.Tensor,    # [E]
+    *,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Least-squares nodal gradients from edge directional derivatives.
+    Returns grad: [N,F,2] (x,y components).
+    """
+    N, Fdim = phi.shape
+    src = edge_index[0].long()
+    dst = edge_index[1].long()
+
+    dist = edge_dist.to(device=phi.device, dtype=phi.dtype).clamp_min(eps)
+    nx_ = nx.to(device=phi.device, dtype=phi.dtype)
+    ny_ = ny.to(device=phi.device, dtype=phi.dtype)
+    nrm = torch.sqrt((nx_ * nx_ + ny_ * ny_).clamp_min(eps))
+    nxu = nx_ / nrm
+    nyu = ny_ / nrm
+
+    # directional slope along src->dst
+    s = (phi[dst] - phi[src]) / dist[:, None]  # [E,F]
+
+    # Assemble normal equations A_i g_i = b_i
+    A00 = phi.new_zeros((N,))
+    A01 = phi.new_zeros((N,))
+    A11 = phi.new_zeros((N,))
+    b0 = phi.new_zeros((N, Fdim))
+    b1 = phi.new_zeros((N, Fdim))
+
+    c00 = nxu * nxu
+    c01 = nxu * nyu
+    c11 = nyu * nyu
+    rhs0 = nxu[:, None] * s
+    rhs1 = nyu[:, None] * s
+
+    # Add contributions symmetrically to both edge endpoints.
+    A00.index_add_(0, src, c00); A00.index_add_(0, dst, c00)
+    A01.index_add_(0, src, c01); A01.index_add_(0, dst, c01)
+    A11.index_add_(0, src, c11); A11.index_add_(0, dst, c11)
+    b0.index_add_(0, src, rhs0); b0.index_add_(0, dst, rhs0)
+    b1.index_add_(0, src, rhs1); b1.index_add_(0, dst, rhs1)
+
+    tr = A00 + A11
+    reg = (1e-10 + 1e-8 * tr).to(phi.dtype)
+    A00r = A00 + reg
+    A11r = A11 + reg
+    det = (A00r * A11r - A01 * A01).clamp_min(eps)
+
+    gx = (A11r[:, None] * b0 - A01[:, None] * b1) / det[:, None]
+    gy = (-A01[:, None] * b0 + A00r[:, None] * b1) / det[:, None]
+    return torch.stack([gx, gy], dim=2)  # [N,F,2]
+
+def _muscl_reconstruct_face_states(
+    phi: torch.Tensor,          # [N,F]
+    edge_index: torch.Tensor,   # [2,E]
+    nx: torch.Tensor,           # [E]
+    ny: torch.Tensor,           # [E]
+    edge_dist: torch.Tensor,    # [E]
+    *,
+    limiter: str = "minmod",
+    eps: float = 1e-12,
+):
+    """
+    MUSCL/TVD face reconstruction for directed edge src->dst.
+    Returns (phi_L, phi_R), both [E,F].
+    """
+    src = edge_index[0].long()
+    dst = edge_index[1].long()
+
+    dist = edge_dist.to(device=phi.device, dtype=phi.dtype).clamp_min(eps)
+    nx_ = nx.to(device=phi.device, dtype=phi.dtype)
+    ny_ = ny.to(device=phi.device, dtype=phi.dtype)
+    nrm = torch.sqrt((nx_ * nx_ + ny_ * ny_).clamp_min(eps))
+    nxu = nx_ / nrm
+    nyu = ny_ / nrm
+
+    grad = _compute_node_gradients_ls(phi, edge_index, nxu, nyu, dist, eps=eps)  # [N,F,2]
+
+    proj_src = grad[src, :, 0] * nxu[:, None] + grad[src, :, 1] * nyu[:, None]    # [E,F]
+    proj_dst_to_src = -(grad[dst, :, 0] * nxu[:, None] + grad[dst, :, 1] * nyu[:, None])  # [E,F]
+
+    slope_edge = (phi[dst] - phi[src]) / dist[:, None]  # [E,F]
+    lim_src = _apply_tvd_limiter(proj_src, slope_edge, limiter)
+    lim_dst_to_src = _apply_tvd_limiter(proj_dst_to_src, -slope_edge, limiter)
+
+    half_d = 0.5 * dist[:, None]
+    phi_L = phi[src] + half_d * lim_src
+    phi_R = phi[dst] + half_d * lim_dst_to_src
+    return phi_L, phi_R
+
 def dec_divergence_euler_flux(
     x_abs: torch.Tensor,       # [N,F] (expects conservative channels exist)
     edge_index: torch.Tensor,  # [2,E] (directed edges: src->dst)
     nx: torch.Tensor,          # [E]
     ny: torch.Tensor,          # [E]
     face_len: torch.Tensor,    # [E]
+    edge_dist: torch.Tensor | None,  # [E] center distance (needed for MUSCL)
     area: torch.Tensor,        # [N]
     cfg: dict,
     *,
     scheme: str = "rusanov",
+    reconstruction: str = "first_order",
+    limiter: str = "minmod",
     eps: float = 1e-8,
 ):
     """
@@ -122,35 +258,52 @@ def dec_divergence_euler_flux(
 
     N, Fdim = x_abs.shape
     idx = infer_feature_indices(cfg, Fdim)
-    euler_idx = [idx["rho"], idx["mx"], idx["my"], idx["E"]]
-
-    # per-node fields
-    rho = x_abs[:, idx["rho"]].abs().clamp_min(eps)
-    mx  = x_abs[:, idx["mx"]]
-    my  = x_abs[:, idx["my"]]
-    E   = x_abs[:, idx["E"]]
-
-    # velocity (reuses your clip logic etc.)
-    vel = compute_velocity_from_state(x_abs, cfg=cfg, eps=eps)  # [N,2]
-    u = vel[:, 0]
-    v = vel[:, 1]
-
-    # pressure & sound speed
-    p = pressure_from_conservative_state(x_abs, cfg=cfg, eps=eps)  # [N]
-    c = torch.sqrt((gamma * p / rho).clamp_min(0.0))               # [N]
 
     src = edge_index[0].long()
     dst = edge_index[1].long()
+    rec_kind = _normalize_reconstruction_kind(reconstruction)
 
-    # gather left/right states and speeds
-    rho_L = rho[src]; mx_L = mx[src]; my_L = my[src]; E_L = E[src]
-    rho_R = rho[dst]; mx_R = mx[dst]; my_R = my[dst]; E_R = E[dst]
+    rho_node = x_abs[:, idx["rho"]].abs().clamp_min(eps)
+    mx_node = x_abs[:, idx["mx"]]
+    my_node = x_abs[:, idx["my"]]
+    E_node = x_abs[:, idx["E"]]
+    U_nodes = torch.stack([rho_node, mx_node, my_node, E_node], dim=1)  # [N,4]
 
-    u_L = u[src]; v_L = v[src]
-    u_R = u[dst]; v_R = v[dst]
+    if rec_kind == "muscl":
+        if edge_dist is None:
+            raise RuntimeError("MUSCL reconstruction requires edge_dist in dec_divergence_euler_flux.")
+        U_L, U_R = _muscl_reconstruct_face_states(
+            U_nodes, edge_index, nx, ny, edge_dist, limiter=limiter, eps=eps
+        )
+    else:
+        U_L = U_nodes[src]
+        U_R = U_nodes[dst]
 
-    p_L = p[src]; p_R = p[dst]
-    c_L = c[src]; c_R = c[dst]
+    rho_L = U_L[:, 0].clamp_min(eps)
+    mx_L  = U_L[:, 1]
+    my_L  = U_L[:, 2]
+    E_L   = U_L[:, 3]
+    rho_R = U_R[:, 0].clamp_min(eps)
+    mx_R  = U_R[:, 1]
+    my_R  = U_R[:, 2]
+    E_R   = U_R[:, 3]
+
+    u_clip = float(loss.get("u_clip", 1e3))
+    u_L = mx_L / rho_L
+    v_L = my_L / rho_L
+    u_R = mx_R / rho_R
+    v_R = my_R / rho_R
+    if u_clip > 0:
+        u_L = u_clip * torch.tanh(u_L / u_clip)
+        v_L = u_clip * torch.tanh(v_L / u_clip)
+        u_R = u_clip * torch.tanh(u_R / u_clip)
+        v_R = u_clip * torch.tanh(v_R / u_clip)
+
+    p_floor = float(loss.get("p_floor", 0.0))
+    p_L = ((gamma - 1.0) * (E_L - 0.5 * (mx_L * mx_L + my_L * my_L) / rho_L)).clamp_min(p_floor)
+    p_R = ((gamma - 1.0) * (E_R - 0.5 * (mx_R * mx_R + my_R * my_R) / rho_R)).clamp_min(p_floor)
+    c_L = torch.sqrt((gamma * p_L / rho_L).clamp_min(0.0))
+    c_R = torch.sqrt((gamma * p_R / rho_R).clamp_min(0.0))
 
     # normal velocity
     un_L = u_L * nx + v_L * ny
@@ -295,10 +448,11 @@ def dec_advdiff_terms_abs(
 
     # --- edge geometry ---
     # pred_ea layout: [nx, ny, face_len, dual_len, tau]
-    nx, ny, face_len, _dual_len, tau = edge_attr_unpack(pred_ea)
+    nx, ny, face_len, dual_len, tau = edge_attr_unpack(pred_ea)
     nx = nx.to(dtype=x_abs.dtype)
     ny = ny.to(dtype=x_abs.dtype)
     face_len = face_len.to(dtype=x_abs.dtype)
+    dual_len = dual_len.to(dtype=x_abs.dtype)
     tau = tau.to(dtype=x_abs.dtype)
 
     # --- channel selections ---
@@ -311,6 +465,8 @@ def dec_advdiff_terms_abs(
                   or legacy)
 
     advection_type = str(loss.get("advection_type", "scalar")).lower()
+    advection_reconstruction = str(loss.get("advection_reconstruction", "first_order"))
+    muscl_limiter = str(loss.get("muscl_limiter", "minmod"))
 
     # defaults:
     # - scalar advection default: rho + E (your prior behavior)
@@ -337,9 +493,12 @@ def dec_advdiff_terms_abs(
                 edge_index=edge_index,
                 nx=nx, ny=ny,
                 face_len=face_len,
+                edge_dist=dual_len,
                 area=area,
                 cfg=cfg,
                 scheme=scheme,
+                reconstruction=advection_reconstruction,
+                limiter=muscl_limiter,
                 eps=rho_eps,
             )  # [N,4] ordered [rho,mx,my,E]
 
@@ -364,8 +523,11 @@ def dec_advdiff_terms_abs(
                 edge_index=edge_index,
                 nx=nx, ny=ny,
                 face_len=face_len,
+                edge_dist=dual_len,
                 area=area,
                 scheme=scheme,
+                reconstruction=advection_reconstruction,
+                limiter=muscl_limiter,
             )  # [N,Ca]
 
             r_adv[:, sel_adv] = -div_adv
@@ -703,8 +865,11 @@ def dec_divergence_advective_flux(
     edge_index: torch.Tensor,   # [2,E] directed
     nx: torch.Tensor, ny: torch.Tensor,
     face_len: torch.Tensor,
+    edge_dist: torch.Tensor | None,  # [E] center distance (needed for MUSCL)
     area: torch.Tensor,         # [N]
     scheme: str = "upwind",
+    reconstruction: str = "first_order",
+    limiter: str = "minmod",
 ):
     """
     Computes div(u * phi) using face-based fluxes stored on edges.
@@ -720,12 +885,23 @@ def dec_divergence_advective_flux(
     u_face = 0.5 * (vel[src] + vel[dst])  # [E,2]
     un = u_face[:, 0] * nx + u_face[:, 1] * ny  # [E]
 
+    rec_kind = _normalize_reconstruction_kind(reconstruction)
+    if rec_kind == "muscl":
+        if edge_dist is None:
+            raise RuntimeError("MUSCL reconstruction requires edge_dist in dec_divergence_advective_flux.")
+        phi_L, phi_R = _muscl_reconstruct_face_states(
+            phi, edge_index, nx, ny, edge_dist, limiter=limiter
+        )
+    else:
+        phi_L = phi[src]
+        phi_R = phi[dst]
+
     if scheme.lower() == "central":
-        phi_face = 0.5 * (phi[src] + phi[dst])  # [E,F]
+        phi_face = 0.5 * (phi_L + phi_R)  # [E,F]
     else:
         # upwind: if un>0 (flow from src to dst), take src; else take dst
         take_src = (un >= 0).unsqueeze(1)
-        phi_face = torch.where(take_src, phi[src], phi[dst])  # [E,F]
+        phi_face = torch.where(take_src, phi_L, phi_R)  # [E,F]
 
     flux = (un * face_len)[:, None] * phi_face  # [E,F]
     div = phi.new_zeros((N, Fdim))
@@ -822,7 +998,7 @@ def dec_advdiff_rate(
     rho_eps = float(cfg["loss"].get("rho_eps", 1e-8))
     nu = as_nu_tensor(cfg["loss"].get("nu", 0.0), x_abs.size(1), device=x_abs.device, dtype=x_abs.dtype)
 
-    nx, ny, face_len, _dual_len, tau = edge_attr_unpack(pred_ea)
+    nx, ny, face_len, dual_len, tau = edge_attr_unpack(pred_ea)
 
     area = cell_area_from_levels(levels, dx0=dx0, dy0=dy0, dtype=x_abs.dtype, device=x_abs.device)  # [N]
     vel = compute_velocity_from_state(x_abs, cfg, eps=rho_eps)  # [N,2]
@@ -837,8 +1013,11 @@ def dec_advdiff_rate(
             edge_index=edge_index,
             nx=nx, ny=ny,
             face_len=face_len,
+            edge_dist=dual_len,
             area=area,
             scheme=scheme,
+            reconstruction=str(cfg["loss"].get("advection_reconstruction", "first_order")),
+            limiter=str(cfg["loss"].get("muscl_limiter", "minmod")),
         )
     else:
         div_adv = torch.zeros_like(x_abs)
