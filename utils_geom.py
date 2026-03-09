@@ -10,12 +10,14 @@ def dynamic_cells_from_parent_masks(
     H: int, W: int,
     xmin: float, xmax: float, ymin: float, ymax: float,
     build_edges: bool = False,
+    refine_ratio: int = 2,
 ):
     """
     Convert hierarchical *parent* masks into the final leaf mesh.
 
     Input:
-      masks_by_level[L]: bool tensor with shape (H*2^(L-1), W*2^(L-1))
+      masks_by_level[L]: bool tensor with shape
+        (H*refine_ratio^(L-1), W*refine_ratio^(L-1))
         - L=1: parents at level-0 to be refined -> produce level-1 children
         - L=2: parents at level-1 to be refined -> produce level-2 children
         - ... (up to Lmax)
@@ -26,13 +28,17 @@ def dynamic_cells_from_parent_masks(
       parents: (N,)  int64, coarse (level-0) parent index in [0..H*W-1]
       edge_index: (2,E) (optional) 4-neighbor within-level connectivity
     """
+    rr = int(refine_ratio)
+    if rr < 2:
+        raise ValueError(f"refine_ratio must be >=2, got {refine_ratio}")
+
     device = next(iter(masks_by_level.values())).device if masks_by_level else torch.device("cpu")
     Lmax = max(masks_by_level.keys(), default=0)
 
     # Normalize to bool with expected shapes
     refine = [None] * (Lmax + 1)   # refine[l] exists for l>=1
     for L, M in masks_by_level.items():
-        Mh, Mw = H * (2 ** (L - 1)), W * (2 ** (L - 1))
+        Mh, Mw = H * (rr ** (L - 1)), W * (rr ** (L - 1))
         assert M.shape == (Mh, Mw), f"mask[{L}] has shape {tuple(M.shape)}; expected {(Mh, Mw)}"
         refine[L] = M.to(torch.bool)
 
@@ -50,8 +56,8 @@ def dynamic_cells_from_parent_masks(
             # children exist where parent grid asked for refinement at level l
             parent_refined = F.interpolate(
                 refine[l].float().unsqueeze(0).unsqueeze(0),
-                scale_factor=2.0, mode="nearest"
-            ).squeeze(0).squeeze(0).to(torch.bool)  # shape (H*2^l, W*2^l)
+                scale_factor=float(rr), mode="nearest"
+            ).squeeze(0).squeeze(0).to(torch.bool)  # shape (H*rr^l, W*rr^l)
 
             leaves_l = parent_refined & ~refine[l+1]
             leaves_by_level.append(leaves_l)
@@ -59,8 +65,8 @@ def dynamic_cells_from_parent_masks(
         # deepest level: every child created by refine[Lmax] is a leaf
         leaf_Lmax = F.interpolate(
             refine[Lmax].float().unsqueeze(0).unsqueeze(0),
-            scale_factor=2.0, mode="nearest"
-        ).squeeze(0).squeeze(0).to(torch.bool)     # (H*2^Lmax, W*2^Lmax)
+            scale_factor=float(rr), mode="nearest"
+        ).squeeze(0).squeeze(0).to(torch.bool)     # (H*rr^Lmax, W*rr^Lmax)
         leaves_by_level.append(leaf_Lmax)
 
     # Assemble centers/levels/parents
@@ -69,8 +75,8 @@ def dynamic_cells_from_parent_masks(
     centers_list, levels_list, parents_list = [], [], []
 
     for l, leaf in enumerate(leaves_by_level):
-        HH = H * (2 ** l)
-        WW = W * (2 ** l)
+        HH = H * (rr ** l)
+        WW = W * (rr ** l)
         jj, ii = torch.nonzero(leaf, as_tuple=True)       # rows=j (y), cols=i (x)
         if jj.numel() == 0:
             continue
@@ -84,8 +90,8 @@ def dynamic_cells_from_parent_masks(
         levels_list.append(torch.full((jj.numel(),), l, dtype=torch.int64, device=leaf.device))
 
         # coarse (level-0) parent index (row-major; parent = j0*W + i0)
-        i0 = (ii // (2 ** l)).to(torch.int64)
-        j0 = (jj // (2 ** l)).to(torch.int64)
+        i0 = (ii // (rr ** l)).to(torch.int64)
+        j0 = (jj // (rr ** l)).to(torch.int64)
         parents_list.append(j0 * W + i0)
 
     if centers_list:
@@ -107,8 +113,8 @@ def dynamic_cells_from_parent_masks(
     ei_src, ei_dst = [], []
     start = 0
     for l, leaf in enumerate(leaves_by_level):
-        HH = H * (2 ** l)
-        WW = W * (2 ** l)
+        HH = H * (rr ** l)
+        WW = W * (rr ** l)
         idx_map = -torch.ones((HH, WW), dtype=torch.int64, device=device)
         jj, ii = torch.nonzero(leaf, as_tuple=True)
         if jj.numel() == 0:
@@ -470,5 +476,4 @@ def parents_from_pos(centers: torch.Tensor,
     col = torch.floor((x - xmin) / dx).long().clamp_(0, W - 1)
     row = torch.floor((y - ymin) / dy).long().clamp_(0, H - 1)
     return row * W + col
-
 

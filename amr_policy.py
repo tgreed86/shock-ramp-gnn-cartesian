@@ -38,6 +38,16 @@ def _get(cfg: dict, path: str, default=None):
     return node
 
 
+def _get_refine_ratio(cfg: dict) -> int:
+    pol = cfg.get("policy", {}) or {}
+    mesh = cfg.get("mesh", {}) or {}
+    rr = pol.get("refine_ratio", mesh.get("refine_ratio", 2))
+    rr = int(rr)
+    if rr < 2:
+        raise ValueError(f"refine_ratio must be >=2, got {rr}")
+    return rr
+
+
 def _as_list_or_repeat(x, L_max: int):
     if isinstance(x, (list, tuple)):
         if len(x) == L_max:
@@ -105,9 +115,11 @@ def _resolve_channel_indices(cfg: dict, Fdim: int) -> torch.Tensor:
 
 def _parents_from_level_ij(levels: torch.Tensor,
                            ij: torch.Tensor,
-                           H: int, W: int) -> torch.Tensor:
+                           H: int, W: int,
+                           refine_ratio: int = 2) -> torch.Tensor:
     """
-    Map each level-l cell with indices (i,j) at its own resolution (H*2^l, W*2^l)
+    Map each level-l cell with indices (i,j) at its own resolution
+    (H*refine_ratio^l, W*refine_ratio^l)
     to its coarse parent index in a flattened (H*W) coarse grid.
 
     Works for arbitrary l >= 0. Assumes ij are integer cell indices at the cell's level.
@@ -117,8 +129,12 @@ def _parents_from_level_ij(levels: torch.Tensor,
     i = ij[:, 0].long()
     j = ij[:, 1].long()
 
-    # scale = 2^level, elementwise
-    scale = torch.pow(torch.tensor(2, device=levels.device, dtype=torch.long), levels)
+    rr = int(refine_ratio)
+    if rr < 2:
+        raise ValueError(f"refine_ratio must be >=2, got {refine_ratio}")
+
+    # scale = refine_ratio^level, elementwise
+    scale = torch.pow(torch.tensor(rr, device=levels.device, dtype=torch.long), levels)
     # integer floor division to get coarse parent row/col
     row = torch.div(i, scale, rounding_mode='floor').clamp_(0, H - 1)
     col = torch.div(j, scale, rounding_mode='floor').clamp_(0, W - 1)
@@ -313,6 +329,7 @@ def compute_hierarchical_gradients_from_gt_raster(
 
     pol    = cfg.get("policy", {})
     Lmax   = int(pol.get("max_level", 2))
+    rr = _get_refine_ratio(cfg)
     xmin, xmax, ymin, ymax = cfg["data"]["bbox"]
 
     # Resolve channels
@@ -345,6 +362,7 @@ def compute_hierarchical_gradients_from_gt_raster(
             (None if "level_t" not in batch else batch["level_t"].detach().cpu()),
             batch["center_feat_t"][:, [c]].detach().cpu(),
             H, W, (xmin, xmax, ymin, ymax),
+            refine_ratio=rr,
         )
         img2d = _to_tensor_2d(
             img_flat, Hc, Wc,
@@ -363,8 +381,8 @@ def compute_hierarchical_gradients_from_gt_raster(
     X = torch.stack(imgs, dim=0).to(dev, dtype=torch.float32)  # (C,Hf,Wf)
 
     # Central-diff conv kernels (replicate padding), scaled by Δ
-    dx_f = dx0 / (2.0 ** Lmax)
-    dy_f = dy0 / (2.0 ** Lmax)
+    dx_f = dx0 / (float(rr) ** Lmax)
+    dy_f = dy0 / (float(rr) ** Lmax)
     kx = torch.tensor([[0, 0, 0], [-0.5, 0, 0.5], [0, 0, 0]], dtype=torch.float32, device=dev).view(1,1,3,3) / dx_f
     ky = torch.tensor([[0, -0.5, 0], [0, 0, 0], [0, 0.5, 0]], dtype=torch.float32, device=dev).view(1,1,3,3) / dy_f
 
@@ -418,7 +436,7 @@ def compute_hierarchical_gradients_from_gt_raster(
 
     # Down-pool to parents
     for L in range(Lmax-1, -1, -1):
-        scale = 2 ** (Lmax - L)
+        scale = rr ** (Lmax - L)
         # max-pool per channel to preserve sharpest gradients
         pooled = F.max_pool2d(gfeat_fine, kernel_size=scale, stride=scale)  # (C,h,w)
         grad_feat_by_level[L] = pooled.permute(1,2,0).contiguous()
@@ -441,6 +459,7 @@ def predict_masks_hierarchical_from_gt_gradients(
     dev = device or next((v.device for v in batch.values() if torch.is_tensor(v)), torch.device("cpu"))
 
     pol          = cfg.get("policy", {})
+    rr           = _get_refine_ratio(cfg)
     tau_by_level = pol.get("tau_by_level", None)
     tau_low_def  = float(pol.get("tau_low",  0.02))
     tau_high_def = float(pol.get("tau_high", 0.03))
@@ -449,7 +468,27 @@ def predict_masks_hierarchical_from_gt_gradients(
     pct_low_default  = float(pol.get("percentile_low",  75.0))
     pct_high_default = float(pol.get("percentile_high", 90.0))
     pct_by_level     = pol.get("percentiles_by_level", {})
+    pct_mode = "auto"
+    if isinstance(pct_by_level, dict):
+        pct_mode = str(pct_by_level.get("selection", "auto")).strip().lower()
+    if pct_mode not in ("auto", "global", "per_level", "per-level", "level", "levels"):
+        raise ValueError(
+            "policy.percentiles_by_level.selection must be one of: "
+            "auto, global, per_level"
+        )
+    use_global_pct = (pct_mode == "global")
+    use_level_pct = (pct_mode in ("per_level", "per-level", "level", "levels"))
     dbg_thr = bool(pol.get("debug_thresholds", False))
+
+    def _pct_level_entry(L: int):
+        if not isinstance(pct_by_level, dict):
+            return None
+        if L in pct_by_level:
+            return pct_by_level[L]
+        s = str(L)
+        if s in pct_by_level:
+            return pct_by_level[s]
+        return None
 
     def _taus(L: int) -> tuple[float, float]:
         if isinstance(tau_by_level, dict) and L in tau_by_level:
@@ -504,7 +543,7 @@ def predict_masks_hierarchical_from_gt_gradients(
     maxL = max(G.keys())
     for L in range(maxL - 1, -1, -1):
         for Lc in range(L + 1, maxL + 1):
-            scale = 2 ** (Lc - L)
+            scale = rr ** (Lc - L)
             pooled = torch.nn.functional.max_pool2d(G[Lc][None, None], kernel_size=scale, stride=scale)[0, 0]
             pooled_up[L] = torch.maximum(pooled_up[L], pooled)
 
@@ -515,12 +554,17 @@ def predict_masks_hierarchical_from_gt_gradients(
         Gparent = pooled_up[parent].to(dev)
 
         if mode == "percentile":
-            if isinstance(pct_by_level, dict) and L in pct_by_level:
-                pL = pct_by_level[L]
-                p_low  = float(pL.get("low",  pct_low_default))
-                p_high = float(pL.get("high", pct_high_default))
-            else:
+            if use_global_pct:
                 p_low, p_high = pct_low_default, pct_high_default
+            else:
+                pL = _pct_level_entry(L)
+                if use_level_pct and (pL is None):
+                    p_low, p_high = pct_low_default, pct_high_default
+                elif isinstance(pL, dict):
+                    p_low = float(pL.get("low", pct_low_default))
+                    p_high = float(pL.get("high", pct_high_default))
+                else:
+                    p_low, p_high = pct_low_default, pct_high_default
             p_low  = max(0.0, min(100.0, p_low))
             p_high = max(0.0, min(100.0, p_high))
             if p_low > p_high: p_low, p_high = p_high, p_low
@@ -577,7 +621,7 @@ def predict_masks_hierarchical_from_gt_gradients(
 
         if L > 1:
             allow = torch.nn.functional.interpolate(
-                masks_by_level[L - 1].float()[None, None], scale_factor=2.0, mode="nearest"
+                masks_by_level[L - 1].float()[None, None], scale_factor=float(rr), mode="nearest"
             )[0, 0].bool()
             h, w = Gparent.shape
             M = M & allow[:h, :w]
@@ -585,7 +629,7 @@ def predict_masks_hierarchical_from_gt_gradients(
         # Optional: constant-physical-width dilation
         r_phys = float(cfg.get("policy", {}).get(f"dilate_phys_L{L}", 0.0))
         if r_phys > 0:
-            dxL_here = (xmax - xmin) / (W * (2 ** (L - 1)))
+            dxL_here = (xmax - xmin) / (W * (rr ** (L - 1)))
             r_cells = max(1, int(round(r_phys / dxL_here)))
             k = 2 * r_cells + 1
             M = torch.nn.functional.max_pool2d(
@@ -601,19 +645,19 @@ def predict_masks_hierarchical_from_gt_gradients(
     norm_masks_by_level = {}
     for L, M in masks_by_level.items():
         M = M.to(torch.bool)
-        expected_h = H * (2 ** (L - 1))
-        expected_w = W * (2 ** (L - 1))
+        expected_h = H * (rr ** (L - 1))
+        expected_w = W * (rr ** (L - 1))
         h, w = int(M.shape[0]), int(M.shape[1])
 
         if (h, w) == (expected_h, expected_w):
             norm_masks_by_level[L] = M
             continue
 
-        if (h, w) == (expected_h * 2, expected_w * 2):
+        if (h, w) == (expected_h * rr, expected_w * rr):
             Mp = torch.nn.functional.max_pool2d(
                 M.float()[None, None],
-                kernel_size=2,
-                stride=2,
+                kernel_size=rr,
+                stride=rr,
             )[0, 0].to(torch.bool)
             norm_masks_by_level[L] = Mp
             continue
@@ -728,12 +772,16 @@ def _mean_pool_blocks(A: np.ndarray, blk: int) -> np.ndarray:
     return A_reshaped.mean(axis=(1, 3))
 
 
-def _maxpool_or(mask_child: torch.Tensor) -> torch.Tensor:
+def _maxpool_or(mask_child: torch.Tensor, ratio: int = 2) -> torch.Tensor:
     """
-    Downsample a child-level boolean mask by 2× using OR over 2×2 blocks.
+    Downsample a child-level boolean mask by ratio×ratio using OR pooling.
     Accepts shapes [Hc,Wc], [1,Hc,Wc], [Hc,Wc,1], or [B,Hc,Wc] (B=1).
-    Returns [Hp,Wp] where Hp=ceil(Hc/2), Wp=ceil(Wc/2).
+    Returns [Hp,Wp] where Hp=ceil(Hc/ratio), Wp=ceil(Wc/ratio).
     """
+    rr = int(ratio)
+    if rr < 2:
+        raise ValueError(f"ratio must be >=2, got {ratio}")
+
     m = torch.as_tensor(mask_child).to(torch.bool)
 
     # Strip a leading/trailing singleton or collapse a (B,H,W) with B>1 via any().
@@ -751,16 +799,16 @@ def _maxpool_or(mask_child: torch.Tensor) -> torch.Tensor:
 
     Hc, Wc = m.shape
 
-    # Pad to even sizes so we can view into 2×2 tiles safely
-    padH = Hc % 2
-    padW = Wc % 2
+    # Pad to multiples of rr so we can view into rr×rr tiles safely
+    padH = (rr - (Hc % rr)) % rr
+    padW = (rr - (Wc % rr)) % rr
     if padH or padW:
         m = F.pad(m, (0, padW, 0, padH), value=False)
         Hc, Wc = m.shape
 
-    # OR over 2×2 tiles
-    m = m.view(Hc // 2, 2, Wc // 2, 2).any(dim=(1, 3))
-    return m  # dtype=bool, shape [Hc//2, Wc//2]
+    # OR over rr×rr tiles
+    m = m.view(Hc // rr, rr, Wc // rr, rr).any(dim=(1, 3))
+    return m  # dtype=bool, shape [Hc//rr, Wc//rr]
 
 
 def _upsample2(mask_parent: torch.Tensor) -> torch.Tensor:
@@ -808,20 +856,28 @@ def _combine_channels(mag: np.ndarray, sel: Optional[list], mode: str) -> np.nda
 
 # ------------------------ leaf set & graph construction ---------------------- #
 
-def _leaf_masks_from_hierarchy(masks_by_level: Dict[int, torch.Tensor], L_max: int) -> Dict[int, torch.Tensor]:
+def _leaf_masks_from_hierarchy(
+    masks_by_level: Dict[int, torch.Tensor],
+    L_max: int,
+    refine_ratio: int = 2,
+) -> Dict[int, torch.Tensor]:
     """
     Given {l: mask_l}, compute leaf masks per level by subtracting parents that
     are refined at the next level.
     """
+    rr = int(refine_ratio)
+    if rr < 2:
+        raise ValueError(f"refine_ratio must be >=2, got {refine_ratio}")
+
     out = {}
     for l in range(0, L_max + 1):
         mask_l = masks_by_level.get(l, None)
         if mask_l is None:
-            Hl = masks_by_level[0].shape[0] * (2 ** l)
-            Wl = masks_by_level[0].shape[1] * (2 ** l)
+            Hl = masks_by_level[0].shape[0] * (rr ** l)
+            Wl = masks_by_level[0].shape[1] * (rr ** l)
             mask_l = torch.zeros((Hl, Wl), dtype=torch.bool, device=_device_of_masks(masks_by_level))
         if l < L_max and masks_by_level.get(l + 1, None) is not None:
-            refined_parent = _maxpool_or(masks_by_level[l + 1])
+            refined_parent = _maxpool_or(masks_by_level[l + 1], ratio=rr)
             leaf = mask_l & (~refined_parent.to(mask_l.device))
         else:
             leaf = mask_l
@@ -935,6 +991,3 @@ def _idw_map(src_x: torch.Tensor,
         out[rows] = src_x.index_select(0, topk_idx[rows, 0])
 
     return out
-
-
-

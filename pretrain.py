@@ -36,6 +36,16 @@ def _cfg_hash_for_cache(cfg):
     s = json.dumps(key, sort_keys=True, default=str)
     return hashlib.md5(s.encode()).hexdigest()[:8]
 
+
+def _get_refine_ratio(cfg: dict) -> int:
+    pol = cfg.get("policy", {}) or {}
+    mesh = cfg.get("mesh", {}) or {}
+    rr = pol.get("refine_ratio", mesh.get("refine_ratio", 2))
+    rr = int(rr)
+    if rr < 2:
+        raise ValueError(f"refine_ratio must be >=2, got {rr}")
+    return rr
+
 def plot_precomputed_mesh_from_h5(
     h5_path: str,
     *,
@@ -81,6 +91,7 @@ def plot_precomputed_mesh_from_h5(
         meta = f["meta"].attrs
         dx = float(meta["dx"])
         dy = float(meta["dy"])
+        rr = int(meta.get("refine_ratio", 2))
         bbox = np.asarray(meta["bbox"], dtype=np.float64).reshape(-1)
         if bbox.size != 4:
             raise RuntimeError(f"Expected bbox with 4 entries, got shape {bbox.shape}")
@@ -115,8 +126,8 @@ def plot_precomputed_mesh_from_h5(
         N = centers.shape[0]
 
     # Cell half-widths/half-heights by refinement level:
-    # level L => cell size = (dx / 2^L, dy / 2^L)
-    scale = np.power(2.0, levels.astype(np.float32))  # 2^L
+    # level L => cell size = (dx / rr^L, dy / rr^L)
+    scale = np.power(float(rr), levels.astype(np.float32))
     hx = (dx / scale) * 0.5
     hy = (dy / scale) * 0.5
 
@@ -264,8 +275,8 @@ def plot_precomputed_mesh_with_edges_from_h5(
 
         # scale the window using the *coarser* of the two levels
         Lc = int(min(levels[u0], levels[v0]))
-        w = dx0 / (2 ** Lc)
-        h = dy0 / (2 ** Lc)
+        w = dx0 / (float(rr) ** Lc)
+        h = dy0 / (float(rr) ** Lc)
 
         half_w = 0.5 * float(zoom_cells) * float(w)
         half_h = 0.5 * float(zoom_cells) * float(h)
@@ -289,6 +300,7 @@ def plot_precomputed_mesh_with_edges_from_h5(
         meta = f["meta"].attrs
         dx0 = float(meta["dx"])
         dy0 = float(meta["dy"])
+        rr = int(meta.get("refine_ratio", 2))
         bbox = np.asarray(meta["bbox"], dtype=np.float64).reshape(-1)
         if bbox.size != 4:
             raise RuntimeError(f"Expected bbox with 4 entries, got shape {bbox.shape}")
@@ -396,7 +408,7 @@ def plot_precomputed_mesh_with_edges_from_h5(
     lev_k = levels[keep_idx].astype(np.int32, copy=False)
     c_k = centers[keep_idx]
 
-    scale = np.power(2.0, lev_k.astype(np.float32))  # 2^L
+    scale = np.power(float(rr), lev_k.astype(np.float32))
     hx = (dx0 / scale) * 0.5
     hy = (dy0 / scale) * 0.5
 
@@ -506,6 +518,7 @@ def _normalize_builder_output_to_mesh(
     H: int,
     W: int,
     device: torch.device,
+    refine_ratio: int = 2,
 ):
     """
     Normalize various possible builder outputs into:
@@ -520,6 +533,10 @@ def _normalize_builder_output_to_mesh(
       - tuple/list of length 4 or 5
       - list-of-cells (len >> 5), where each cell is dict/tuple-like
     """
+    rr = int(refine_ratio)
+    if rr < 2:
+        raise ValueError(f"refine_ratio must be >=2, got {refine_ratio}")
+
     bbox = tuple(cfg["data"]["bbox"])
     xmin, xmax, ymin, ymax = bbox
 
@@ -623,12 +640,12 @@ def _normalize_builder_output_to_mesh(
         jj     = torch.as_tensor([c["j"]     for c in out], dtype=torch.int64, device=device).view(-1)
 
         centers = _centers_from_level_ij(
-            levels, ii, jj, H=H, W=W, bbox=bbox, device=device
+            levels, ii, jj, H=H, W=W, bbox=bbox, device=device, refine_ratio=rr
         ).to(dtype=torch.float32)
 
         # Parents: coarse parent index on level-0 grid.
-        # For a level-L cell, its level-0 parent is (i // 2^L, j // 2^L).
-        scale_i = torch.pow(torch.tensor(2, device=device, dtype=torch.int64), levels)
+        # For a level-L cell, its level-0 parent is (i // rr^L, j // rr^L).
+        scale_i = torch.pow(torch.tensor(rr, device=device, dtype=torch.int64), levels)
         i0 = torch.div(ii, scale_i, rounding_mode="floor")
         j0 = torch.div(jj, scale_i, rounding_mode="floor")
         parents = (j0 * int(W) + i0).to(torch.int64).view(-1)
@@ -650,7 +667,13 @@ def _normalize_builder_output_to_mesh(
 
     raise RuntimeError(f"Unsupported builder return type: {type(out)}")
 
-def amr_cell_wh_area_from_levels(levels: torch.Tensor, *, dx0: float, dy0: float):
+def amr_cell_wh_area_from_levels(
+    levels: torch.Tensor,
+    *,
+    dx0: float,
+    dy0: float,
+    refine_ratio: int = 2,
+):
     """
     levels: (N,) int64
     Returns:
@@ -660,8 +683,12 @@ def amr_cell_wh_area_from_levels(levels: torch.Tensor, *, dx0: float, dy0: float
       hx: (N,) float32
       hy: (N,) float32
     """
+    rr = int(refine_ratio)
+    if rr < 2:
+        raise ValueError(f"refine_ratio must be >=2, got {refine_ratio}")
+
     lv = levels.to(dtype=torch.float32)
-    scale = torch.pow(torch.tensor(2.0, device=levels.device), lv)  # 2^L
+    scale = torch.pow(torch.tensor(float(rr), device=levels.device), lv)
     w = (float(dx0) / scale).to(torch.float32)
     h = (float(dy0) / scale).to(torch.float32)
     area = (w * h).to(torch.float32)
@@ -677,6 +704,7 @@ def dec_edge_attr_for_dyadic_quads(
     *,
     dx0: float,
     dy0: float,
+    refine_ratio: int = 2,
 ):
     """
     Returns edge_attr: (E,5) float32 with columns:
@@ -687,7 +715,9 @@ def dec_edge_attr_for_dyadic_quads(
     u = ei[0]
     v = ei[1]
 
-    w, h, _area, hx, hy = amr_cell_wh_area_from_levels(levels, dx0=dx0, dy0=dy0)
+    w, h, _area, hx, hy = amr_cell_wh_area_from_levels(
+        levels, dx0=dx0, dy0=dy0, refine_ratio=refine_ratio
+    )
 
     du = centers[v] - centers[u]  # (E,2)
     dx = du[:, 0]
@@ -741,10 +771,11 @@ def _centers_from_level_ij(
     W: int,
     bbox: tuple[float, float, float, float],
     device: torch.device,
+    refine_ratio: int = 2,
 ) -> torch.Tensor:
     """
     Compute physical cell centers from (level, i, j) where i,j are indices
-    on the level-L grid (0 <= i < W*2^L, 0 <= j < H*2^L).
+    on the level-L grid (0 <= i < W*refine_ratio^L, 0 <= j < H*refine_ratio^L).
 
     Assumes bbox spans the full level-0 domain discretized into HxW cells.
     """
@@ -752,9 +783,13 @@ def _centers_from_level_ij(
     dx0 = (xmax - xmin) / float(W)
     dy0 = (ymax - ymin) / float(H)
 
-    # cell size at level L: dx0/2^L, dy0/2^L
+    rr = int(refine_ratio)
+    if rr < 2:
+        raise ValueError(f"refine_ratio must be >=2, got {refine_ratio}")
+
+    # cell size at level L: dx0/rr^L, dy0/rr^L
     lv = level_1d.to(device=device, dtype=torch.float32)
-    scale = torch.pow(torch.tensor(2.0, device=device), lv)
+    scale = torch.pow(torch.tensor(float(rr), device=device), lv)
 
     dxL = dx0 / scale
     dyL = dy0 / scale
@@ -862,6 +897,7 @@ def _cell_corners_from_centers_levels(
     levels: torch.Tensor,   # (N,)
     H: int, W: int,
     bbox: tuple[float, float, float, float],
+    refine_ratio: int = 2,
 ) -> torch.Tensor:
     """
     Return corners for each AMR cell (axis-aligned) as (N,4,2) in physical coords.
@@ -871,10 +907,14 @@ def _cell_corners_from_centers_levels(
     dx0 = (xmax - xmin) / float(W)
     dy0 = (ymax - ymin) / float(H)
 
+    rr = int(refine_ratio)
+    if rr < 2:
+        raise ValueError(f"refine_ratio must be >=2, got {refine_ratio}")
+
     lv = levels.to(torch.float32)
-    # cell width at level l is dx0 / 2^l, so half-width is dx0 / 2^(l+1)
-    halfx = (dx0 * 0.5) * torch.pow(torch.tensor(2.0, device=centers.device), -lv)
-    halfy = (dy0 * 0.5) * torch.pow(torch.tensor(2.0, device=centers.device), -lv)
+    # cell width at level l is dx0 / rr^l, so half-width is dx0 / (2*rr^l)
+    halfx = (dx0 * 0.5) * torch.pow(torch.tensor(float(rr), device=centers.device), -lv)
+    halfy = (dy0 * 0.5) * torch.pow(torch.tensor(float(rr), device=centers.device), -lv)
 
     # (N,1) for broadcasting
     halfx = halfx.view(-1, 1)
@@ -1019,6 +1059,7 @@ def _build_starting_mesh_from_spec(
         H=H,
         W=W,
         device=torch.device(device) if not isinstance(device, torch.device) else device,
+        refine_ratio=_get_refine_ratio(cfg),
     )
 
     # Optional: enforce expected shapes early
@@ -1058,10 +1099,16 @@ def _refine_cells_one_level(
     refine_mask: torch.Tensor, # (N,) bool
     H: int, W: int,
     bbox: tuple[float, float, float, float],
+    refine_ratio: int = 2,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Replace each selected cell by its 4 children (level+1). Non-selected cells are kept.
+    Replace each selected cell by its refine_ratio^2 children (level+1).
+    Non-selected cells are kept.
     """
+    rr = int(refine_ratio)
+    if rr < 2:
+        raise ValueError(f"refine_ratio must be >=2, got {refine_ratio}")
+
     xmin, xmax, ymin, ymax = bbox
     dx0 = (xmax - xmin) / float(W)
     dy0 = (ymax - ymin) / float(H)
@@ -1078,24 +1125,23 @@ def _refine_cells_one_level(
     if c_ref.numel() == 0:
         return centers, levels, parents
 
-    # parent cell size at level l is dx0/2^l, child centers are offset by (dx_l/4, dy_l/4)
+    # Parent cell size at level l is dx0/rr^l, dy0/rr^l.
     lv = l_ref.to(torch.float32)
-    offx = (dx0 * 0.25) * torch.pow(torch.tensor(2.0, device=centers.device), -lv)  # dx0 / 2^(l+2)
-    offy = (dy0 * 0.25) * torch.pow(torch.tensor(2.0, device=centers.device), -lv)
+    parent_w = float(dx0) * torch.pow(torch.tensor(float(rr), device=centers.device), -lv)
+    parent_h = float(dy0) * torch.pow(torch.tensor(float(rr), device=centers.device), -lv)
 
-    offx = offx.view(-1, 1)
-    offy = offy.view(-1, 1)
+    # Child-center offsets in parent-cell units.
+    frac = ((torch.arange(rr, device=centers.device, dtype=centers.dtype) + 0.5) / float(rr)) - 0.5
+    gx, gy = torch.meshgrid(frac, frac, indexing="xy")
 
-    sx = torch.tensor([-1.0, -1.0,  1.0,  1.0], device=centers.device).view(1, 4)
-    sy = torch.tensor([-1.0,  1.0, -1.0,  1.0], device=centers.device).view(1, 4)
-
-    child = torch.empty((c_ref.shape[0], 4, 2), device=centers.device, dtype=centers.dtype)
-    child[..., 0] = c_ref[:, 0:1] + sx * offx
-    child[..., 1] = c_ref[:, 1:2] + sy * offy
+    child = torch.empty((c_ref.shape[0], rr, rr, 2), device=centers.device, dtype=centers.dtype)
+    child[..., 0] = c_ref[:, 0].view(-1, 1, 1) + parent_w.view(-1, 1, 1) * gx.view(1, rr, rr)
+    child[..., 1] = c_ref[:, 1].view(-1, 1, 1) + parent_h.view(-1, 1, 1) * gy.view(1, rr, rr)
     child_centers = child.reshape(-1, 2)
 
-    child_levels = (l_ref + 1).repeat_interleave(4)
-    child_parents = p_ref.repeat_interleave(4)
+    child_count = rr * rr
+    child_levels = (l_ref + 1).repeat_interleave(child_count)
+    child_parents = p_ref.repeat_interleave(child_count)
 
     new_centers = torch.cat([c_keep, child_centers], dim=0)
     new_levels  = torch.cat([l_keep, child_levels], dim=0)
@@ -1126,17 +1172,22 @@ def cell_area_from_levels(
     H: int,
     W: int,
     bbox: tuple[float, float, float, float],
+    refine_ratio: int = 2,
 ) -> torch.Tensor:
     """
-    Compute area per cell for axis-aligned dyadic quads:
-      area(L) = (dx0 * dy0) / 4^L
+    Compute area per cell for axis-aligned AMR quads:
+      area(L) = (dx0 * dy0) / (refine_ratio^2)^L
     where dx0, dy0 are level-0 cell sizes from bbox and (H,W).
     """
+    rr = int(refine_ratio)
+    if rr < 2:
+        raise ValueError(f"refine_ratio must be >=2, got {refine_ratio}")
+
     xmin, xmax, ymin, ymax = map(float, bbox)
     dx0 = (xmax - xmin) / float(W)
     dy0 = (ymax - ymin) / float(H)
     levels_f = levels.to(torch.float32)
-    area = (dx0 * dy0) * torch.pow(torch.tensor(0.25, device=levels.device), levels_f)
+    area = (dx0 * dy0) * torch.pow(torch.tensor(float(rr * rr), device=levels.device), -levels_f)
     return area.to(torch.float32)
 
 
@@ -1150,9 +1201,10 @@ def build_amr_face_adjacency_edges(
     *,
     max_L_guard: int = 6,
     return_edge_attr: bool = True,
+    refine_ratio: int = 2,
 ):
     """
-    Face-adjacency edge builder for axis-aligned dyadic AMR quads.
+    Face-adjacency edge builder for axis-aligned AMR quads.
 
     Uses a max-grid occupancy rasterization to detect which *original* cells share a face,
     including coarse–fine partial overlaps. Nodes remain original cells (true centers).
@@ -1179,6 +1231,9 @@ def build_amr_face_adjacency_edges(
         return ei
 
     xmin, xmax, ymin, ymax = map(float, bbox)
+    rr = int(refine_ratio)
+    if rr < 2:
+        raise ValueError(f"refine_ratio must be >=2, got {refine_ratio}")
 
     levels_i64 = levels.to(torch.int64)
     Lmax = int(levels_i64.max().item()) if levels_i64.numel() else 0
@@ -1194,10 +1249,10 @@ def build_amr_face_adjacency_edges(
     dy0 = (ymax - ymin) / float(H)
 
     # Max-grid resolution
-    Hmax = int(H) * (2 ** Lmax)
-    Wmax = int(W) * (2 ** Lmax)
-    dx_max = dx0 / (2 ** Lmax)
-    dy_max = dy0 / (2 ** Lmax)
+    Hmax = int(H) * (rr ** Lmax)
+    Wmax = int(W) * (rr ** Lmax)
+    dx_max = dx0 / (float(rr) ** Lmax)
+    dy_max = dy0 / (float(rr) ** Lmax)
 
     # occupancy grid storing ORIGINAL cell id
     occ = np.full((Hmax, Wmax), fill_value=-1, dtype=np.int32)
@@ -1208,18 +1263,18 @@ def build_amr_face_adjacency_edges(
     # Rasterize: stamp each AMR cell id into the max-grid region it occupies
     for cid in range(N):
         L = int(l[cid])
-        scale = 2 ** (Lmax - L)  # block size in max-grid pixels along each axis
+        scale = rr ** (Lmax - L)  # block size in max-grid pixels along each axis
 
-        dxL = dx0 / (2 ** L)
-        dyL = dy0 / (2 ** L)
+        dxL = dx0 / (float(rr) ** L)
+        dyL = dy0 / (float(rr) ** L)
 
         # integer index in the level-L grid
         ixL = int(np.floor((c[cid, 0] - xmin) / dxL))
         iyL = int(np.floor((c[cid, 1] - ymin) / dyL))
 
         # clamp for numerical edge cases at domain boundary
-        ixL = max(0, min(ixL, (W * (2 ** L)) - 1))
-        iyL = max(0, min(iyL, (H * (2 ** L)) - 1))
+        ixL = max(0, min(ixL, (W * (rr ** L)) - 1))
+        iyL = max(0, min(iyL, (H * (rr ** L)) - 1))
 
         ix0 = ixL * scale
         iy0 = iyL * scale
@@ -1431,6 +1486,7 @@ def _build_pred_mesh_from_gt_gradients(
           mask_pred_parent : (H,W) bool, mask of which coarse parents are occupied
     """
     dev = torch.device(device)
+    rr = _get_refine_ratio(cfg)
 
     # -------------------------------
     # 1. GT(t) centers and features
@@ -1457,6 +1513,7 @@ def _build_pred_mesh_from_gt_gradients(
             ex["ij_t"].to(dev),
             H,
             W,
+            refine_ratio=rr,
         )
     elif "dyn_parents" in ex and ex["dyn_parents"] is not None:
         parents_t = ex["dyn_parents"].to(dev)
@@ -1498,19 +1555,14 @@ def _build_pred_mesh_from_gt_gradients(
     # -------------------------------
     # 4. Gradient-based masks
     # -------------------------------
-    """
-    masks_pred_by_level = predict_masks_hierarchical_from_gt_gradients(
-        batch_like,
-        cfg,
-        H,
-        W,
-        dx,
-        dy,
-        device=dev,
+    dbg_cfg = cfg.get("debug", {}) or {}
+    # Keep precompute fast by default: only enable per-step gradient capture/plots
+    # when explicitly requested.
+    want_grad_plots = bool(dbg_cfg.get("plot_gradients", False)) and bool(
+        dbg_cfg.get("plot_gradients_during_precompute", False)
     )
-    """
-    # --- call policy, capturing gradient maps for debugging ---
-    grad_debug: dict = {}
+    grad_debug = {} if want_grad_plots else None
+
     masks_pred_by_level = predict_masks_hierarchical_from_gt_gradients(
         batch_like,
         cfg,
@@ -1521,19 +1573,19 @@ def _build_pred_mesh_from_gt_gradients(
         device=device,
         debug_out=grad_debug,
     )
-    """
-    t_idx = ex.get("t", None)
-    if torch.is_tensor(t_idx):
-        t_idx = int(t_idx.item())
-    debug_plot_policy_gradients(
-        grad_debug,
-        cfg=cfg,
-        t=t_idx,
-        use_pooled_up=False,   # or True, if you prefer the pooled maps
-        out_dir="./debug_grad_plots",
-        prefix="policy_grads",
-    )
-    """
+
+    if want_grad_plots and isinstance(grad_debug, dict):
+        t_idx = ex.get("t", None)
+        if torch.is_tensor(t_idx):
+            t_idx = int(t_idx.item())
+        debug_plot_policy_gradients(
+            grad_debug,
+            cfg=cfg,
+            t=t_idx,
+            use_pooled_up=False,   
+            out_dir="./debug_grad_plots",
+            prefix="policy_grads",
+        )
     # -------------------------------
     # 5. Masks -> dynamic leaf mesh
     # -------------------------------
@@ -1546,6 +1598,7 @@ def _build_pred_mesh_from_gt_gradients(
         xmax,
         ymin,
         ymax,
+        refine_ratio=rr,
     )
 
     # Flatten parents to [N] indices on level-0 grid
@@ -1568,6 +1621,7 @@ def _build_pred_mesh_from_gt_gradients(
             W,
             bbox=tuple(cfg["data"]["bbox"]),
             return_edge_attr=True,  # keep identical downstream contract for now
+            refine_ratio=rr,
         )
         pred_ei = pred_ei.to(dev, dtype=torch.long)
         pred_ea = pred_ea.to(dev, dtype=torch.float32)      
@@ -1737,6 +1791,7 @@ def _clip_pred_mesh_to_wedge(
 
     pol = cfg.get("policy", {})
     Lmax = int(pol.get("max_level", 3))
+    rr = _get_refine_ratio(cfg)
     bbox = tuple(cfg["data"]["bbox"])
 
     # Small positive radius expands the polygon slightly so boundary points count "inside"
@@ -1748,7 +1803,9 @@ def _clip_pred_mesh_to_wedge(
     # ---------- Step 1: keep cells that intersect the wedge ----------
     center_inside = _path_contains_points_torch(wedge_path, pred_centers, radius=radius)
 
-    corners = _cell_corners_from_centers_levels(pred_centers, pred_levels, H, W, bbox)  # (N,4,2)
+    corners = _cell_corners_from_centers_levels(
+        pred_centers, pred_levels, H, W, bbox, refine_ratio=rr
+    )  # (N,4,2)
     corner_inside = _path_contains_points_torch(wedge_path, corners.reshape(-1, 2), radius=radius).view(-1, 4)
     any_corner_inside = corner_inside.any(dim=1)
 
@@ -1767,7 +1824,9 @@ def _clip_pred_mesh_to_wedge(
     # A cell is "fully inside" if all 4 corners are inside.
     # Refine any cell that is not fully inside, up to Lmax.
     for _ in range(Lmax + 1):
-        corners = _cell_corners_from_centers_levels(pred_centers, pred_levels, H, W, bbox)
+        corners = _cell_corners_from_centers_levels(
+            pred_centers, pred_levels, H, W, bbox, refine_ratio=rr
+        )
         corner_inside = _path_contains_points_torch(wedge_path, corners.reshape(-1, 2), radius=radius).view(-1, 4)
         fully_inside = corner_inside.all(dim=1)
 
@@ -1784,10 +1843,13 @@ def _clip_pred_mesh_to_wedge(
             pred_centers, pred_levels, parent_flat,
             refine_mask=refine_mask,
             H=H, W=W, bbox=bbox,
+            refine_ratio=rr,
         )
 
     # ---------- Step 3: final strict keep (no cells outside wedge) ----------
-    corners = _cell_corners_from_centers_levels(pred_centers, pred_levels, H, W, bbox)
+    corners = _cell_corners_from_centers_levels(
+        pred_centers, pred_levels, H, W, bbox, refine_ratio=rr
+    )
     corner_inside = _path_contains_points_torch(wedge_path, corners.reshape(-1, 2), radius=radius).view(-1, 4)
     fully_inside = corner_inside.all(dim=1)
 
@@ -1808,16 +1870,16 @@ def _clip_pred_mesh_to_wedge(
     edge_method = str(cfg.get("edges", {}).get("method", "amr_local_knn")).lower()
 
     if ("face" in edge_method):
-        pred_ei, _pred_ea = build_amr_face_adjacency_edges(
+        pred_ei = build_amr_face_adjacency_edges(
             pred_centers,
             pred_levels,
             H,
             W,
             bbox=bbox,
-            return_edge_attr=True,
+            return_edge_attr=False,
+            refine_ratio=rr,
         )
         pred_ei = pred_ei.to(dev, dtype=torch.long)
-        _pred_ea = _pred_ea.to(dev, dtype=torch.float32)
     else:
         pred_ei = build_amr_local_knn_edges(
             pred_centers,
@@ -1902,6 +1964,7 @@ def precompute_pred_mesh_and_interps_for_rollout(
         return hashlib.sha1(s).hexdigest()
     
     dbg = cfg.get("debug", {})
+    refine_ratio = _get_refine_ratio(cfg)
 
     def _h5_is_usable(path: str, cfg: dict, expected_T: int) -> bool:
         if not os.path.exists(path):
@@ -1993,34 +2056,35 @@ def precompute_pred_mesh_and_interps_for_rollout(
 
     def _refine_cells_one_level(centers: torch.Tensor, levels: torch.Tensor, parents: torch.Tensor):
         """
-        Refine every cell in (centers, levels, parents) by one level (split into 4 children).
+        Refine every cell in (centers, levels, parents) by one level
+        (split into refine_ratio^2 children).
         Returns children arrays.
         """
         xmin, xmax, ymin, ymax = map(float, cfg["data"]["bbox"])
 
         L = levels.to(torch.int64)
-        # cell size at current level
-        # dx_L = dx / 2^L, dy_L = dy / 2^L
-        dx_L = (torch.tensor(float(dx)) / torch.pow(torch.tensor(2.0), L.to(torch.float32))).to(torch.float32)
-        dy_L = (torch.tensor(float(dy)) / torch.pow(torch.tensor(2.0), L.to(torch.float32))).to(torch.float32)
+        rr = int(refine_ratio)
+        rr_t = torch.tensor(float(rr), device=L.device)
 
-        # child offsets: +/- dx_L/4, +/- dy_L/4
-        ox = (dx_L * 0.25)[:, None]
-        oy = (dy_L * 0.25)[:, None]
+        # cell size at current level: dx_L = dx / rr^L, dy_L = dy / rr^L
+        dx_L = (torch.tensor(float(dx)) / torch.pow(rr_t, L.to(torch.float32))).to(torch.float32)
+        dy_L = (torch.tensor(float(dy)) / torch.pow(rr_t, L.to(torch.float32))).to(torch.float32)
 
         c = centers.to(torch.float32)
-        x = c[:, 0:1]
-        y = c[:, 1:2]
+        x0 = c[:, 0]
+        y0 = c[:, 1]
 
-        # 4 children per parent
-        c00 = torch.cat([x - ox, y - oy], dim=1)
-        c01 = torch.cat([x - ox, y + oy], dim=1)
-        c10 = torch.cat([x + ox, y - oy], dim=1)
-        c11 = torch.cat([x + ox, y + oy], dim=1)
+        frac = ((torch.arange(rr, dtype=torch.float32, device=c.device) + 0.5) / float(rr)) - 0.5
+        gx, gy = torch.meshgrid(frac, frac, indexing="xy")
 
-        child_centers = torch.cat([c00, c01, c10, c11], dim=0)
-        child_levels  = torch.cat([L + 1, L + 1, L + 1, L + 1], dim=0)
-        child_parents = torch.cat([parents, parents, parents, parents], dim=0)
+        child = torch.empty((c.shape[0], rr, rr, 2), dtype=torch.float32, device=c.device)
+        child[..., 0] = x0.view(-1, 1, 1) + dx_L.view(-1, 1, 1) * gx.view(1, rr, rr)
+        child[..., 1] = y0.view(-1, 1, 1) + dy_L.view(-1, 1, 1) * gy.view(1, rr, rr)
+
+        child_centers = child.reshape(-1, 2)
+        child_count = rr * rr
+        child_levels = (L + 1).repeat_interleave(child_count)
+        child_parents = parents.repeat_interleave(child_count)
 
         return child_centers, child_levels, child_parents
 
@@ -2072,7 +2136,7 @@ def precompute_pred_mesh_and_interps_for_rollout(
             if policy == "level0_only":
                 # base_is_level0 must track new children of originally level0 cells
                 base_keep = base_is_level0[keep]
-                base_child = torch.ones((c_child.shape[0],), dtype=torch.bool)
+                base_child = torch.ones((c_child.shape[0],), dtype=torch.bool, device=base_keep.device)
                 base_is_level0 = torch.cat([base_keep, base_child], dim=0)
 
         return centers, levels, parents
@@ -2081,17 +2145,18 @@ def precompute_pred_mesh_and_interps_for_rollout(
         """
         Build face-adjacency edges by rasterizing the AMR partition onto the max-level grid.
 
-        Works well for dyadic-aligned AMR meshes (your wedge mesh is dyadic with max_level <= 3).
+        Works for axis-aligned AMR meshes with integer refine_ratio.
         """
         xmin, xmax, ymin, ymax = map(float, cfg["data"]["bbox"])
+        rr = int(refine_ratio)
 
         levels_i64 = levels.to(torch.int64)
         Lmax = int(levels_i64.max().item()) if levels_i64.numel() > 0 else 0
         if Lmax > 6:
             raise RuntimeError(f"Lmax={Lmax} is too large for max-grid raster adjacency (guard).")
 
-        Hmax = int(H) * (2 ** Lmax)
-        Wmax = int(W) * (2 ** Lmax)
+        Hmax = int(H) * (rr ** Lmax)
+        Wmax = int(W) * (rr ** Lmax)
 
         # occupancy grid of cell IDs at max resolution
         occ = np.full((Hmax, Wmax), fill_value=-1, dtype=np.int32)
@@ -2101,17 +2166,17 @@ def precompute_pred_mesh_and_interps_for_rollout(
 
         for cid in range(c.shape[0]):
             L = int(l[cid])
-            scale = 2 ** (Lmax - L)
+            scale = rr ** (Lmax - L)
 
-            dxL = float(dx) / (2 ** L)
-            dyL = float(dy) / (2 ** L)
+            dxL = float(dx) / (float(rr) ** L)
+            dyL = float(dy) / (float(rr) ** L)
 
             # integer indices at level L grid
             ixL = int(np.floor((c[cid, 0] - xmin) / dxL))
             iyL = int(np.floor((c[cid, 1] - ymin) / dyL))
 
-            ixL = max(0, min(ixL, (W * (2 ** L)) - 1))
-            iyL = max(0, min(iyL, (H * (2 ** L)) - 1))
+            ixL = max(0, min(ixL, (W * (rr ** L)) - 1))
+            iyL = max(0, min(iyL, (H * (rr ** L)) - 1))
 
             ix0 = ixL * scale
             iy0 = iyL * scale
@@ -2317,6 +2382,7 @@ def precompute_pred_mesh_and_interps_for_rollout(
         meta.attrs["dx"] = float(dx)
         meta.attrs["dy"] = float(dy)
         meta.attrs["bbox"] = np.asarray(cfg["data"]["bbox"], dtype=np.float64)
+        meta.attrs["refine_ratio"] = int(refine_ratio)
         meta.attrs["T"] = int(T)
         meta.attrs["cfg_sha1"] = _cfg_sha1(cfg)
         meta.attrs["geometry_mode"] = str(geometry_mode)
@@ -2351,7 +2417,9 @@ def precompute_pred_mesh_and_interps_for_rollout(
             feat_t = feat_t.to(dev, dtype=torch.float32)
 
             if level_t is not None and ij_t is not None:
-                parents_t = _parents_from_level_ij(level_t.to(dev), ij_t.to(dev), H, W)
+                parents_t = _parents_from_level_ij(
+                    level_t.to(dev), ij_t.to(dev), H, W, refine_ratio=refine_ratio
+                )
             elif "parents" in s:
                 parents_t = s["parents"].to(dev)
             else:
@@ -2376,7 +2444,9 @@ def precompute_pred_mesh_and_interps_for_rollout(
             feat_tp1 = feat_tp1.to(dev, dtype=torch.float32)
 
             if level_tp1 is not None and ij_tp1 is not None:
-                parents_tp1 = _parents_from_level_ij(level_tp1.to(dev), ij_tp1.to(dev), H, W)
+                parents_tp1 = _parents_from_level_ij(
+                    level_tp1.to(dev), ij_tp1.to(dev), H, W, refine_ratio=refine_ratio
+                )
             elif "parents" in s_next:
                 parents_tp1 = s_next["parents"].to(dev)
             else:
@@ -2482,12 +2552,15 @@ def precompute_pred_mesh_and_interps_for_rollout(
             ei_cpu = pred_e_dev.to("cpu", dtype=torch.int64)
 
             # dx,dy in your meta are level-0 cell sizes (you already store them in /meta attrs)
-            w_cpu, h_cpu, area_cpu, *_ = amr_cell_wh_area_from_levels(l_cpu, dx0=float(dx), dy0=float(dy))
+            w_cpu, h_cpu, area_cpu, *_ = amr_cell_wh_area_from_levels(
+                l_cpu, dx0=float(dx), dy0=float(dy), refine_ratio=refine_ratio
+            )
             cell_wh = torch.stack([w_cpu, h_cpu], dim=1)  # (N,2)
 
             edge_attr = dec_edge_attr_for_dyadic_quads(
                 c_cpu, l_cpu, ei_cpu,
                 dx0=float(dx), dy0=float(dy),
+                refine_ratio=refine_ratio,
             )
 
             _write_ds(g, "pred_cell_area", _to_np(area_cpu, dtype=np.float32))
@@ -2508,9 +2581,23 @@ def precompute_pred_mesh_and_interps_for_rollout(
             if dev.type == "mps":
                 torch.mps.empty_cache()
 
-        # ---------- SECOND PASS: pred→pred IDW maps ----------
+        # ---------- SECOND PASS: pred->pred IDW maps ----------
         knn_k = int(cfg["loss"].get("interp_k", 8))
         chunk = int(cfg.get("speed", {}).get("interp_chunk", 8192))
+        total_maps = max(0, int(T - 2))
+        print(f"[PRECOMP] SECOND PASS: building pred->pred maps ({total_maps} transitions)...")
+
+        def _second_pass_iter():
+            it2 = range(1, T - 1)
+            used_tqdm = False
+            if progress:
+                try:
+                    from tqdm import tqdm
+                    it2 = tqdm(it2, desc="[rollout precompute] pred->pred maps")
+                    used_tqdm = True
+                except Exception:
+                    pass
+            return it2, used_tqdm
 
         if static_pred is not None:
             # geometry is constant => identity maps for every t
@@ -2523,11 +2610,16 @@ def precompute_pred_mesh_and_interps_for_rollout(
 
             idx_map, w_map = _identity_pred2pred_map(N_dst=N_dst, k=knn_k, device=torch.device("cpu"))
 
-            for t in range(1, T - 1):
+            it2, used_tqdm = _second_pass_iter()
+            for i, t in enumerate(it2, start=1):
                 g = _ensure_group(f, t)
                 _write_ds(g, "pred2pred_idx_to_next", _to_np(idx_map.to(torch.int32), dtype=np.int32))
                 _write_ds(g, "pred2pred_w_to_next",   _to_np(w_map.to(torch.float16), dtype=np.float16))
                 f.flush()
+                if progress and (not used_tqdm) and total_maps > 0:
+                    stride = max(1, total_maps // 20)
+                    if (i % stride == 0) or (i == total_maps):
+                        print(f"[rollout precompute] pred->pred maps {i}/{total_maps}")
 
             del idx_map, w_map
 
@@ -2535,7 +2627,8 @@ def precompute_pred_mesh_and_interps_for_rollout(
             # existing behavior: build pred(t) -> pred(t+1) maps from centers
             knn_device = torch.device("cpu")
 
-            for t in range(1, T - 1):
+            it2, used_tqdm = _second_pass_iter()
+            for i, t in enumerate(it2, start=1):
                 if f"t{t:05d}" not in f or f"t{t+1:05d}" not in f:
                     continue
 
@@ -2553,6 +2646,10 @@ def precompute_pred_mesh_and_interps_for_rollout(
                 _write_ds(g, "pred2pred_idx_to_next", _to_np(idx_map.to(torch.int32), dtype=np.int32))
                 _write_ds(g, "pred2pred_w_to_next",   _to_np(w_map.to(torch.float16), dtype=np.float16))
                 f.flush()
+                if progress and (not used_tqdm) and total_maps > 0:
+                    stride = max(1, total_maps // 20)
+                    if (i % stride == 0) or (i == total_maps):
+                        print(f"[rollout precompute] pred->pred maps {i}/{total_maps}")
 
                 del src_c, dst_c, idx_map, w_map
 

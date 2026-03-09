@@ -1,6 +1,15 @@
 import torch
 import torch.nn.functional as F
 
+def _get_refine_ratio(cfg: dict) -> int:
+    pol = cfg.get("policy", {}) or {}
+    mesh = cfg.get("mesh", {}) or {}
+    rr = pol.get("refine_ratio", mesh.get("refine_ratio", 2))
+    rr = int(rr)
+    if rr < 2:
+        raise ValueError(f"refine_ratio must be >=2, got {rr}")
+    return rr
+
 def _get_feature_name_list(cfg: dict) -> list[str] | None:
     feats = cfg.get("features", {}) or {}
     for k in ("dataset_order", "names", "use_columns"):
@@ -418,6 +427,7 @@ def dec_advdiff_terms_abs(
     N, Fdim = x_abs.shape
 
     loss = cfg.get("loss", {}) or {}
+    rr = _get_refine_ratio(cfg)
     idx = infer_feature_indices(cfg, Fdim)
 
     # --- helpers ---
@@ -444,7 +454,9 @@ def dec_advdiff_terms_abs(
         return out if len(out) > 0 else list(default)
 
     # --- geometry / weights ---
-    area = cell_area_from_levels(levels, dx0=dx0, dy0=dy0, dtype=x_abs.dtype, device=x_abs.device)  # [N]
+    area = cell_area_from_levels(
+        levels, dx0=dx0, dy0=dy0, dtype=x_abs.dtype, device=x_abs.device, refine_ratio=rr
+    )  # [N]
 
     # --- edge geometry ---
     # pred_ea layout: [nx, ny, face_len, dual_len, tau]
@@ -828,15 +840,27 @@ def edge_attr_unpack(pred_ea: torch.Tensor):
     tau = pred_ea[:, 4]  # face_len/dual_len
     return nx, ny, face_len, dual_len, tau
 
-def cell_area_from_levels(levels: torch.Tensor, *, dx0: float, dy0: float, dtype, device):
+def cell_area_from_levels(
+    levels: torch.Tensor,
+    *,
+    dx0: float,
+    dy0: float,
+    dtype,
+    device,
+    refine_ratio: int = 2,
+):
     """
-    axis-aligned dyadic quads: A = (dx0*dy0) / (4^L)
+    axis-aligned AMR quads: A = (dx0*dy0) / ((refine_ratio^2)^L)
     """
+    rr = int(refine_ratio)
+    if rr < 2:
+        raise ValueError(f"refine_ratio must be >=2, got {refine_ratio}")
+
     base_area = torch.tensor(float(dx0) * float(dy0), device=device, dtype=dtype)
     L = levels.to(device=device)
     if L.dtype not in (torch.int32, torch.int64):
         L = L.long()
-    denom = torch.pow(torch.tensor(4.0, device=device, dtype=dtype), L.to(dtype=dtype))
+    denom = torch.pow(torch.tensor(float(rr * rr), device=device, dtype=dtype), L.to(dtype=dtype))
     return base_area / denom
 
 def dec_laplacian(phi: torch.Tensor, edge_index: torch.Tensor, tau: torch.Tensor, area: torch.Tensor):
@@ -997,10 +1021,13 @@ def dec_advdiff_rate(
     scheme = str(cfg["loss"].get("advection_scheme", "upwind")).lower()
     rho_eps = float(cfg["loss"].get("rho_eps", 1e-8))
     nu = as_nu_tensor(cfg["loss"].get("nu", 0.0), x_abs.size(1), device=x_abs.device, dtype=x_abs.dtype)
+    rr = _get_refine_ratio(cfg)
 
     nx, ny, face_len, dual_len, tau = edge_attr_unpack(pred_ea)
 
-    area = cell_area_from_levels(levels, dx0=dx0, dy0=dy0, dtype=x_abs.dtype, device=x_abs.device)  # [N]
+    area = cell_area_from_levels(
+        levels, dx0=dx0, dy0=dy0, dtype=x_abs.dtype, device=x_abs.device, refine_ratio=rr
+    )  # [N]
     vel = compute_velocity_from_state(x_abs, cfg, eps=rho_eps)  # [N,2]
 
     # div(u*phi)

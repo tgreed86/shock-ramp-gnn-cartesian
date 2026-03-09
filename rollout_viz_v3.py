@@ -75,6 +75,7 @@ from train import (
 )
 from models import ParcFeatureAdapter
 from utils_geom import build_idw_map, apply_idw_map
+from utils.degree_error_diag import make_degree_error_bar_plots
 import utils.dec_ops as dec
 
 
@@ -120,6 +121,15 @@ def _load_pt_series(pt_path: str):
     else:
         data_list = torch.load(pt_path, map_location="cpu")
     return data_list
+
+def _get_refine_ratio(cfg: dict) -> int:
+    pol = cfg.get("policy", {}) or {}
+    mesh = cfg.get("mesh", {}) or {}
+    rr = pol.get("refine_ratio", mesh.get("refine_ratio", 2))
+    rr = int(rr)
+    if rr < 2:
+        raise ValueError(f"refine_ratio must be >=2, got {rr}")
+    return rr
 
 def _extract_time(step_obj) -> Optional[float]:
     """Try to pull a float time from a PyG Data-like object or dict."""
@@ -187,6 +197,42 @@ def _maybe_empty_device_cache(device: torch.device):
             pass
 
 
+def _parse_degree_diag_steps(raw: Optional[str], n_steps: int) -> Optional[list[int]]:
+    """
+    Parse comma-separated rollout-step selectors into sorted unique 0-based indices.
+    Supported tokens: integers and 'last'.
+    Returns None when raw is None (feature disabled).
+    """
+    if raw is None:
+        return None
+    txt = str(raw).strip()
+    if txt == "":
+        return []
+    if n_steps <= 0:
+        return []
+
+    out: set[int] = set()
+    for tok in txt.split(","):
+        t = tok.strip()
+        if not t:
+            continue
+        if t.lower() == "last":
+            idx = n_steps - 1
+        else:
+            try:
+                idx = int(t)
+            except ValueError as e:
+                raise ValueError(
+                    f"Invalid --degree-diag-steps token '{t}'. Use comma-separated 0-based integers and/or 'last'."
+                ) from e
+        if idx < 0 or idx >= n_steps:
+            raise ValueError(
+                f"--degree-diag-steps index {idx} is out of range for rollout length {n_steps}."
+            )
+        out.add(int(idx))
+    return sorted(out)
+
+
 # ----------------- Percentile helpers (optional sampling) ----------------- #
 
 def _as_1d(a: np.ndarray) -> np.ndarray:
@@ -221,6 +267,7 @@ def _mesh_segments_from_centers_levels(
     levels: np.ndarray,   # (N,)
     dx0: float,
     dy0: float,
+    refine_ratio: int = 2,
 ) -> np.ndarray:
     """Build axis-aligned quad edge segments implied by AMR (center, level)."""
     c = np.asarray(centers, dtype=np.float32)
@@ -228,7 +275,11 @@ def _mesh_segments_from_centers_levels(
     if c.size == 0:
         return np.empty((0, 2, 2), dtype=np.float32)
 
-    scale = np.power(2.0, L.astype(np.float32))
+    rr = int(refine_ratio)
+    if rr < 2:
+        raise ValueError(f"refine_ratio must be >=2, got {refine_ratio}")
+
+    scale = np.power(float(rr), L.astype(np.float32))
     hx = (dx0 / scale) * 0.5
     hy = (dy0 / scale) * 0.5
 
@@ -332,10 +383,13 @@ def _render_mesh_frame(
     fig_w: float,
     fig_h: float,
     dpi: int,
+    refine_ratio: int = 2,
 ) -> np.ndarray:
     """Render one mesh-only frame in the same visual style as utils/mesh_gif.py."""
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=int(dpi))
-    segs = _mesh_segments_from_centers_levels(centers, levels, dx0=dx0, dy0=dy0)
+    segs = _mesh_segments_from_centers_levels(
+        centers, levels, dx0=dx0, dy0=dy0, refine_ratio=refine_ratio
+    )
 
     if color_by_level:
         L = np.asarray(levels, dtype=np.int64)
@@ -382,6 +436,7 @@ def make_rollout_mesh_gif(
     seed: int = 0,
     color_by_level: bool = False,
     progress_every: int = 1,
+    refine_ratio: int = 2,
 ):
     """Write a mesh-only rollout GIF using per-step predicted mesh geometry."""
     if not examples:
@@ -452,6 +507,7 @@ def make_rollout_mesh_gif(
                 fig_w=float(fig_w),
                 fig_h=float(fig_h),
                 dpi=int(dpi),
+                refine_ratio=int(refine_ratio),
             )
             writer.append_data(frame)
             frames_written += 1
@@ -1037,6 +1093,7 @@ def make_rollout_gifs_raster(
 
     # Ensure chronological
     examples = sorted(examples, key=lambda e: int(e.get("t", 0)))
+    refine_ratio = _get_refine_ratio(cfg)
 
     # Feature dimension
     F = int(examples[0]["gt_t"].shape[1])
@@ -1084,7 +1141,8 @@ def make_rollout_gifs_raster(
         Lmax: int,
     ):
         """
-        AMR block replication onto a common fine grid sized (H*2^Lmax, W*2^Lmax).
+        AMR block replication onto a common fine grid sized
+        (H*refine_ratio^Lmax, W*refine_ratio^Lmax).
         Fine levels overwrite coarse levels naturally by iterating l=0..Lmax.
         """
         device_cpu = torch.device("cpu")
@@ -1101,7 +1159,7 @@ def make_rollout_gifs_raster(
         dx = (xmax - xmin) / float(W)
         dy = (ymax - ymin) / float(H)
 
-        scale = 1 << int(Lmax)
+        scale = int(refine_ratio) ** int(Lmax)
         HH, WW = int(H * scale), int(W * scale)
 
         img = torch.full((HH * WW, C), torch.nan, dtype=torch.float32, device=device_cpu)
@@ -1116,7 +1174,7 @@ def make_rollout_gifs_raster(
             m = (levels == l)
             if not torch.any(m):
                 continue
-            b = 1 << (Lmax - l)  # block size in fine pixels
+            b = int(refine_ratio) ** int(Lmax - l)  # block size in fine pixels
             r0 = (row_fine[m] // b) * b
             c0 = (col_fine[m] // b) * b
 
@@ -1753,6 +1811,12 @@ def main():
     ap.add_argument("--raster-bins", type=int, default=256, help="IDW grid bins (only for raster-mode=idw).")
     ap.add_argument("--raster-k", type=int, default=8, help="IDW kNN k (only for raster-mode=idw).")
     ap.add_argument("--raster-chunk", type=int, default=32768, help="IDW chunk (only for raster-mode=idw).")
+    ap.add_argument(
+        "--degree-diag-steps",
+        type=str,
+        default=None,
+        help="Comma-separated rollout-step indices (0-based) and/or 'last' for node-degree error bar plots. If omitted, disabled.",
+    )
 
     ap.add_argument("--debug-fast-checks", action="store_true",
                     help="Run fast drift diagnostics (prints k-growth, k=1 mesh-mapped errors, Δ magnitude, mapping sanity).")
@@ -1986,6 +2050,8 @@ def main():
         mu = sigma = None
         log("[WARN] No normalization stats in checkpoint; proceeding without normalization.")
 
+    degree_diag_requested = (args.degree_diag_steps is not None) and (str(args.degree_diag_steps).strip() != "")
+
     # ----- Evaluate only this rollout window -----
     log(f"[INFO] Running multi-step evaluation for ONE window at start_t={start_t} (horizon={horizon})...")
     with Timer("evaluate_one_epoch_multi_step"):
@@ -1999,6 +2065,7 @@ def main():
             mu=mu,
             sigma=sigma,
             collect_examples=True,
+            collect_example_edges=bool(degree_diag_requested),
             budget_csv_path=budget_csv_path, 
             write_budgets=True,
         )
@@ -2019,6 +2086,7 @@ def main():
             ex["bbox"] = (float(xmin), float(xmax), float(ymin), float(ymax))
 
     feat_names = cfg.get("features", {}).get("names", None)
+    degree_diag_steps = _parse_degree_diag_steps(args.degree_diag_steps, len(examples))
 
     if args.debug_fast_checks:
         bbox = examples[0]["bbox"] if len(examples) else tuple(_get_bbox(cfg))
@@ -2073,6 +2141,7 @@ def main():
                 seed=int(args.mesh_seed),
                 color_by_level=bool(args.mesh_color_by_level),
                 progress_every=int(args.progress_every),
+                refine_ratio=int(_get_refine_ratio(cfg)),
             )
 
     log(f"[INFO] Done. GIFs are in: {out_dir}")
@@ -2087,6 +2156,27 @@ def main():
         dpi=150,
         show=False,
     )
+
+    if degree_diag_steps is not None:
+        if len(degree_diag_steps) == 0:
+            log("[WARN] --degree-diag-steps was provided but no valid step tokens were parsed; skipping degree diagnostics.")
+        else:
+            diag_out_dir = out_dir
+            log(f"[INFO] Making node-degree error bar plots for rollout steps: {degree_diag_steps}")
+            with Timer("make_degree_error_bar_plots"):
+                outputs = make_degree_error_bar_plots(
+                    examples=examples,
+                    step_indices=degree_diag_steps,
+                    out_dir=diag_out_dir,
+                    knn_k=int(args.raster_k),
+                    chunk=int(args.raster_chunk),
+                    dpi=max(120, int(args.dpi)),
+                    log_fn=log,
+                )
+            if outputs:
+                log(f"[INFO] Degree diagnostics saved to: {diag_out_dir}")
+            else:
+                log("[WARN] Degree diagnostics requested, but no plots were produced.")
     
 
 if __name__ == "__main__":

@@ -1046,9 +1046,11 @@ def amr_composite_to_finest_grid(
     values:  torch.Tensor,  # (N,F)
     H: int, W: int,
     bbox=(0.0,1.0,0.0,1.0),
+    refine_ratio: int = 2,
 ):
     """
-    Composite an AMR field onto the *finest* implied grid (H*2^Lmax, W*2^Lmax),
+    Composite an AMR field onto the *finest* implied grid
+    (H*refine_ratio^Lmax, W*refine_ratio^Lmax),
     with 'fine overwriting coarse'.
 
     Returns:
@@ -1056,6 +1058,10 @@ def amr_composite_to_finest_grid(
       valid_flat: (HH*WW,)     bool mask: True where at least one AMR cell wrote
       HH, WW
     """
+    rr = int(refine_ratio)
+    if rr < 2:
+        raise ValueError(f"refine_ratio must be >=2, got {refine_ratio}")
+
     if isinstance(centers, np.ndarray): centers = torch.from_numpy(centers)
     if isinstance(levels,  np.ndarray): levels  = torch.from_numpy(levels)
     if isinstance(values,  np.ndarray): values  = torch.from_numpy(values)
@@ -1069,7 +1075,7 @@ def amr_composite_to_finest_grid(
     dy = (ymax - ymin) / float(H)
 
     Lmax = int(levels.max().item()) if levels.numel() > 0 else 0
-    scale = 1 << Lmax
+    scale = rr ** Lmax
     HH, WW = H * scale, W * scale
     N = centers.size(0)
     F = vals.size(1)
@@ -1092,7 +1098,7 @@ def amr_composite_to_finest_grid(
 
     for i in range(N):
         l = int(levO[i])
-        block = 1 << (Lmax - l)
+        block = rr ** (Lmax - l)
         r = int(rowf[i])
         c = int(colf[i])
         r0 = (r // block) * block
@@ -1741,4 +1747,3 @@ def _recover_parent_mask(ex: dict, H: int, W: int) -> torch.Tensor:
     if torch.is_tensor(mp):
         return mp.to(torch.bool).view(H, W)
     return torch.ones((H, W), dtype=torch.bool)
-

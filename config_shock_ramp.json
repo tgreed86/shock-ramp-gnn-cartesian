@@ -24,8 +24,8 @@
 
   "train": {
     "precomp_cache_path": "./cache/all/shock_ramp_precomp_pLow85_pHigh95_faceAdj_DEC.h5",
-    "precomp_force_recompute": false,
-    "epochs": 20,
+    "precomp_force_recompute": true,
+    "epochs": 10,
     "validation_every_epochs": 1,
     "batch_size": 1,
     "lr": 0.0001,
@@ -44,20 +44,29 @@
     "multi_step_K": 2,
     "uniform_H": 256,
     "uniform_W": 256,
-    "time_integrator": "rk4",
+    "time_integrator": "euler",
     "rk4_start_epoch": 10,
     "rk4_ramp_epochs": 5,
     "teacher_forcing_uniform": false,
     "uniform_diag_edges": false,
     "validation_every_epochs": 5,
     "runtime_mesh": {
-      "enabled": false,
-      "warm_start_from_precompute": true,
+      "enabled": true,
+      "warm_start_from_precompute": false,
       "update_every_steps": 1,
       "detach_policy_input": true,
       "reset_to_coarse_each_step": true,
       "refine_only": true,
-      "max_cells_per_step": 400000,
+      "max_cells_per_step": 500000,
+      "policy_backend": "cnn",
+      "cnn": {
+        "checkpoint_path": "./runs_mesh_policy_cnn/without_parent_masks/unet_hierarchical/500ep_lr-scheduler_3-6-26/mesh_policy_cnn_last.pt",
+        "include_parent_mask": false,
+        "include_coords": true,
+        "threshold_default": 0.5,
+        "threshold_by_level": {},
+        "device": "same"
+      },
       "step_log": {
         "enabled": true,
         "path": "./runs_mesh_first/runtime_step_log.csv",
@@ -88,16 +97,19 @@
     "geometry_mode": "gt_gradients",
     "_comment_geometry_mode": "gt_gradients or starting_refine for uniform mesh",
     "starting_refine_to_level": 0,
+    "refine_ratio": 2,
     "hysteresis_mode": "percentile",
     "percentile_low":  85.0,
     "percentile_high": 95.0,
     "percentiles_by_level": {
-    "1": {"low": 100.0, "high": 100.0},
-    "2": {"low": 100.0, "high": 100.0},
-    "3": {"low": 100.0, "high": 100.0}
+      "selection": "global",
+      "_comment_selection": "global or per_level (or auto)",
+      "1": {"low": 100.0, "high": 100.0},
+      "2": {"low": 100.0, "high": 100.0},
+      "3": {"low": 100.0, "high": 100.0}
     },
     "combine": "l2",
-    "grad_channels": [3],
+    "grad_channels": [0],
     "grad_norm": "l2",
     "max_level": 3,
     "tau_low":  1.0,
@@ -160,13 +172,13 @@
     "parc_gate_init": -3.0,
     "parc_gate_per_channel": false,
 
-    "ops_term_clip": 1e6,
-    "state_rho_max": 1e6,
-    "state_E_max": 1e8,
-    "state_m_max": 1e9,
-    "ops_rho_max": 1e6,
-    "ops_E_max": 1e8,
-    "ops_m_max": 1e9
+    "ops_term_clip": 0.0,
+    "state_rho_max": 0.0,
+    "state_E_max": 0.0,
+    "state_m_max": 0.0,
+    "ops_rho_max": 0.0,
+    "ops_E_max": 0.0,
+    "ops_m_max": 0.0
   },
 
   "eval": {
@@ -190,7 +202,7 @@
   },
 
   "debug": {
-    "plot_gradients": true,
+    "plot_gradients": false,
     "profile": false,
     "plot_precomp_max_cells":  "250_000",
     "plot_precomp_linewidth": 0.05,
@@ -211,7 +223,9 @@
     "fast_next_diag": false,
     "parc_scale_watch": false,
     "print_norm_sanity_once": false,
-    "teacher_force_ops": false
+    "teacher_force_ops": false,
+    "hang_watch_batches": 1000,
+    "print_batch_time": true
   },
 
   "speed": {

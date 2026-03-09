@@ -55,6 +55,16 @@ import utils.mls as mls
 
 
 debug_once = False
+
+def _get_refine_ratio(cfg: dict) -> int:
+    pol = cfg.get("policy", {}) or {}
+    mesh = cfg.get("mesh", {}) or {}
+    rr = pol.get("refine_ratio", mesh.get("refine_ratio", 2))
+    rr = int(rr)
+    if rr < 2:
+        raise ValueError(f"refine_ratio must be >=2, got {rr}")
+    return rr
+
 @torch.no_grad()
 def _compute_norm_stats_from_loader(loader, device):
     n_total = 0
@@ -278,6 +288,7 @@ def mls_advdiff_terms_abs_faceadj(
         dy0=float(dy0),
         dtype=torch.float32,
         device=x_abs.device,
+        refine_ratio=_get_refine_ratio(cfg),
     )
 
     # move outputs back to training device
@@ -393,6 +404,7 @@ def stepA_check_ops_vs_gt_delta(
             dy0=float(dy),
             dtype=torch.float32,
             device=device,
+            refine_ratio=_get_refine_ratio(cfg),
         ).view(-1)
     else:
         area = torch.ones((N,), device=device, dtype=torch.float32)
@@ -525,6 +537,7 @@ def stepA_check_given_state_vs_gt(
         dy0=float(dy),
         dtype=torch.float32,
         device=device,
+        refine_ratio=_get_refine_ratio(cfg),
     ).view(-1)
 
     # sanitize state for ops (same limiter style as before)
@@ -1027,8 +1040,14 @@ def _compute_budget_row(*, x_abs: torch.Tensor, levels: torch.Tensor, dx0: float
     x = x_abs.detach().to(device="cpu", dtype=torch.float32)
     lev = levels.detach().to(device="cpu", dtype=torch.int64).view(-1)
 
-    w = dec.cell_area_from_levels(lev, dx0=float(dx0), dy0=float(dy0),
-                                  dtype=torch.float32, device=torch.device("cpu"))  # (N,)
+    w = dec.cell_area_from_levels(
+        lev,
+        dx0=float(dx0),
+        dy0=float(dy0),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        refine_ratio=_get_refine_ratio(cfg),
+    )  # (N,)
 
     idx = _budget_feature_indices(cfg, int(x.shape[1]))
     rho = x[:, idx["rho"]]
@@ -1293,7 +1312,24 @@ def _forward_main_head_with_edge_attr(model, x_in, edge_index, edge_attr=None, *
     """
     if edge_attr is not None and not hasattr(_forward_main_head_with_edge_attr, "_printed"):
         _forward_main_head_with_edge_attr._printed = True
-        print("[DEC-CHK] Forward called with edge_attr present.")
+        print("[DEC-CHK] Forward called with edge_attr present.", flush=True)
+
+    hang_dbg_once = not hasattr(_forward_main_head_with_edge_attr, "_hang_dbg_once")
+    if hang_dbg_once:
+        try:
+            ei_shape = tuple(edge_index.shape) if torch.is_tensor(edge_index) else None
+        except Exception:
+            ei_shape = None
+        try:
+            ea_shape = tuple(edge_attr.shape) if torch.is_tensor(edge_attr) else None
+        except Exception:
+            ea_shape = None
+        print(
+            f"[HANG-DBG] entering _forward_main_head_with_edge_attr: "
+            f"x_in={tuple(x_in.shape)} dtype={x_in.dtype} dev={x_in.device} "
+            f"edge_index={ei_shape} edge_attr={ea_shape} force_fp32={bool(force_fp32)}",
+            flush=True,
+        )
 
     # --- choose autocast-off context safely ---
     if force_fp32:
@@ -1311,6 +1347,10 @@ def _forward_main_head_with_edge_attr(model, x_in, edge_index, edge_attr=None, *
         X = x_in.float() if force_fp32 else x_in
         EA = (edge_attr.float() if (force_fp32 and edge_attr is not None) else edge_attr)
 
+        t_fwd0 = time.perf_counter() if hang_dbg_once else None
+        if hang_dbg_once:
+            print("[HANG-DBG] calling model forward...", flush=True)
+
         if EA is None:
             y = _forward_main_head(model, X, edge_index)
         else:
@@ -1319,7 +1359,14 @@ def _forward_main_head_with_edge_attr(model, x_in, edge_index, edge_attr=None, *
                 y = _forward_main_head(model, X, edge_index, edge_attr=EA)
             except TypeError:
                 # model doesn’t accept edge_attr yet
+                if hang_dbg_once:
+                    print("[HANG-DBG] model forward rejected edge_attr; retrying without edge_attr.", flush=True)
                 y = _forward_main_head(model, X, edge_index)
+
+        if hang_dbg_once:
+            dt_fwd = time.perf_counter() - t_fwd0
+            print(f"[HANG-DBG] model forward returned in {dt_fwd:.3f}s", flush=True)
+            _forward_main_head_with_edge_attr._hang_dbg_once = True
 
     # If you want to keep downstream memory low / match dtype expectations, cast back.
     # (Optionally clamp before casting if you ever see fp16 overflow.)
@@ -1642,6 +1689,233 @@ def _map_gt_to_pred_mesh_once(
     return mapped.to(out_dev)
 
 
+def _runtime_mesh_backend(cfg: Dict[str, Any]) -> str:
+    rt_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
+    raw = str(rt_cfg.get("policy_backend", "gradient")).strip().lower()
+    if raw in ("gt_gradients", "gradients", "gradient_policy"):
+        raw = "gradient"
+    if raw in ("cnn_policy",):
+        raw = "cnn"
+    if raw not in ("gradient", "cnn"):
+        raise ValueError(
+            f"train.runtime_mesh.policy_backend must be 'gradient' or 'cnn', got '{raw}'"
+        )
+    return raw
+
+
+def _runtime_mesh_cnn_thresholds(cfg: Dict[str, Any]) -> tuple[float, Dict[int, float]]:
+    rt_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
+    cnn_cfg = rt_cfg.get("cnn", {}) or {}
+    thr_default = float(cnn_cfg.get("threshold_default", 0.5))
+    raw_map = cnn_cfg.get("threshold_by_level", {}) or {}
+    if not isinstance(raw_map, dict):
+        raise ValueError("train.runtime_mesh.cnn.threshold_by_level must be a JSON object.")
+    thr_by_level: Dict[int, float] = {}
+    for k, v in raw_map.items():
+        try:
+            L = int(k)
+        except Exception as e:
+            raise ValueError(
+                f"Invalid level key in train.runtime_mesh.cnn.threshold_by_level: {k!r}"
+            ) from e
+        thr_by_level[L] = float(v)
+    return thr_default, thr_by_level
+
+
+def _load_runtime_mesh_policy_from_cfg(
+    cfg: Dict[str, Any],
+    *,
+    device: torch.device,
+    H: int,
+    W: int,
+):
+    backend = _runtime_mesh_backend(cfg)
+    if backend != "cnn":
+        return None
+
+    rt_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
+    cnn_cfg = rt_cfg.get("cnn", {}) or {}
+
+    ckpt_raw = cnn_cfg.get("checkpoint_path", None)
+    if not ckpt_raw:
+        raise RuntimeError(
+            "Runtime mesh backend is 'cnn' but train.runtime_mesh.cnn.checkpoint_path is empty."
+        )
+    ckpt_path = os.path.abspath(os.path.expanduser(str(ckpt_raw)))
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Runtime mesh CNN checkpoint not found: {ckpt_path}")
+
+    dev_spec = str(cnn_cfg.get("device", "same")).strip().lower()
+    if dev_spec in ("", "same", "auto", "none"):
+        policy_device = torch.device(device)
+    else:
+        policy_device = torch.device(dev_spec)
+
+    try:
+        from mesh_policy_cnn import MeshPolicyCNN
+    except Exception as e:
+        raise RuntimeError(
+            "Runtime mesh backend is 'cnn' but mesh_policy_cnn.py could not be imported."
+        ) from e
+
+    ckpt = torch.load(ckpt_path, map_location=policy_device)
+    model_args = ckpt.get("model_args", None) if isinstance(ckpt, dict) else None
+    if not isinstance(model_args, dict):
+        raise RuntimeError(
+            f"Checkpoint {ckpt_path} is missing 'model_args'; expected artifact from train_mesh_policy.py."
+        )
+
+    model = MeshPolicyCNN(
+        in_channels=int(model_args["in_channels"]),
+        base_channels=int(model_args.get("base_channels", 48)),
+        head_channels=int(model_args.get("head_channels", 8)),
+        max_level=int(model_args["max_level"]),
+        refine_ratio=int(model_args["refine_ratio"]),
+        model_type=str(model_args.get("model_type", "upsample_heads")),
+    ).to(policy_device)
+
+    state = ckpt.get("model_state", ckpt)
+    if not isinstance(state, dict):
+        raise RuntimeError(f"Checkpoint {ckpt_path} does not contain a valid model state dict.")
+    model.load_state_dict(state, strict=True)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    cfg_rr = _get_refine_ratio(cfg)
+    cfg_Lmax = int(cfg.get("policy", {}).get("max_level", cfg.get("data", {}).get("L_max", 3)))
+    ckpt_rr = int(model_args.get("refine_ratio", cfg_rr))
+    ckpt_Lmax = int(model_args.get("max_level", cfg_Lmax))
+    if ckpt_rr != cfg_rr:
+        raise RuntimeError(
+            f"Runtime mesh CNN refine_ratio mismatch: checkpoint={ckpt_rr}, cfg={cfg_rr}"
+        )
+    if ckpt_Lmax != cfg_Lmax:
+        raise RuntimeError(
+            f"Runtime mesh CNN max_level mismatch: checkpoint={ckpt_Lmax}, cfg={cfg_Lmax}"
+        )
+
+    include_parent_mask = bool(cnn_cfg.get("include_parent_mask", True))
+    include_coords = bool(cnn_cfg.get("include_coords", True))
+
+    coord_grid = None
+    if include_coords:
+        yy = torch.linspace(0.0, 1.0, H, device=policy_device, dtype=torch.float32)
+        xx = torch.linspace(0.0, 1.0, W, device=policy_device, dtype=torch.float32)
+        gy, gx = torch.meshgrid(yy, xx, indexing="ij")
+        coord_grid = torch.stack([gx, gy], dim=0).contiguous()
+
+    thr_default, thr_by_level = _runtime_mesh_cnn_thresholds(cfg)
+
+    ctx = {
+        "backend": "cnn",
+        "model": model,
+        "device": policy_device,
+        "in_channels": int(model_args["in_channels"]),
+        "model_type": str(model_args.get("model_type", "upsample_heads")),
+        "max_level": ckpt_Lmax,
+        "refine_ratio": ckpt_rr,
+        "include_parent_mask": include_parent_mask,
+        "include_coords": include_coords,
+        "coord_grid": coord_grid,
+        "threshold_default": float(thr_default),
+        "threshold_by_level": thr_by_level,
+        "checkpoint_path": ckpt_path,
+    }
+    print(
+        "[RUNTIME-MESH] loaded CNN policy:",
+        f"ckpt={ckpt_path}",
+        f"device={policy_device}",
+        f"in_channels={ctx['in_channels']}",
+        f"model_type={ctx['model_type']}",
+        f"max_level={ctx['max_level']}",
+        f"refine_ratio={ctx['refine_ratio']}",
+    )
+    return ctx
+
+
+@torch.no_grad()
+def _runtime_predict_masks_from_cnn(
+    *,
+    feat_policy: torch.Tensor,
+    parents_t: torch.Tensor,
+    mask_t_parent: torch.Tensor,
+    cfg: Dict[str, Any],
+    H: int,
+    W: int,
+    device: torch.device,
+    runtime_mesh_policy: Dict[str, Any],
+) -> Dict[int, torch.Tensor]:
+    if runtime_mesh_policy is None:
+        raise RuntimeError("runtime_mesh_policy is None for CNN runtime mesh backend.")
+    if runtime_mesh_policy.get("backend", None) != "cnn":
+        raise RuntimeError("runtime_mesh_policy backend is not 'cnn'.")
+
+    pdev = torch.device(runtime_mesh_policy["device"])
+    model = runtime_mesh_policy["model"]
+    rr = int(runtime_mesh_policy["refine_ratio"])
+    Lmax = int(runtime_mesh_policy["max_level"])
+    thr_default = float(runtime_mesh_policy["threshold_default"])
+    thr_by_level: Dict[int, float] = runtime_mesh_policy["threshold_by_level"]
+
+    coarse = coarse_aggregate_from_dynamic(feat_policy, parents_t, H, W)
+    coarse = coarse.view(H, W, -1).permute(2, 0, 1).contiguous()  # (F,H,W)
+
+    channels = [coarse]
+    if bool(runtime_mesh_policy.get("include_parent_mask", True)):
+        channels.append(mask_t_parent.to(coarse.device, dtype=torch.float32).unsqueeze(0))
+    if bool(runtime_mesh_policy.get("include_coords", True)):
+        coord_grid = runtime_mesh_policy.get("coord_grid", None)
+        if coord_grid is None:
+            raise RuntimeError("CNN runtime mesh policy expects coord channels, but coord_grid is missing.")
+        channels.append(coord_grid.to(coarse.device, dtype=torch.float32))
+
+    x_in = torch.cat(channels, dim=0).unsqueeze(0)  # (1,C,H,W)
+    expected_in = int(runtime_mesh_policy.get("in_channels", -1))
+    if expected_in > 0 and int(x_in.shape[1]) != expected_in:
+        raise RuntimeError(
+            f"CNN runtime mesh input channel mismatch: built={int(x_in.shape[1])}, expected={expected_in}. "
+            "Check runtime_mesh.cnn.include_parent_mask/include_coords and feature channel setup."
+        )
+
+    logits_raw = model(x_in.to(pdev, dtype=torch.float32, non_blocking=True))
+    if not isinstance(logits_raw, dict):
+        raise RuntimeError(f"CNN runtime mesh model forward must return dict[int,Tensor], got {type(logits_raw)}")
+
+    logits_by_level: Dict[int, torch.Tensor] = {}
+    for k, v in logits_raw.items():
+        logits_by_level[int(k)] = v
+
+    masks_by_level: Dict[int, torch.Tensor] = {}
+    for L in range(1, Lmax + 1):
+        if L not in logits_by_level:
+            raise RuntimeError(f"CNN runtime mesh missing logits for level L={L}")
+        logits_L = logits_by_level[L]
+        if logits_L.ndim != 4 or logits_L.shape[0] != 1 or logits_L.shape[1] != 1:
+            raise RuntimeError(
+                f"CNN runtime mesh logits for L={L} must be shape (1,1,H,W), got {tuple(logits_L.shape)}"
+            )
+        m = (torch.sigmoid(logits_L[:, 0]) >= float(thr_by_level.get(L, thr_default)))  # (1,h,w)
+        h, w = int(m.shape[-2]), int(m.shape[-1])
+        exp_h = H * (rr ** (L - 1))
+        exp_w = W * (rr ** (L - 1))
+        if (h, w) != (exp_h, exp_w):
+            raise RuntimeError(
+                f"CNN runtime mesh output shape mismatch at L={L}: got {(h, w)}, expected {(exp_h, exp_w)}"
+            )
+
+        if L > 1:
+            allow = F.interpolate(
+                masks_by_level[L - 1].float().unsqueeze(1),
+                scale_factor=float(rr),
+                mode="nearest",
+            )[:, 0].bool()
+            m = m & allow[:, :h, :w]
+        masks_by_level[L] = m
+
+    return {L: masks_by_level[L][0].to(device=device, dtype=torch.bool) for L in masks_by_level.keys()}
+
+
 @torch.no_grad()
 def _runtime_build_pred_mesh_from_state(
     *,
@@ -1657,12 +1931,14 @@ def _runtime_build_pred_mesh_from_state(
     device: torch.device,
     wedge_path,
     need_edge_attr: bool,
+    runtime_mesh_policy: Dict[str, Any] | None = None,
 ):
     """
     Build next-step predicted mesh from state gradients in runtime mode.
     Wedge clipping is mandatory for shock-ramp geometry.
     """
     dev = torch.device(device)
+    rr = _get_refine_ratio(cfg)
     rt_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
     reset_each = bool(rt_cfg.get("reset_to_coarse_each_step", True))
     detach_policy_input = bool(rt_cfg.get("detach_policy_input", True))
@@ -1688,16 +1964,28 @@ def _runtime_build_pred_mesh_from_state(
         "mask_t": mask_t_parent.view(-1),
         "level_t": level_t,
     }
-
-    masks_pred_by_level = predict_masks_hierarchical_from_gt_gradients(
-        batch_like,
-        cfg,
-        H,
-        W,
-        dx,
-        dy,
-        device=dev,
-    )
+    policy_backend = _runtime_mesh_backend(cfg)
+    if policy_backend == "cnn":
+        masks_pred_by_level = _runtime_predict_masks_from_cnn(
+            feat_policy=feat_policy,
+            parents_t=parents_t,
+            mask_t_parent=mask_t_parent,
+            cfg=cfg,
+            H=H,
+            W=W,
+            device=dev,
+            runtime_mesh_policy=runtime_mesh_policy,
+        )
+    else:
+        masks_pred_by_level = predict_masks_hierarchical_from_gt_gradients(
+            batch_like,
+            cfg,
+            H,
+            W,
+            dx,
+            dy,
+            device=dev,
+        )
 
     xmin, xmax, ymin, ymax = _get_bbox(cfg)
     pred_centers, pred_levels, pred_parents, pred_ei = dynamic_cells_from_parent_masks(
@@ -1708,29 +1996,35 @@ def _runtime_build_pred_mesh_from_state(
         xmax,
         ymin,
         ymax,
+        refine_ratio=rr,
     )
     parent_flat = pred_parents.view(-1).long()
 
-    edge_method = str(cfg.get("edges", {}).get("method", "knn")).lower()
-    if "face" in edge_method:
-        pred_ei, _pred_ea = build_amr_face_adjacency_edges(
-            pred_centers,
-            pred_levels,
-            H,
-            W,
-            bbox=tuple(cfg["data"]["bbox"]),
-            return_edge_attr=True,
-        )
-        pred_ei = pred_ei.to(dev, dtype=torch.long)
-    else:
-        pred_ei = build_amr_local_knn_edges(
-            pred_centers,
-            parent_flat,
-            H,
-            W,
-            k_local=int(cfg.get("edges", {}).get("k_local", 4)),
-            max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
-        ).to(dev, dtype=torch.long)
+    # Defer edge construction to the wedge-clip stage when wedge clipping is active.
+    # This avoids building the same edge graph twice per runtime step.
+    pred_ei = torch.empty((2, 0), dtype=torch.long, device=dev)
+    if wedge_path is None:
+        edge_method = str(cfg.get("edges", {}).get("method", "knn")).lower()
+        if "face" in edge_method:
+            pred_ei = build_amr_face_adjacency_edges(
+                pred_centers,
+                pred_levels,
+                H,
+                W,
+                bbox=tuple(cfg["data"]["bbox"]),
+                return_edge_attr=False,
+                refine_ratio=rr,
+            )
+            pred_ei = pred_ei.to(dev, dtype=torch.long)
+        else:
+            pred_ei = build_amr_local_knn_edges(
+                pred_centers,
+                parent_flat,
+                H,
+                W,
+                k_local=int(cfg.get("edges", {}).get("k_local", 4)),
+                max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
+            ).to(dev, dtype=torch.long)
 
     pred_centers, pred_levels, parent_flat, pred_ei, mask_pred_parent = _clip_pred_mesh_to_wedge(
         pred_centers=pred_centers,
@@ -1758,6 +2052,7 @@ def _runtime_build_pred_mesh_from_state(
             pred_ei.to("cpu", dtype=torch.int64),
             dx0=float(dx),
             dy0=float(dy),
+            refine_ratio=rr,
         )
         pred_ea = edge_attr.to(dev, dtype=torch.float32)
 
@@ -2105,6 +2400,7 @@ def train_one_epoch_multi_step(
     mu=None,
     sigma=None,
     epoch_idx: int | None = None,
+    runtime_mesh_policy: Dict[str, Any] | None = None,
 ):
     """
     STRICT multi-step mesh-first training with:
@@ -2123,6 +2419,14 @@ def train_one_epoch_multi_step(
     dbg = cfg.get("debug", {})
     nan_watch = bool(dbg.get("nan_watch", True))          # turn on/off
     nan_watch_first_only = bool(dbg.get("nan_first_only", True))
+    hang_watch = bool(dbg.get("hang_watch", True))
+    hang_watch_batches = int(dbg.get("hang_watch_batches", 4))
+    if hang_watch_batches < 1:
+        hang_watch_batches = 1
+    print_batch_time = bool(dbg.get("print_batch_time", False))
+    progress_every_batches = int(dbg.get("progress_every_batches", 10))
+    if progress_every_batches < 1:
+        progress_every_batches = 1
 
     if not hasattr(train_one_epoch_multi_step, "_nan_printed"):
         train_one_epoch_multi_step._nan_printed = False
@@ -2239,6 +2543,7 @@ def train_one_epoch_multi_step(
     runtime_mesh_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
     runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
     runtime_update_every = int(runtime_mesh_cfg.get("update_every_steps", 1))
+    runtime_mesh_backend = _runtime_mesh_backend(cfg)
     runtime_need_edge_attr = bool(need_phy and (not use_mls))
     runtime_wedge_path = None
     if runtime_mesh_enabled:
@@ -2246,11 +2551,63 @@ def train_one_epoch_multi_step(
         if not mesh_spec_path:
             raise RuntimeError("Runtime mesh mode requires cfg['mesh']['starting_mesh_path'].")
         runtime_wedge_path = _load_wedge_path_from_spec(str(mesh_spec_path), cfg)
-        print(f"[RUNTIME-MESH] train loop active (update_every_steps={runtime_update_every})")
+        if runtime_mesh_backend == "cnn" and runtime_mesh_policy is None:
+            raise RuntimeError(
+                "Runtime mesh backend is 'cnn' but runtime_mesh_policy was not loaded."
+            )
+        print(
+            f"[RUNTIME-MESH] train loop active (backend={runtime_mesh_backend}, "
+            f"update_every_steps={runtime_update_every})"
+        )
 
     train_one_epoch_multi_step._printed_loss_components = False
 
+    epoch_loop_t0 = time.perf_counter()
+    try:
+        total_batches = int(len(loader))
+    except Exception:
+        total_batches = -1
+    hang_cap_notified = False
+
+    def _maybe_print_batch_progress(batch_idx: int, batch_wall_s: float) -> None:
+        bi = int(batch_idx) + 1
+        if print_batch_time:
+            if total_batches > 0:
+                print(f"[BATCH-TIME] train batch {bi}/{total_batches} wall={batch_wall_s:.3f}s", flush=True)
+            else:
+                print(f"[BATCH-TIME] train batch {bi} wall={batch_wall_s:.3f}s", flush=True)
+        if (bi % progress_every_batches) != 0:
+            return
+        elapsed = float(time.perf_counter() - epoch_loop_t0)
+        avg = elapsed / float(max(bi, 1))
+        if total_batches > 0:
+            print(
+                f"[PROGRESS] train batch {bi}/{total_batches} "
+                f"batch_wall={batch_wall_s:.3f}s avg_batch={avg:.3f}s elapsed={elapsed:.1f}s",
+                flush=True,
+            )
+        else:
+            print(
+                f"[PROGRESS] train batch {bi} "
+                f"batch_wall={batch_wall_s:.3f}s avg_batch={avg:.3f}s elapsed={elapsed:.1f}s",
+                flush=True,
+            )
+
     for batch_idx, batch in enumerate(loader):
+        if hang_watch and (not hang_cap_notified) and (batch_idx == hang_watch_batches):
+            print(
+                f"[HANG-DBG] detailed hang logs reached configured limit: "
+                f"debug.hang_watch_batches={hang_watch_batches}. "
+                f"Set a larger value to continue per-step diagnostics.",
+                flush=True,
+            )
+            hang_cap_notified = True
+
+        batch_dbg = bool(hang_watch and (batch_idx < hang_watch_batches))
+        batch_t0 = time.perf_counter()
+        if batch_dbg:
+            print(f"[HANG-DBG] batch fetched: idx={batch_idx}", flush=True)
+
         dt_list = batch.get("dt_list", None)
         if dt_list is None:
             raise RuntimeError("Missing dt_list in batch. Ensure the active collate attaches dt_list.")
@@ -3365,6 +3722,7 @@ def train_one_epoch_multi_step(
                             active_pred_ei.to("cpu", dtype=torch.int64),
                             dx0=float(dx),
                             dy0=float(dy),
+                            refine_ratio=_get_refine_ratio(cfg),
                         ).to(device=device, dtype=torch.float32)
 
                     x_in_abs = _to_dev_nb(feat_t_on_pred_list[1], dtype=torch.float32)
@@ -3395,6 +3753,7 @@ def train_one_epoch_multi_step(
                             device=device,
                             wedge_path=runtime_wedge_path,
                             need_edge_attr=runtime_need_edge_attr,
+                            runtime_mesh_policy=runtime_mesh_policy,
                         )
                         t_rebuild_s = time.perf_counter() - t_rebuild_t0
 
@@ -3473,6 +3832,13 @@ def train_one_epoch_multi_step(
                     dtk = torch.tensor(float(dtk), device=device, dtype=x_in_abs.dtype)
 
                 t_model_t0 = time.perf_counter()
+                if batch_dbg:
+                    print(
+                        f"[HANG-DBG] train entering _run_step: step={k} "
+                        f"N={int(x_in_abs.shape[0]) if torch.is_tensor(x_in_abs) else -1} "
+                        f"E={int(active_pred_ei.shape[1]) if (torch.is_tensor(active_pred_ei) and active_pred_ei.ndim == 2) else -1}",
+                        flush=True,
+                    )
                 loss_k, y_pred_abs_k, _ = _run_step(
                     step_k=k,
                     pred_centers=active_pred_centers,
@@ -3486,6 +3852,8 @@ def train_one_epoch_multi_step(
                     dt_ref_scalar=dt_ref_scalar,
                     x_ops_abs=None,
                 )
+                if batch_dbg:
+                    print(f"[HANG-DBG] train _run_step returned: step={k}", flush=True)
                 t_model_s = time.perf_counter() - t_model_t0
 
                 window_loss += float(loss_k.detach().cpu())
@@ -3542,23 +3910,51 @@ def train_one_epoch_multi_step(
 
             # ===== backward + step once per window =====
             if window_loss_graph is not None:
+                if batch_dbg:
+                    print("[HANG-DBG] starting backward+step", flush=True)
+                t_bw0 = time.perf_counter() if batch_dbg else None
                 if scaler is not None:
                     scaler.scale(window_loss_graph).backward()
+                    if batch_dbg:
+                        print(f"[HANG-DBG] backward done (scaled) in {time.perf_counter() - t_bw0:.3f}s", flush=True)
+                    t_clip0 = time.perf_counter() if batch_dbg else None
                     scaler.unscale_(opt)  # <-- required before clipping
                     if grad_clip > 0.0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    if batch_dbg:
+                        print(f"[HANG-DBG] unscale+clip done in {time.perf_counter() - t_clip0:.3f}s", flush=True)
+                    t_step0 = time.perf_counter() if batch_dbg else None
                     scaler.step(opt)
                     scaler.update()
+                    if batch_dbg:
+                        print(f"[HANG-DBG] optimizer step+update done in {time.perf_counter() - t_step0:.3f}s", flush=True)
                 else:
                     window_loss_graph.backward()
+                    if batch_dbg:
+                        print(f"[HANG-DBG] backward done in {time.perf_counter() - t_bw0:.3f}s", flush=True)
+                    t_clip0 = time.perf_counter() if batch_dbg else None
                     if grad_clip > 0.0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    if batch_dbg:
+                        print(f"[HANG-DBG] clip done in {time.perf_counter() - t_clip0:.3f}s", flush=True)
+                    t_step0 = time.perf_counter() if batch_dbg else None
                     opt.step()
+                    if batch_dbg:
+                        print(f"[HANG-DBG] optimizer step done in {time.perf_counter() - t_step0:.3f}s", flush=True)
             else:
                 opt.step()
+                if batch_dbg:
+                    print("[HANG-DBG] no graph loss; optimizer step only", flush=True)
 
             total_loss_accum += window_loss
             mae_accum += window_mae
+            _maybe_print_batch_progress(batch_idx, float(time.perf_counter() - batch_t0))
+            if batch_dbg:
+                print(
+                    f"[HANG-DBG] batch complete: idx={batch_idx} "
+                    f"wall={time.perf_counter() - batch_t0:.3f}s",
+                    flush=True,
+                )
             continue
 
         # ======================
@@ -3569,6 +3965,8 @@ def train_one_epoch_multi_step(
             k, pred_lists=pred_lists
         )
         pred_ea_1 = pred_ea_list[k + 1] if (pred_ea_list is not None) else None
+
+        print("Step 0")
 
         # --- Option A: move ONLY step-0 tensors to GPU here ---
         pred_centers_1 = _to_dev_nb(pred_centers_1)
@@ -3660,6 +4058,7 @@ def train_one_epoch_multi_step(
         # STEPS 1..K-2
         # ======================
         for k in range(1, K - 1):
+            print(f"\nStep {k}")
             pred_centers_next, pred_levels_next, pred_parents_next, pred_ei_next, mask_pred_next = _pred_mesh_for_step_strict(k, pred_lists=pred_lists)
             pred_ea_next = pred_ea_list[k + 1] if (pred_ea_list is not None) else None
 
@@ -3789,6 +4188,7 @@ def train_one_epoch_multi_step(
 
         total_loss_accum += window_loss
         mae_accum        += window_mae
+        _maybe_print_batch_progress(batch_idx, float(time.perf_counter() - batch_t0))
 
     denom = max(n_steps, 1)
     return total_loss_accum / denom, mae_accum / denom, {"num_windows": len(loader), "num_steps": n_steps}
@@ -3806,9 +4206,11 @@ def evaluate_one_epoch_multi_step(
     mu=None,
     sigma=None,
     collect_examples: bool = False,
+    collect_example_edges: bool = False,
     budget_csv_path: str | None = None,
     write_budgets: bool = False,
     epoch_idx: int | None = None,
+    runtime_mesh_policy: Dict[str, Any] | None = None,
 ):
 
     model.eval()
@@ -3860,6 +4262,7 @@ def evaluate_one_epoch_multi_step(
     runtime_mesh_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
     runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
     runtime_update_every = int(runtime_mesh_cfg.get("update_every_steps", 1))
+    runtime_mesh_backend = _runtime_mesh_backend(cfg)
     runtime_need_edge_attr = bool(need_phy and (not use_mls))
     runtime_wedge_path = None
     if runtime_mesh_enabled:
@@ -3867,7 +4270,14 @@ def evaluate_one_epoch_multi_step(
         if not mesh_spec_path:
             raise RuntimeError("Runtime mesh mode requires cfg['mesh']['starting_mesh_path'].")
         runtime_wedge_path = _load_wedge_path_from_spec(str(mesh_spec_path), cfg)
-        print(f"[RUNTIME-MESH] eval loop active (update_every_steps={runtime_update_every})")
+        if runtime_mesh_backend == "cnn" and runtime_mesh_policy is None:
+            raise RuntimeError(
+                "Runtime mesh backend is 'cnn' but runtime_mesh_policy was not loaded."
+            )
+        print(
+            f"[RUNTIME-MESH] eval loop active (backend={runtime_mesh_backend}, "
+            f"update_every_steps={runtime_update_every})"
+        )
 
     # ---- metric accumulators (weighted by cell area) ----
     step_wsum = []
@@ -3911,7 +4321,14 @@ def evaluate_one_epoch_multi_step(
 
         dtype = pred_abs_.dtype
         dev = pred_abs_.device
-        w = dec.cell_area_from_levels(pred_levels, dx0=float(dx), dy0=float(dy), dtype=dtype, device=dev)  # [N]
+        w = dec.cell_area_from_levels(
+            pred_levels,
+            dx0=float(dx),
+            dy0=float(dy),
+            dtype=dtype,
+            device=dev,
+            refine_ratio=_get_refine_ratio(cfg),
+        )  # [N]
         wsum_add = float(w.sum().detach().cpu())
 
         diff = (pred_abs_ - gt_abs_)
@@ -3940,6 +4357,7 @@ def evaluate_one_epoch_multi_step(
         pred_centers,
         pred_levels,
         pred_parents,
+        pred_ei,
         y_pred_step_abs,
         centers_list,
         feat_list,
@@ -3953,7 +4371,7 @@ def evaluate_one_epoch_multi_step(
         t_indices = batch.get("t_indices", None)
         t_idx = int(t_indices[idx_tp1].item()) if (t_indices is not None and torch.is_tensor(t_indices)) else (int(t_indices[idx_tp1]) if t_indices is not None else int(idx_tp1))
         bbox = tuple(cfg.get("data", {}).get("bbox", (0.0, 1.0, 0.0, 1.0)))
-        examples.append({
+        ex_rec = {
             "pred_centers": pred_centers.detach().cpu(),
             "pred_levels":  pred_levels.detach().cpu(),
             "pred_parents": pred_parents.detach().cpu(),
@@ -3973,7 +4391,10 @@ def evaluate_one_epoch_multi_step(
             "level_tp1":    level_list[idx_tp1].detach().cpu(),
             "parents_tp1":  parents_list[idx_tp1].detach().cpu(),
             "feat_tp1":     feat_list[idx_tp1].detach().cpu(),
-        })
+        }
+        if collect_example_edges and (pred_ei is not None):
+            ex_rec["pred_ei"] = pred_ei.detach().cpu()
+        examples.append(ex_rec)
 
     def _budget_integrals(x_abs: torch.Tensor, pred_levels: torch.Tensor):
         """
@@ -3991,7 +4412,8 @@ def evaluate_one_epoch_multi_step(
         # area weights on pred mesh
         w = dec.cell_area_from_levels(
             pred_levels, dx0=float(dx), dy0=float(dy),
-            dtype=x_abs.dtype, device=x_abs.device
+            dtype=x_abs.dtype, device=x_abs.device,
+            refine_ratio=_get_refine_ratio(cfg),
         )  # [N]
 
         rho = x_abs[:, idx_map["rho"]]
@@ -4556,6 +4978,7 @@ def evaluate_one_epoch_multi_step(
                                 active_pred_ei.to("cpu", dtype=torch.int64),
                                 dx0=float(dx),
                                 dy0=float(dy),
+                                refine_ratio=_get_refine_ratio(cfg),
                             ).to(device=device, dtype=torch.float32)
 
                         x_in_abs = feat_t_on_pred_list[1].to(device=device, dtype=torch.float32)
@@ -4586,6 +5009,7 @@ def evaluate_one_epoch_multi_step(
                                 device=device,
                                 wedge_path=runtime_wedge_path,
                                 need_edge_attr=runtime_need_edge_attr,
+                                runtime_mesh_policy=runtime_mesh_policy,
                             )
                             t_rebuild_s = time.perf_counter() - t_rebuild_t0
 
@@ -4782,6 +5206,7 @@ def evaluate_one_epoch_multi_step(
                         pred_centers=active_pred_centers,
                         pred_levels=active_pred_levels,
                         pred_parents=active_pred_parents,
+                        pred_ei=active_pred_ei,
                         y_pred_step_abs=y_pred_abs_k,
                         centers_list=centers_list,
                         feat_list=feat_list,
@@ -4884,6 +5309,7 @@ def evaluate_one_epoch_multi_step(
                 pred_centers=pred_centers_1,
                 pred_levels=pred_levels_1,
                 pred_parents=pred_parents_1,
+                pred_ei=pred_ei_1,
                 y_pred_step_abs=y_pred_abs0,
                 centers_list=centers_list,
                 feat_list=feat_list,
@@ -4956,6 +5382,7 @@ def evaluate_one_epoch_multi_step(
                     pred_centers=pred_centers_next,
                     pred_levels=pred_levels_next,
                     pred_parents=pred_parents_next,
+                    pred_ei=pred_ei_next,
                     y_pred_step_abs=y_pred_abs_k,
                     centers_list=centers_list,
                     feat_list=feat_list,
@@ -5121,12 +5548,17 @@ def build_model_from_cfg(cfg, device):
 
 # ------------------------------ Main ------------------------------
 
-def main(config_path: str | None = None):
+def main(config_path: str | None = None, out_dir: str | None = None):
     # -------- load & normalize config --------
     if config_path is None:
         config_path = os.path.join(os.path.dirname(__file__), "config_feature_first.json")
     with open(config_path, "r") as f:
         cfg = json.load(f)
+
+    if out_dir is not None:
+        out_dir_abs = os.path.abspath(os.path.expanduser(str(out_dir)))
+        cfg.setdefault("train", {})["save_dir"] = out_dir_abs
+        print(f"[CLI] Overriding train.save_dir -> {out_dir_abs}")
 
     idx = dec.infer_feature_indices(cfg, 4)
     print("[IDX]", idx)
@@ -5204,6 +5636,16 @@ def main(config_path: str | None = None):
     runtime_mesh_cfg.setdefault("warm_start_from_precompute", True)
     runtime_mesh_cfg.setdefault("update_every_steps", 1)
     runtime_mesh_cfg.setdefault("max_cells_per_step", 400_000)
+    runtime_mesh_cfg.setdefault("policy_backend", "gradient")
+    runtime_mesh_cnn_cfg = runtime_mesh_cfg.setdefault("cnn", {})
+    if not isinstance(runtime_mesh_cnn_cfg, dict):
+        raise ValueError("train.runtime_mesh.cnn must be a JSON object when provided.")
+    runtime_mesh_cnn_cfg.setdefault("checkpoint_path", "")
+    runtime_mesh_cnn_cfg.setdefault("include_parent_mask", True)
+    runtime_mesh_cnn_cfg.setdefault("include_coords", True)
+    runtime_mesh_cnn_cfg.setdefault("threshold_default", 0.5)
+    runtime_mesh_cnn_cfg.setdefault("threshold_by_level", {})
+    runtime_mesh_cnn_cfg.setdefault("device", "same")
     step_log_cfg = runtime_mesh_cfg.setdefault("step_log", {})
     if not isinstance(step_log_cfg, dict):
         raise ValueError("train.runtime_mesh.step_log must be a JSON object when provided.")
@@ -5217,10 +5659,21 @@ def main(config_path: str | None = None):
         raise ValueError("train.runtime_mesh.update_every_steps must be >= 1.")
 
     if runtime_mesh_enabled:
+        runtime_backend = _runtime_mesh_backend(cfg)
         if not bool(runtime_mesh_cfg.get("reset_to_coarse_each_step", True)):
             raise RuntimeError("Runtime mesh mode requires reset_to_coarse_each_step=true for this workflow.")
         if not bool(runtime_mesh_cfg.get("refine_only", True)):
             raise RuntimeError("Runtime mesh mode requires refine_only=true for this workflow.")
+        if runtime_backend == "cnn":
+            ckpt_raw = runtime_mesh_cnn_cfg.get("checkpoint_path", "")
+            ckpt_path = os.path.abspath(os.path.expanduser(str(ckpt_raw))) if ckpt_raw else ""
+            if not ckpt_path:
+                raise RuntimeError(
+                    "Runtime mesh backend 'cnn' requires train.runtime_mesh.cnn.checkpoint_path."
+                )
+            if not os.path.exists(ckpt_path):
+                raise FileNotFoundError(f"Runtime mesh CNN checkpoint not found: {ckpt_path}")
+            cfg["train"]["runtime_mesh"]["cnn"]["checkpoint_path"] = ckpt_path
 
         mesh_path_cfg = cfg.get("mesh", {}).get("starting_mesh_path", None)
         if not mesh_path_cfg:
@@ -5249,6 +5702,15 @@ def main(config_path: str | None = None):
     xmin, xmax, ymin, ymax = _get_bbox(cfg)
     dx = (xmax - xmin) / W
     dy = (ymax - ymin) / H
+
+    runtime_mesh_policy = None
+    if runtime_mesh_enabled:
+        runtime_mesh_policy = _load_runtime_mesh_policy_from_cfg(
+            cfg,
+            device=device,
+            H=H,
+            W=W,
+        )
 
     # -------- dataset & loaders --------
     pt_path = cfg["data"]["pt_path"]
@@ -5564,7 +6026,8 @@ def main(config_path: str | None = None):
         # unpack: loss, mae, stats
         tr_loss, tr_mae, tr_stats = train_one_epoch_multi_step(
             model, train_loader, opt, cfg, device,
-            H=H, W=W, dx=dx, dy=dy, mu=mu, sigma=sigma, epoch_idx=epoch
+            H=H, W=W, dx=dx, dy=dy, mu=mu, sigma=sigma, epoch_idx=epoch,
+            runtime_mesh_policy=runtime_mesh_policy,
         )
         run_validation = ((epoch % val_every) == 0) or (epoch == total_epochs)
         vl_loss = float("nan")
@@ -5573,7 +6036,8 @@ def main(config_path: str | None = None):
             vl_loss, vl_stats = evaluate_one_epoch_multi_step(
                 model, val_loader, cfg, device,
                 H=H, W=W, dx=dx, dy=dy, mu=mu, sigma=sigma,
-                collect_examples=False, epoch_idx=epoch
+                collect_examples=False, epoch_idx=epoch,
+                runtime_mesh_policy=runtime_mesh_policy,
             )
 
         TR.append(tr_loss)
@@ -5681,6 +6145,7 @@ def main(config_path: str | None = None):
         mu=mu,
         sigma=sigma,
         collect_examples=False,
+        runtime_mesh_policy=runtime_mesh_policy,
     )
 
     print(f"[TEST] loss={test_loss:.4e}")
@@ -5701,6 +6166,12 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, default=None, help="Path to JSON config")
+    ap.add_argument(
+        "--out-dir",
+        type=str,
+        default=None,
+        help="Override cfg['train']['save_dir'] for this run.",
+    )
     args = ap.parse_args()
     print("Running main...", flush=True)
-    main(args.config)
+    main(args.config, args.out_dir)

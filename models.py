@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+import time
 from torch_geometric.nn import GATConv, GraphUNet
 from torch_geometric.nn import SAGEConv
 import inspect
@@ -42,12 +43,39 @@ class FeatureNet(nn.Module):
 
     def forward(self, X, edge_index):
         h = X
-        for conv in self.convs:
+        hang_dbg_once = not hasattr(self, "_hang_dbg_once")
+        if hang_dbg_once:
+            try:
+                ei_shape = tuple(edge_index.shape) if torch.is_tensor(edge_index) else None
+            except Exception:
+                ei_shape = None
+            print(
+                f"[HANG-DBG] FeatureNet.forward start: X={tuple(X.shape)} "
+                f"dtype={X.dtype} dev={X.device} edge_index={ei_shape}",
+                flush=True,
+            )
+
+        for li, conv in enumerate(self.convs):
+            t0 = time.perf_counter() if hang_dbg_once else None
+            if hang_dbg_once:
+                print(f"[HANG-DBG] FeatureNet conv[{li}] begin", flush=True)
             h = conv(h, edge_index)
+            if hang_dbg_once:
+                print(
+                    f"[HANG-DBG] FeatureNet conv[{li}] done in {time.perf_counter() - t0:.3f}s",
+                    flush=True,
+                )
             h = F.relu(h)
             h = F.dropout(h, p=self.dropout, training=self.training)
         y_feat = self.feat_head(h)
         y_score = self.score_head(h) if self.score_head is not None else None
+        if hang_dbg_once:
+            print(
+                f"[HANG-DBG] FeatureNet heads done: y_feat={tuple(y_feat.shape)} "
+                f"y_score={None if y_score is None else tuple(y_score.shape)}",
+                flush=True,
+            )
+            self._hang_dbg_once = True
         return y_feat, y_score, h
 
 class FeatureExtractorGNN(nn.Module):
@@ -507,4 +535,3 @@ class ParcFeatureAdapter(nn.Module):
                 "adv":  float(torch.sigmoid(self.gate_adv_logit).detach().cpu()),
                 "diff": float(torch.sigmoid(self.gate_diff_logit).detach().cpu()),
             }
-
