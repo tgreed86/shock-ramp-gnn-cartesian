@@ -1650,6 +1650,75 @@ def _runtime_step_log_write_summary(csv_path: str, summary_path: str) -> None:
             f.write("\n")
 
 
+def _cell_level_ij_from_centers(
+    *,
+    centers: torch.Tensor,
+    levels: torch.Tensor,
+    H: int,
+    W: int,
+    bbox: Tuple[float, float, float, float],
+    refine_ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Recover integer (row, col) indices of each cell on its own level grid from centers.
+    """
+    if centers.numel() == 0:
+        empty = torch.empty((0,), dtype=torch.long, device=centers.device)
+        return empty, empty
+
+    dev = centers.device
+    lv = levels.view(-1).long()
+    max_l = int(torch.clamp(lv.max(), min=0).item())
+    rr = int(refine_ratio)
+    rr_pows = torch.tensor([rr ** i for i in range(max_l + 1)], device=dev, dtype=torch.float32)
+    ww_l = (float(W) * rr_pows).index_select(0, lv.clamp(0, max_l))
+    hh_l = (float(H) * rr_pows).index_select(0, lv.clamp(0, max_l))
+
+    xmin, xmax, ymin, ymax = [float(v) for v in bbox]
+    xs = max(float(xmax - xmin), 1e-12)
+    ys = max(float(ymax - ymin), 1e-12)
+
+    # Inverse of center formula x = xmin + (i + 0.5) * xs / WW (same for y/HH).
+    col_f = ((centers[:, 0].to(torch.float32) - xmin) * ww_l / xs) - 0.5
+    row_f = ((centers[:, 1].to(torch.float32) - ymin) * hh_l / ys) - 0.5
+
+    col = torch.round(col_f).to(torch.long)
+    row = torch.round(row_f).to(torch.long)
+
+    ww_i = ww_l.to(torch.long)
+    hh_i = hh_l.to(torch.long)
+    col = torch.minimum(torch.maximum(col, torch.zeros_like(col)), ww_i - 1)
+    row = torch.minimum(torch.maximum(row, torch.zeros_like(row)), hh_i - 1)
+    return row, col
+
+
+def _cell_keys_level_ij(
+    *,
+    levels: torch.Tensor,
+    row: torch.Tensor,
+    col: torch.Tensor,
+    H: int,
+    W: int,
+    refine_ratio: int,
+) -> torch.Tensor:
+    """
+    Build a unique int64 key for (level,row,col), with level-specific row/col.
+    """
+    if levels.numel() == 0:
+        return torch.empty((0,), dtype=torch.long, device=levels.device)
+
+    lv = levels.view(-1).long()
+    rr = int(refine_ratio)
+    max_l = int(torch.clamp(lv.max(), min=0).item())
+    h_max = int(H * (rr ** max_l))
+    w_max = int(W * (rr ** max_l))
+    h_max = max(1, h_max)
+    w_max = max(1, w_max)
+
+    key = ((lv * int(h_max)) + row.view(-1).long()) * int(w_max) + col.view(-1).long()
+    return key.to(torch.long)
+
+
 def _map_pred_to_next_pred(pred_centers_src,
                            feats_src,
                            levels_src,
@@ -1659,6 +1728,9 @@ def _map_pred_to_next_pred(pred_centers_src,
                            parents_dst,
                            mask_pred_dst,
                            H, W, knn_k=8, chunk=8192,
+                           *,
+                           bbox: Tuple[float, float, float, float],
+                           refine_ratio: int = 2,
                            knn_backend: str = "exact",
                            knn_backend_kwargs: Dict[str, Any] | None = None):
     """
@@ -1714,6 +1786,61 @@ def _map_pred_to_next_pred(pred_centers_src,
             src_keep = src_match_for_dst[has_match]
             out[dst_keep] = feats_src[src_keep]
             need_idw[dst_keep] = False
+
+    # ---- 1b) Exact same-cell copy for all levels ---------------------------
+    # Match by recovered (level,row,col) key so unchanged fine cells bypass IDW too.
+    if pred_centers_src.numel() > 0 and pred_centers_dst.numel() > 0:
+        src_row, src_col = _cell_level_ij_from_centers(
+            centers=pred_centers_src,
+            levels=levels_src,
+            H=H,
+            W=W,
+            bbox=bbox,
+            refine_ratio=int(refine_ratio),
+        )
+        dst_row, dst_col = _cell_level_ij_from_centers(
+            centers=pred_centers_dst,
+            levels=levels_dst,
+            H=H,
+            W=W,
+            bbox=bbox,
+            refine_ratio=int(refine_ratio),
+        )
+
+        src_key = _cell_keys_level_ij(
+            levels=levels_src,
+            row=src_row,
+            col=src_col,
+            H=H,
+            W=W,
+            refine_ratio=int(refine_ratio),
+        )
+        dst_key = _cell_keys_level_ij(
+            levels=levels_dst,
+            row=dst_row,
+            col=dst_col,
+            H=H,
+            W=W,
+            refine_ratio=int(refine_ratio),
+        )
+
+        src_order = torch.argsort(src_key)
+        src_key_sorted = src_key[src_order]
+        src_idx_sorted = src_order
+
+        dst_need_idx = need_idw.nonzero(as_tuple=True)[0]
+        if dst_need_idx.numel() > 0:
+            dst_need_key = dst_key[dst_need_idx]
+            pos = torch.searchsorted(src_key_sorted, dst_need_key)
+            valid = (pos >= 0) & (pos < src_key_sorted.numel())
+            if valid.any():
+                eq = torch.zeros_like(valid, dtype=torch.bool)
+                eq[valid] = (src_key_sorted[pos[valid]] == dst_need_key[valid])
+                if eq.any():
+                    dst_keep = dst_need_idx[eq]
+                    src_keep = src_idx_sorted[pos[eq]]
+                    out[dst_keep] = feats_src[src_keep]
+                    need_idw[dst_keep] = False
 
     # ---- 2) IDW for the remaining nodes -----------------------------------
     q_idx = need_idw.nonzero(as_tuple=True)[0]
@@ -2664,6 +2791,8 @@ def train_one_epoch_multi_step(
     runtime_mesh_backend = _runtime_mesh_backend(cfg)
     runtime_idw_backend = "exact"
     runtime_idw_backend_kwargs: Dict[str, Any] = {}
+    runtime_bbox = _get_bbox(cfg)
+    runtime_refine_ratio = _get_refine_ratio(cfg)
     runtime_need_edge_attr = bool(need_phy and (not use_mls))
     runtime_wedge_path = None
     if runtime_mesh_enabled:
@@ -3977,6 +4106,8 @@ def train_one_epoch_multi_step(
                                 W=W,
                                 knn_k=runtime_knn_k,
                                 chunk=runtime_chunk,
+                                bbox=runtime_bbox,
+                                refine_ratio=runtime_refine_ratio,
                                 knn_backend=runtime_idw_backend,
                                 knn_backend_kwargs=runtime_idw_backend_kwargs,
                             )
@@ -4460,6 +4591,8 @@ def evaluate_one_epoch_multi_step(
     runtime_mesh_backend = _runtime_mesh_backend(cfg)
     runtime_idw_backend = "exact"
     runtime_idw_backend_kwargs: Dict[str, Any] = {}
+    runtime_bbox = _get_bbox(cfg)
+    runtime_refine_ratio = _get_refine_ratio(cfg)
     runtime_need_edge_attr = bool(need_phy and (not use_mls))
     runtime_wedge_path = None
     if runtime_mesh_enabled:
@@ -5257,6 +5390,8 @@ def evaluate_one_epoch_multi_step(
                                     W=W,
                                     knn_k=runtime_knn_k,
                                     chunk=runtime_chunk,
+                                    bbox=runtime_bbox,
+                                    refine_ratio=runtime_refine_ratio,
                                     knn_backend=runtime_idw_backend,
                                     knn_backend_kwargs=runtime_idw_backend_kwargs,
                                 )
