@@ -225,10 +225,17 @@
     "print_norm_sanity_once": false,
     "teacher_force_ops": false,
     "hang_watch_batches": 1000,
-    "print_batch_time": true
+    "print_batch_time": true,
+    "print_runtime_mesh_batch_breakdown": true
   },
 
   "speed": {
     "interp_chunk": 4096
+  },
+  "idw": {
+    "backend": "faiss_ivf",
+    "faiss_nlist": 512,
+    "faiss_nprobe": 32,
+    "allow_fallback_to_exact": true
   }
 }

@@ -1410,6 +1410,80 @@ def _select_idw_backend(
     return idw_dev, eff_chunk
 
 
+def _runtime_idw_backend_settings(
+    cfg: Dict[str, Any],
+    *,
+    out_device: torch.device,
+) -> tuple[str, Dict[str, Any]]:
+    rt_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
+    idw_cfg = rt_cfg.get("idw", {}) or {}
+    if not isinstance(idw_cfg, dict):
+        raise ValueError("train.runtime_mesh.idw must be a JSON object when provided.")
+
+    raw_backend = str(idw_cfg.get("backend", "exact")).strip().lower()
+    backend_aliases = {
+        "torch": "exact",
+        "cdist": "exact",
+        "exact": "exact",
+        "flat": "faiss_flat",
+        "faiss_flat": "faiss_flat",
+        "faiss": "faiss_ivf",
+        "ivf": "faiss_ivf",
+        "faiss_ivf": "faiss_ivf",
+        "ann": "faiss_ivf",
+        "approx": "faiss_ivf",
+    }
+    backend = backend_aliases.get(raw_backend, raw_backend)
+    if backend not in ("exact", "faiss_flat", "faiss_ivf"):
+        raise ValueError(
+            "train.runtime_mesh.idw.backend must be one of: exact, faiss_flat, faiss_ivf."
+        )
+
+    allow_fallback = bool(idw_cfg.get("allow_fallback_to_exact", True))
+    faiss_nlist = max(1, int(idw_cfg.get("faiss_nlist", 256)))
+    faiss_nprobe = max(1, int(idw_cfg.get("faiss_nprobe", 16)))
+
+    out_dev = torch.device(out_device)
+    if backend in ("faiss_flat", "faiss_ivf"):
+        if out_dev.type != "cuda":
+            msg = (
+                f"[IDW] backend={backend} requested but device={out_dev.type} is not CUDA; "
+                "falling back to exact."
+            )
+            if allow_fallback:
+                if not getattr(_runtime_idw_backend_settings, "_warn_non_cuda", False):
+                    print(msg, flush=True)
+                    _runtime_idw_backend_settings._warn_non_cuda = True
+                backend = "exact"
+            else:
+                raise RuntimeError(msg + " Set allow_fallback_to_exact=true or use exact backend.")
+        else:
+            try:
+                import faiss  # type: ignore
+                if not hasattr(faiss, "StandardGpuResources"):
+                    raise RuntimeError("installed faiss build does not expose CUDA GPU resources")
+            except Exception as e:
+                msg = (
+                    f"[IDW] backend={backend} requested but faiss is unavailable ({e!r}); "
+                    "falling back to exact."
+                )
+                if allow_fallback:
+                    if not getattr(_runtime_idw_backend_settings, "_warn_no_faiss", False):
+                        print(msg, flush=True)
+                        _runtime_idw_backend_settings._warn_no_faiss = True
+                    backend = "exact"
+                else:
+                    raise RuntimeError(
+                        "train.runtime_mesh.idw.backend requests faiss, but import failed."
+                    ) from e
+
+    backend_kwargs: Dict[str, Any] = {}
+    if backend in ("faiss_flat", "faiss_ivf"):
+        backend_kwargs["faiss_nlist"] = int(faiss_nlist)
+        backend_kwargs["faiss_nprobe"] = int(faiss_nprobe)
+    return backend, backend_kwargs
+
+
 _RUNTIME_STEP_LOG_FIELDS = [
     "wall_time",
     "split",
@@ -1584,7 +1658,9 @@ def _map_pred_to_next_pred(pred_centers_src,
                            levels_dst,
                            parents_dst,
                            mask_pred_dst,
-                           H, W, knn_k=8, chunk=8192):
+                           H, W, knn_k=8, chunk=8192,
+                           knn_backend: str = "exact",
+                           knn_backend_kwargs: Dict[str, Any] | None = None):
     """
     Map predicted features from mesh k -> k+1.
 
@@ -1642,10 +1718,18 @@ def _map_pred_to_next_pred(pred_centers_src,
     # ---- 2) IDW for the remaining nodes -----------------------------------
     q_idx = need_idw.nonzero(as_tuple=True)[0]
     if q_idx.numel() > 0:
+        backend_kwargs = dict(knn_backend_kwargs or {})
         q_pts = pred_centers_dst[q_idx].to(idw_dev, dtype=torch.float32)  # (Q,2)
         src_pts = pred_centers_src.to(idw_dev, dtype=torch.float32)
         src_feats = feats_src.to(idw_dev)
-        idx_map, w_map = build_idw_map(q_pts, src_pts, k=knn_k, chunk=idw_chunk)
+        idx_map, w_map = build_idw_map(
+            q_pts,
+            src_pts,
+            k=knn_k,
+            chunk=idw_chunk,
+            backend=knn_backend,
+            **backend_kwargs,
+        )
         vals = apply_idw_map(idx_map, w_map, src_feats).to(dev)  # (Q,F)
         out[q_idx] = vals
 
@@ -1672,6 +1756,8 @@ def _map_gt_to_pred_mesh_once(
     pred_centers: torch.Tensor,
     knn_k: int = 8,
     chunk: int = 8192,
+    knn_backend: str = "exact",
+    knn_backend_kwargs: Dict[str, Any] | None = None,
 ) -> torch.Tensor:
     out_dev = pred_centers.device
     idw_dev, idw_chunk = _select_idw_backend(
@@ -1684,7 +1770,15 @@ def _map_gt_to_pred_mesh_once(
     src_f = src_feats.to(idw_dev, dtype=torch.float32)
     dst_c = pred_centers.to(idw_dev, dtype=torch.float32)
 
-    idx_map, w_map = build_idw_map(dst_c, src_c, k=int(knn_k), chunk=int(idw_chunk))
+    backend_kwargs = dict(knn_backend_kwargs or {})
+    idx_map, w_map = build_idw_map(
+        dst_c,
+        src_c,
+        k=int(knn_k),
+        chunk=int(idw_chunk),
+        backend=knn_backend,
+        **backend_kwargs,
+    )
     mapped = apply_idw_map(idx_map, w_map, src_f)
     return mapped.to(out_dev)
 
@@ -1932,11 +2026,21 @@ def _runtime_build_pred_mesh_from_state(
     wedge_path,
     need_edge_attr: bool,
     runtime_mesh_policy: Dict[str, Any] | None = None,
+    timing_out: Dict[str, float] | None = None,
 ):
     """
     Build next-step predicted mesh from state gradients in runtime mode.
     Wedge clipping is mandatory for shock-ramp geometry.
     """
+    t_build_t0 = time.perf_counter()
+    timing: Dict[str, float] = {
+        "mesh_predict_s": 0.0,
+        "mesh_materialize_s": 0.0,
+        "wedge_clip_s": 0.0,
+        "edge_attr_s": 0.0,
+        "total_s": 0.0,
+    }
+
     dev = torch.device(device)
     rr = _get_refine_ratio(cfg)
     rt_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
@@ -1965,6 +2069,7 @@ def _runtime_build_pred_mesh_from_state(
         "level_t": level_t,
     }
     policy_backend = _runtime_mesh_backend(cfg)
+    t_policy_t0 = time.perf_counter()
     if policy_backend == "cnn":
         masks_pred_by_level = _runtime_predict_masks_from_cnn(
             feat_policy=feat_policy,
@@ -1986,8 +2091,10 @@ def _runtime_build_pred_mesh_from_state(
             dy,
             device=dev,
         )
+    timing["mesh_predict_s"] = float(time.perf_counter() - t_policy_t0)
 
     xmin, xmax, ymin, ymax = _get_bbox(cfg)
+    t_mesh_mat_t0 = time.perf_counter()
     pred_centers, pred_levels, pred_parents, pred_ei = dynamic_cells_from_parent_masks(
         masks_pred_by_level,
         H,
@@ -1998,6 +2105,7 @@ def _runtime_build_pred_mesh_from_state(
         ymax,
         refine_ratio=rr,
     )
+    timing["mesh_materialize_s"] = float(time.perf_counter() - t_mesh_mat_t0)
     parent_flat = pred_parents.view(-1).long()
 
     # Defer edge construction to the wedge-clip stage when wedge clipping is active.
@@ -2026,6 +2134,7 @@ def _runtime_build_pred_mesh_from_state(
                 max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
             ).to(dev, dtype=torch.long)
 
+    t_wedge_t0 = time.perf_counter()
     pred_centers, pred_levels, parent_flat, pred_ei, mask_pred_parent = _clip_pred_mesh_to_wedge(
         pred_centers=pred_centers,
         pred_levels=pred_levels,
@@ -2037,6 +2146,7 @@ def _runtime_build_pred_mesh_from_state(
         cfg=cfg,
         device=dev,
     )
+    timing["wedge_clip_s"] = float(time.perf_counter() - t_wedge_t0)
 
     pred_centers = pred_centers.to(dev, dtype=torch.float32)
     pred_levels = pred_levels.to(dev, dtype=torch.long)
@@ -2046,6 +2156,7 @@ def _runtime_build_pred_mesh_from_state(
 
     pred_ea = None
     if need_edge_attr:
+        t_ea_t0 = time.perf_counter()
         edge_attr = dec_edge_attr_for_dyadic_quads(
             pred_centers.to("cpu", dtype=torch.float32),
             pred_levels.to("cpu", dtype=torch.int64),
@@ -2055,6 +2166,12 @@ def _runtime_build_pred_mesh_from_state(
             refine_ratio=rr,
         )
         pred_ea = edge_attr.to(dev, dtype=torch.float32)
+        timing["edge_attr_s"] = float(time.perf_counter() - t_ea_t0)
+
+    timing["total_s"] = float(time.perf_counter() - t_build_t0)
+    if isinstance(timing_out, dict):
+        timing_out.clear()
+        timing_out.update(timing)
 
     return pred_centers, pred_levels, parent_flat, pred_ei, mask_pred_parent, pred_ea
 
@@ -2424,6 +2541,7 @@ def train_one_epoch_multi_step(
     if hang_watch_batches < 1:
         hang_watch_batches = 1
     print_batch_time = bool(dbg.get("print_batch_time", False))
+    print_runtime_mesh_batch_breakdown = bool(dbg.get("print_runtime_mesh_batch_breakdown", True))
     progress_every_batches = int(dbg.get("progress_every_batches", 10))
     if progress_every_batches < 1:
         progress_every_batches = 1
@@ -2544,6 +2662,8 @@ def train_one_epoch_multi_step(
     runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
     runtime_update_every = int(runtime_mesh_cfg.get("update_every_steps", 1))
     runtime_mesh_backend = _runtime_mesh_backend(cfg)
+    runtime_idw_backend = "exact"
+    runtime_idw_backend_kwargs: Dict[str, Any] = {}
     runtime_need_edge_attr = bool(need_phy and (not use_mls))
     runtime_wedge_path = None
     if runtime_mesh_enabled:
@@ -2551,13 +2671,17 @@ def train_one_epoch_multi_step(
         if not mesh_spec_path:
             raise RuntimeError("Runtime mesh mode requires cfg['mesh']['starting_mesh_path'].")
         runtime_wedge_path = _load_wedge_path_from_spec(str(mesh_spec_path), cfg)
+        runtime_idw_backend, runtime_idw_backend_kwargs = _runtime_idw_backend_settings(
+            cfg,
+            out_device=device,
+        )
         if runtime_mesh_backend == "cnn" and runtime_mesh_policy is None:
             raise RuntimeError(
                 "Runtime mesh backend is 'cnn' but runtime_mesh_policy was not loaded."
             )
         print(
             f"[RUNTIME-MESH] train loop active (backend={runtime_mesh_backend}, "
-            f"update_every_steps={runtime_update_every})"
+            f"idw_backend={runtime_idw_backend}, update_every_steps={runtime_update_every})"
         )
 
     train_one_epoch_multi_step._printed_loss_components = False
@@ -2593,6 +2717,47 @@ def train_one_epoch_multi_step(
                 flush=True,
             )
 
+    def _maybe_print_runtime_mesh_batch_breakdown(
+        batch_idx: int,
+        batch_wall_s: float,
+        *,
+        t_mesh_materialize_s: float,
+        t_wedge_clip_s: float,
+        t_edge_attr_s: float,
+        t_idw_remap_s: float,
+        n_rebuilds: int,
+    ) -> None:
+        if (not runtime_mesh_enabled) or (not print_runtime_mesh_batch_breakdown):
+            return
+        bi = int(batch_idx) + 1
+        total = float(max(batch_wall_s, 1e-12))
+        accounted = (
+            float(t_mesh_materialize_s)
+            + float(t_wedge_clip_s)
+            + float(t_edge_attr_s)
+            + float(t_idw_remap_s)
+        )
+        other = max(0.0, total - accounted)
+
+        def _pct(x: float) -> float:
+            return 100.0 * float(x) / total
+
+        if total_batches > 0:
+            prefix = f"[RUNTIME-COST] train batch {bi}/{total_batches}"
+        else:
+            prefix = f"[RUNTIME-COST] train batch {bi}"
+
+        print(
+            f"{prefix} wall={total:.3f}s "
+            f"| idw_remap={float(t_idw_remap_s):.3f}s ({_pct(t_idw_remap_s):.1f}%) "
+            f"| mesh_materialize={float(t_mesh_materialize_s):.3f}s ({_pct(t_mesh_materialize_s):.1f}%) "
+            f"| wedge_clip={float(t_wedge_clip_s):.3f}s ({_pct(t_wedge_clip_s):.1f}%) "
+            f"| edge_attr={float(t_edge_attr_s):.3f}s ({_pct(t_edge_attr_s):.1f}%) "
+            f"| other={other:.3f}s ({_pct(other):.1f}%) "
+            f"| rebuilds={int(n_rebuilds)}",
+            flush=True,
+        )
+
     for batch_idx, batch in enumerate(loader):
         if hang_watch and (not hang_cap_notified) and (batch_idx == hang_watch_batches):
             print(
@@ -2607,6 +2772,12 @@ def train_one_epoch_multi_step(
         batch_t0 = time.perf_counter()
         if batch_dbg:
             print(f"[HANG-DBG] batch fetched: idx={batch_idx}", flush=True)
+
+        batch_rt_mesh_materialize_s = 0.0
+        batch_rt_wedge_clip_s = 0.0
+        batch_rt_edge_attr_s = 0.0
+        batch_rt_idw_remap_s = 0.0
+        batch_rt_rebuilds = 0
 
         dt_list = batch.get("dt_list", None)
         if dt_list is None:
@@ -3733,6 +3904,7 @@ def train_one_epoch_multi_step(
 
                     if do_rebuild:
                         t_rebuild_t0 = time.perf_counter()
+                        rebuild_timing: Dict[str, float] = {}
                         (
                             active_pred_centers,
                             active_pred_levels,
@@ -3754,8 +3926,13 @@ def train_one_epoch_multi_step(
                             wedge_path=runtime_wedge_path,
                             need_edge_attr=runtime_need_edge_attr,
                             runtime_mesh_policy=runtime_mesh_policy,
+                            timing_out=rebuild_timing,
                         )
                         t_rebuild_s = time.perf_counter() - t_rebuild_t0
+                        batch_rt_rebuilds += 1
+                        batch_rt_mesh_materialize_s += float(rebuild_timing.get("mesh_materialize_s", 0.0))
+                        batch_rt_wedge_clip_s += float(rebuild_timing.get("wedge_clip_s", 0.0))
+                        batch_rt_edge_attr_s += float(rebuild_timing.get("edge_attr_s", 0.0))
 
                         if k == 0:
                             n_src_xin = int(state_centers.shape[0])
@@ -3773,6 +3950,8 @@ def train_one_epoch_multi_step(
                                 pred_centers=active_pred_centers,
                                 knn_k=runtime_knn_k,
                                 chunk=runtime_chunk,
+                                knn_backend=runtime_idw_backend,
+                                knn_backend_kwargs=runtime_idw_backend_kwargs,
                             )
                             t_xin_map_s = time.perf_counter() - t_xin_t0
                         else:
@@ -3798,6 +3977,8 @@ def train_one_epoch_multi_step(
                                 W=W,
                                 knn_k=runtime_knn_k,
                                 chunk=runtime_chunk,
+                                knn_backend=runtime_idw_backend,
+                                knn_backend_kwargs=runtime_idw_backend_kwargs,
                             )
                             t_xin_map_s = time.perf_counter() - t_xin_t0
                     else:
@@ -3822,8 +4003,12 @@ def train_one_epoch_multi_step(
                         pred_centers=active_pred_centers,
                         knn_k=runtime_knn_k,
                         chunk=runtime_chunk,
+                        knn_backend=runtime_idw_backend,
+                        knn_backend_kwargs=runtime_idw_backend_kwargs,
                     )
                     t_xtgt_map_s = time.perf_counter() - t_xtgt_t0
+
+                batch_rt_idw_remap_s += float(t_xin_map_s + t_xtgt_map_s)
 
                 dtk = dt_list[k]
                 if torch.is_tensor(dtk):
@@ -3948,11 +4133,21 @@ def train_one_epoch_multi_step(
 
             total_loss_accum += window_loss
             mae_accum += window_mae
-            _maybe_print_batch_progress(batch_idx, float(time.perf_counter() - batch_t0))
+            batch_wall = float(time.perf_counter() - batch_t0)
+            _maybe_print_batch_progress(batch_idx, batch_wall)
+            _maybe_print_runtime_mesh_batch_breakdown(
+                batch_idx,
+                batch_wall,
+                t_mesh_materialize_s=batch_rt_mesh_materialize_s,
+                t_wedge_clip_s=batch_rt_wedge_clip_s,
+                t_edge_attr_s=batch_rt_edge_attr_s,
+                t_idw_remap_s=batch_rt_idw_remap_s,
+                n_rebuilds=batch_rt_rebuilds,
+            )
             if batch_dbg:
                 print(
                     f"[HANG-DBG] batch complete: idx={batch_idx} "
-                    f"wall={time.perf_counter() - batch_t0:.3f}s",
+                    f"wall={batch_wall:.3f}s",
                     flush=True,
                 )
             continue
@@ -4263,6 +4458,8 @@ def evaluate_one_epoch_multi_step(
     runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
     runtime_update_every = int(runtime_mesh_cfg.get("update_every_steps", 1))
     runtime_mesh_backend = _runtime_mesh_backend(cfg)
+    runtime_idw_backend = "exact"
+    runtime_idw_backend_kwargs: Dict[str, Any] = {}
     runtime_need_edge_attr = bool(need_phy and (not use_mls))
     runtime_wedge_path = None
     if runtime_mesh_enabled:
@@ -4270,13 +4467,17 @@ def evaluate_one_epoch_multi_step(
         if not mesh_spec_path:
             raise RuntimeError("Runtime mesh mode requires cfg['mesh']['starting_mesh_path'].")
         runtime_wedge_path = _load_wedge_path_from_spec(str(mesh_spec_path), cfg)
+        runtime_idw_backend, runtime_idw_backend_kwargs = _runtime_idw_backend_settings(
+            cfg,
+            out_device=device,
+        )
         if runtime_mesh_backend == "cnn" and runtime_mesh_policy is None:
             raise RuntimeError(
                 "Runtime mesh backend is 'cnn' but runtime_mesh_policy was not loaded."
             )
         print(
             f"[RUNTIME-MESH] eval loop active (backend={runtime_mesh_backend}, "
-            f"update_every_steps={runtime_update_every})"
+            f"idw_backend={runtime_idw_backend}, update_every_steps={runtime_update_every})"
         )
 
     # ---- metric accumulators (weighted by cell area) ----
@@ -5029,6 +5230,8 @@ def evaluate_one_epoch_multi_step(
                                     pred_centers=active_pred_centers,
                                     knn_k=runtime_knn_k,
                                     chunk=runtime_chunk,
+                                    knn_backend=runtime_idw_backend,
+                                    knn_backend_kwargs=runtime_idw_backend_kwargs,
                                 )
                                 t_xin_map_s = time.perf_counter() - t_xin_t0
                             else:
@@ -5054,6 +5257,8 @@ def evaluate_one_epoch_multi_step(
                                     W=W,
                                     knn_k=runtime_knn_k,
                                     chunk=runtime_chunk,
+                                    knn_backend=runtime_idw_backend,
+                                    knn_backend_kwargs=runtime_idw_backend_kwargs,
                                 )
                                 t_xin_map_s = time.perf_counter() - t_xin_t0
                         else:
@@ -5078,6 +5283,8 @@ def evaluate_one_epoch_multi_step(
                             pred_centers=active_pred_centers,
                             knn_k=runtime_knn_k,
                             chunk=runtime_chunk,
+                            knn_backend=runtime_idw_backend,
+                            knn_backend_kwargs=runtime_idw_backend_kwargs,
                         )
                         t_xtgt_map_s = time.perf_counter() - t_xtgt_t0
 
@@ -5637,6 +5844,13 @@ def main(config_path: str | None = None, out_dir: str | None = None):
     runtime_mesh_cfg.setdefault("update_every_steps", 1)
     runtime_mesh_cfg.setdefault("max_cells_per_step", 400_000)
     runtime_mesh_cfg.setdefault("policy_backend", "gradient")
+    runtime_mesh_idw_cfg = runtime_mesh_cfg.setdefault("idw", {})
+    if not isinstance(runtime_mesh_idw_cfg, dict):
+        raise ValueError("train.runtime_mesh.idw must be a JSON object when provided.")
+    runtime_mesh_idw_cfg.setdefault("backend", "exact")
+    runtime_mesh_idw_cfg.setdefault("faiss_nlist", 256)
+    runtime_mesh_idw_cfg.setdefault("faiss_nprobe", 16)
+    runtime_mesh_idw_cfg.setdefault("allow_fallback_to_exact", True)
     runtime_mesh_cnn_cfg = runtime_mesh_cfg.setdefault("cnn", {})
     if not isinstance(runtime_mesh_cnn_cfg, dict):
         raise ValueError("train.runtime_mesh.cnn must be a JSON object when provided.")

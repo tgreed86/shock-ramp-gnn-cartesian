@@ -187,15 +187,82 @@ def build_idw_map(
     k: int = 8,
     chunk: int = 8192,
     eps: float = 1e-8,
+    *,
+    backend: str = "exact",
+    faiss_nlist: int = 256,
+    faiss_nprobe: int = 16,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Return (idx, w) so that: dst_vals = sum_j w[:, j] * src_vals[idx[:, j]]
     Robust to exact coincidences and NaNs/Infs from distance calc.
     Shapes: idx -> (N, k), w -> (N, k)
     """
+    backend_key = str(backend).strip().lower()
+    if backend_key in ("exact", "torch", "cdist"):
+        return _build_idw_map_exact(dst_xy, src_xy, k=k, chunk=chunk, eps=eps)
+    if backend_key in ("faiss_flat", "flat"):
+        return _build_idw_map_faiss(
+            dst_xy=dst_xy,
+            src_xy=src_xy,
+            k=k,
+            chunk=chunk,
+            eps=eps,
+            index_kind="flat",
+            faiss_nlist=faiss_nlist,
+            faiss_nprobe=faiss_nprobe,
+        )
+    if backend_key in ("faiss_ivf", "faiss", "ann", "approx"):
+        return _build_idw_map_faiss(
+            dst_xy=dst_xy,
+            src_xy=src_xy,
+            k=k,
+            chunk=chunk,
+            eps=eps,
+            index_kind="ivf",
+            faiss_nlist=faiss_nlist,
+            faiss_nprobe=faiss_nprobe,
+        )
+    raise ValueError(
+        f"Unknown IDW backend '{backend}'. Expected one of: exact, faiss_flat, faiss_ivf."
+    )
+
+
+def _idw_weights_from_dist(d_sel: torch.Tensor, eps: float) -> torch.Tensor:
+    d_sel = torch.nan_to_num(d_sel, nan=float("inf"), posinf=float("inf"), neginf=float("inf"))
+    w_sel = torch.empty_like(d_sel)
+    exact = d_sel[:, 0] <= eps
+
+    if exact.any():
+        w_sel[exact] = 0.0
+        w_sel[exact, 0] = 1.0
+
+    if (~exact).any():
+        nz = ~exact
+        inv = 1.0 / torch.clamp(d_sel[nz], min=eps)
+        inv_sum = inv.sum(dim=1, keepdim=True)
+        w_norm = inv / (inv_sum + eps)
+        w_sel[nz] = torch.nan_to_num(w_norm, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return w_sel
+
+
+@torch.no_grad()
+def _build_idw_map_exact(
+    dst_xy: torch.Tensor,
+    src_xy: torch.Tensor,
+    k: int = 8,
+    chunk: int = 8192,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
     N = int(dst_xy.shape[0])
     M = int(src_xy.shape[0])
     k = min(k, M)
+    if N == 0 or k <= 0:
+        dev = dst_xy.device
+        return (
+            torch.empty((N, 0), dtype=torch.long, device=dev),
+            torch.empty((N, 0), dtype=torch.float32, device=dev),
+        )
 
     idx_all, w_all = [], []
     for start in range(0, N, chunk):
@@ -211,21 +278,156 @@ def build_idw_map(
         d_sel = tk.values.contiguous()   # (b, k)
         i_sel = tk.indices.contiguous()  # (b, k)
 
-        # Weights: handle exact-hit rows with a one-hot
-        w_sel = torch.empty_like(d_sel)
-        exact = d_sel[:, 0] <= eps  # has at least one zero-distance neighbor
+        w_sel = _idw_weights_from_dist(d_sel, eps=eps)
 
-        if exact.any():
-            w_sel[exact] = 0.0
-            w_sel[exact, 0] = 1.0  # copy directly from the first exact neighbor
+        idx_all.append(i_sel)
+        w_all.append(w_sel)
 
-        if (~exact).any():
-            nz = ~exact
-            inv = 1.0 / torch.clamp(d_sel[nz], min=eps)   # avoid 1/0
-            inv_sum = inv.sum(dim=1, keepdim=True)
-            w_norm = inv / (inv_sum + eps)
-            w_sel[nz] = torch.nan_to_num(w_norm, nan=0.0, posinf=0.0, neginf=0.0)
+    return torch.cat(idx_all, dim=0), torch.cat(w_all, dim=0)
 
+
+@torch.no_grad()
+def _build_idw_map_faiss(
+    *,
+    dst_xy: torch.Tensor,
+    src_xy: torch.Tensor,
+    k: int,
+    chunk: int,
+    eps: float,
+    index_kind: str,
+    faiss_nlist: int,
+    faiss_nprobe: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    try:
+        import faiss  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "IDW backend requires faiss. Install faiss-gpu/faiss-cpu or switch backend to 'exact'."
+        ) from e
+
+    # Enables zero-copy torch tensor I/O when supported by the installed FAISS.
+    try:
+        import faiss.contrib.torch_utils  # type: ignore  # noqa: F401
+    except Exception:
+        pass
+
+    dst_xy = dst_xy.contiguous().to(dtype=torch.float32)
+    src_xy = src_xy.contiguous().to(dtype=torch.float32)
+    dev = dst_xy.device
+    if src_xy.device != dev:
+        src_xy = src_xy.to(dev)
+
+    N = int(dst_xy.shape[0])
+    M = int(src_xy.shape[0])
+    k = min(int(k), M)
+    if N == 0 or k <= 0:
+        return (
+            torch.empty((N, 0), dtype=torch.long, device=dev),
+            torch.empty((N, 0), dtype=torch.float32, device=dev),
+        )
+
+    dim = int(src_xy.shape[1])
+    if dim <= 0:
+        raise ValueError("src_xy must have shape (M, D) with D>0.")
+
+    use_gpu = (dev.type == "cuda")
+    faiss_index = None
+    torch_io_ok = False
+
+    if use_gpu:
+        gpu_id = dev.index if dev.index is not None else 0
+        res = faiss.StandardGpuResources()
+        if index_kind == "flat":
+            faiss_index = faiss.GpuIndexFlatL2(res, dim)
+        else:
+            if M < max(64, k * 8):
+                faiss_index = faiss.GpuIndexFlatL2(res, dim)
+            else:
+                nlist_eff = max(1, min(int(faiss_nlist), M))
+                quantizer = faiss.IndexFlatL2(dim)
+                cpu_ivf = faiss.IndexIVFFlat(quantizer, dim, nlist_eff, faiss.METRIC_L2)
+                faiss_index = faiss.index_cpu_to_gpu(res, gpu_id, cpu_ivf)
+                nprobe_eff = max(1, min(int(faiss_nprobe), nlist_eff))
+                try:
+                    faiss_index.nprobe = nprobe_eff
+                except Exception:
+                    try:
+                        faiss.ParameterSpace().set_index_parameter(faiss_index, "nprobe", nprobe_eff)
+                    except Exception:
+                        pass
+    else:
+        if index_kind == "flat":
+            faiss_index = faiss.IndexFlatL2(dim)
+        else:
+            if M < max(64, k * 8):
+                faiss_index = faiss.IndexFlatL2(dim)
+            else:
+                nlist_eff = max(1, min(int(faiss_nlist), M))
+                quantizer = faiss.IndexFlatL2(dim)
+                faiss_index = faiss.IndexIVFFlat(quantizer, dim, nlist_eff, faiss.METRIC_L2)
+                nprobe_eff = max(1, min(int(faiss_nprobe), nlist_eff))
+                try:
+                    faiss_index.nprobe = nprobe_eff
+                except Exception:
+                    try:
+                        faiss.ParameterSpace().set_index_parameter(faiss_index, "nprobe", nprobe_eff)
+                    except Exception:
+                        pass
+
+    assert faiss_index is not None
+
+    # Train only for IVF indexes.
+    if hasattr(faiss_index, "is_trained") and (not faiss_index.is_trained):
+        trained = False
+        try:
+            faiss_index.train(src_xy)
+            trained = True
+            torch_io_ok = True
+        except Exception:
+            pass
+        if not trained:
+            src_np = src_xy.detach().cpu().numpy()
+            faiss_index.train(src_np)
+            torch_io_ok = False
+
+    # Add source vectors.
+    try:
+        faiss_index.add(src_xy)
+        torch_io_ok = True
+    except Exception:
+        src_np = src_xy.detach().cpu().numpy()
+        faiss_index.add(src_np)
+        torch_io_ok = False
+
+    idx_all = []
+    w_all = []
+    for start in range(0, N, int(max(1, chunk))):
+        end = min(N, start + int(max(1, chunk)))
+        q = dst_xy[start:end]
+
+        if torch_io_ok:
+            try:
+                d2, idx = faiss_index.search(q, k)
+                if not torch.is_tensor(d2):
+                    d2 = torch.from_numpy(d2).to(device=dev)
+                if not torch.is_tensor(idx):
+                    idx = torch.from_numpy(idx).to(device=dev)
+            except Exception:
+                q_np = q.detach().cpu().numpy()
+                d2_np, idx_np = faiss_index.search(q_np, k)
+                d2 = torch.from_numpy(d2_np).to(device=dev)
+                idx = torch.from_numpy(idx_np).to(device=dev)
+                torch_io_ok = False
+        else:
+            q_np = q.detach().cpu().numpy()
+            d2_np, idx_np = faiss_index.search(q_np, k)
+            d2 = torch.from_numpy(d2_np).to(device=dev)
+            idx = torch.from_numpy(idx_np).to(device=dev)
+
+        d2 = torch.nan_to_num(d2, nan=float("inf"), posinf=float("inf"), neginf=float("inf"))
+        d_sel = torch.sqrt(torch.clamp_min(d2, 0.0))
+        i_sel = idx.to(dtype=torch.long, device=dev)
+        w_sel = _idw_weights_from_dist(d_sel, eps=eps)
         idx_all.append(i_sel)
         w_all.append(w_sel)
 
@@ -476,4 +678,3 @@ def parents_from_pos(centers: torch.Tensor,
     col = torch.floor((x - xmin) / dx).long().clamp_(0, W - 1)
     row = torch.floor((y - ymin) / dy).long().clamp_(0, H - 1)
     return row * W + col
-
