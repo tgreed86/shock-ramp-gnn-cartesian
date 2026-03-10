@@ -2164,6 +2164,10 @@ def _runtime_build_pred_mesh_from_state(
         "mesh_predict_s": 0.0,
         "mesh_materialize_s": 0.0,
         "wedge_clip_s": 0.0,
+        "wedge_lookup_classify_s": 0.0,
+        "wedge_lookup_refine_s": 0.0,
+        "wedge_edge_build_s": 0.0,
+        "wedge_legacy_geom_s": 0.0,
         "edge_attr_s": 0.0,
         "total_s": 0.0,
     }
@@ -2262,6 +2266,7 @@ def _runtime_build_pred_mesh_from_state(
             ).to(dev, dtype=torch.long)
 
     t_wedge_t0 = time.perf_counter()
+    wedge_timing: Dict[str, float] = {}
     pred_centers, pred_levels, parent_flat, pred_ei, mask_pred_parent = _clip_pred_mesh_to_wedge(
         pred_centers=pred_centers,
         pred_levels=pred_levels,
@@ -2272,8 +2277,13 @@ def _runtime_build_pred_mesh_from_state(
         wedge_path=wedge_path,
         cfg=cfg,
         device=dev,
+        timing_out=wedge_timing,
     )
     timing["wedge_clip_s"] = float(time.perf_counter() - t_wedge_t0)
+    timing["wedge_lookup_classify_s"] = float(wedge_timing.get("lookup_classify_s", 0.0))
+    timing["wedge_lookup_refine_s"] = float(wedge_timing.get("lookup_refine_s", 0.0))
+    timing["wedge_edge_build_s"] = float(wedge_timing.get("edge_build_s", 0.0))
+    timing["wedge_legacy_geom_s"] = float(wedge_timing.get("legacy_geom_s", 0.0))
 
     pred_centers = pred_centers.to(dev, dtype=torch.float32)
     pred_levels = pred_levels.to(dev, dtype=torch.long)
@@ -2852,6 +2862,10 @@ def train_one_epoch_multi_step(
         *,
         t_mesh_materialize_s: float,
         t_wedge_clip_s: float,
+        t_wedge_lookup_classify_s: float,
+        t_wedge_lookup_refine_s: float,
+        t_wedge_edge_build_s: float,
+        t_wedge_legacy_geom_s: float,
         t_edge_attr_s: float,
         t_idw_remap_s: float,
         n_rebuilds: int,
@@ -2881,6 +2895,10 @@ def train_one_epoch_multi_step(
             f"| idw_remap={float(t_idw_remap_s):.3f}s ({_pct(t_idw_remap_s):.1f}%) "
             f"| mesh_materialize={float(t_mesh_materialize_s):.3f}s ({_pct(t_mesh_materialize_s):.1f}%) "
             f"| wedge_clip={float(t_wedge_clip_s):.3f}s ({_pct(t_wedge_clip_s):.1f}%) "
+            f"| wedge_lookup_cls={float(t_wedge_lookup_classify_s):.3f}s ({_pct(t_wedge_lookup_classify_s):.1f}%) "
+            f"| wedge_lookup_refine={float(t_wedge_lookup_refine_s):.3f}s ({_pct(t_wedge_lookup_refine_s):.1f}%) "
+            f"| wedge_edge_build={float(t_wedge_edge_build_s):.3f}s ({_pct(t_wedge_edge_build_s):.1f}%) "
+            f"| wedge_legacy_geom={float(t_wedge_legacy_geom_s):.3f}s ({_pct(t_wedge_legacy_geom_s):.1f}%) "
             f"| edge_attr={float(t_edge_attr_s):.3f}s ({_pct(t_edge_attr_s):.1f}%) "
             f"| other={other:.3f}s ({_pct(other):.1f}%) "
             f"| rebuilds={int(n_rebuilds)}",
@@ -2904,6 +2922,10 @@ def train_one_epoch_multi_step(
 
         batch_rt_mesh_materialize_s = 0.0
         batch_rt_wedge_clip_s = 0.0
+        batch_rt_wedge_lookup_classify_s = 0.0
+        batch_rt_wedge_lookup_refine_s = 0.0
+        batch_rt_wedge_edge_build_s = 0.0
+        batch_rt_wedge_legacy_geom_s = 0.0
         batch_rt_edge_attr_s = 0.0
         batch_rt_idw_remap_s = 0.0
         batch_rt_rebuilds = 0
@@ -4061,6 +4083,18 @@ def train_one_epoch_multi_step(
                         batch_rt_rebuilds += 1
                         batch_rt_mesh_materialize_s += float(rebuild_timing.get("mesh_materialize_s", 0.0))
                         batch_rt_wedge_clip_s += float(rebuild_timing.get("wedge_clip_s", 0.0))
+                        batch_rt_wedge_lookup_classify_s += float(
+                            rebuild_timing.get("wedge_lookup_classify_s", 0.0)
+                        )
+                        batch_rt_wedge_lookup_refine_s += float(
+                            rebuild_timing.get("wedge_lookup_refine_s", 0.0)
+                        )
+                        batch_rt_wedge_edge_build_s += float(
+                            rebuild_timing.get("wedge_edge_build_s", 0.0)
+                        )
+                        batch_rt_wedge_legacy_geom_s += float(
+                            rebuild_timing.get("wedge_legacy_geom_s", 0.0)
+                        )
                         batch_rt_edge_attr_s += float(rebuild_timing.get("edge_attr_s", 0.0))
 
                         if k == 0:
@@ -4271,6 +4305,10 @@ def train_one_epoch_multi_step(
                 batch_wall,
                 t_mesh_materialize_s=batch_rt_mesh_materialize_s,
                 t_wedge_clip_s=batch_rt_wedge_clip_s,
+                t_wedge_lookup_classify_s=batch_rt_wedge_lookup_classify_s,
+                t_wedge_lookup_refine_s=batch_rt_wedge_lookup_refine_s,
+                t_wedge_edge_build_s=batch_rt_wedge_edge_build_s,
+                t_wedge_legacy_geom_s=batch_rt_wedge_legacy_geom_s,
                 t_edge_attr_s=batch_rt_edge_attr_s,
                 t_idw_remap_s=batch_rt_idw_remap_s,
                 n_rebuilds=batch_rt_rebuilds,

@@ -53,7 +53,7 @@
     "runtime_mesh": {
       "enabled": true,
       "warm_start_from_precompute": false,
-      "update_every_steps": 1,
+      "update_every_steps": 2,
       "detach_policy_input": true,
       "reset_to_coarse_each_step": true,
       "refine_only": true,

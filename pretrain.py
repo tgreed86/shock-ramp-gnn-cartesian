@@ -4,7 +4,7 @@
 # ---- rollout_precompute.py ----
 from __future__ import annotations
 from typing import Dict, List, Any
-import os, json, hashlib, torch
+import os, json, hashlib, time, torch
 import numpy as np
 import h5py
 import matplotlib.pyplot as plt
@@ -1648,83 +1648,110 @@ def build_amr_local_knn_edges(
     Returns undirected, self-loop free, deduplicated (2,E) int64 edge_index.
     MPS-safe (no unique(dim=...)).
     """
-    device = centers.device
+    out_device = centers.device
     N = int(centers.size(0))
     if N == 0:
-        return torch.empty(2, 0, dtype=torch.long, device=device)
+        return torch.empty(2, 0, dtype=torch.long, device=out_device)
 
-    # ensure CPU-friendly Python lists for buckets
-    pf = parents_flat.long().view(-1)
-    buckets = [[] for _ in range(H * W)]
-    # only keep valid parents
-    valid_mask = (pf >= 0) & (pf < H * W)
-    valid_idx = torch.nonzero(valid_mask, as_tuple=False).view(-1).tolist()
-    for i in valid_idx:
-        p = int(pf[i].item())
-        buckets[p].append(i)
+    # On accelerator backends (cuda/mps), this routine is Python-loop heavy and
+    # uses many small cdist/topk blocks; CPU execution is often faster and safer.
+    use_cpu = (out_device.type != "cpu")
+    work_device = torch.device("cpu") if use_cpu else out_device
+    centers_w = centers.to(device=work_device, dtype=torch.float32)
+    pf = parents_flat.to(device=work_device, dtype=torch.long).view(-1)
 
-    def neigh_parents(p):
+    valid_mask = (pf >= 0) & (pf < (H * W))
+    valid_idx = torch.nonzero(valid_mask, as_tuple=False).view(-1)
+    if valid_idx.numel() == 0:
+        return torch.empty(2, 0, dtype=torch.long, device=out_device)
+
+    pf_valid = pf.index_select(0, valid_idx)
+    order = torch.argsort(pf_valid)
+    pf_sorted = pf_valid.index_select(0, order)
+    idx_sorted = valid_idx.index_select(0, order)
+
+    counts = torch.bincount(pf_sorted, minlength=H * W)
+    offsets = torch.zeros(H * W + 1, dtype=torch.long, device=work_device)
+    offsets[1:] = torch.cumsum(counts, dim=0)
+    active_parents = torch.nonzero(counts > 0, as_tuple=False).view(-1)
+
+    def _slice_for_parent(p: int) -> torch.Tensor:
+        s = int(offsets[p].item())
+        e = int(offsets[p + 1].item())
+        if e <= s:
+            return idx_sorted.new_empty((0,), dtype=torch.long)
+        return idx_sorted[s:e]
+
+    def _neighbor_parents(p: int) -> list[int]:
         r, c = divmod(p, W)
         out = [p]
-        if c > 0:      out.append(p - 1)
-        if c + 1 < W:  out.append(p + 1)
-        if r > 0:      out.append(p - W)
-        if r + 1 < H:  out.append(p + W)
+        if c > 0:
+            out.append(p - 1)
+        if c + 1 < W:
+            out.append(p + 1)
+        if r > 0:
+            out.append(p - W)
+        if r + 1 < H:
+            out.append(p + W)
         return out
 
-    rows, cols = [], []
-    for p in range(H * W):
-        src_idx = buckets[p]
-        if not src_idx:
-            continue
-        cand_idx = []
-        for q in neigh_parents(p):
-            cand_idx.extend(buckets[q])
-        if len(cand_idx) <= 1:
+    rows_parts: list[torch.Tensor] = []
+    cols_parts: list[torch.Tensor] = []
+    k_take = int(max(1, k_local + 1))
+
+    for p in active_parents.tolist():
+        src_idx = _slice_for_parent(int(p))
+        if src_idx.numel() == 0:
             continue
 
-        # cap candidate set to keep cdist small
-        if len(cand_idx) > max_local:
-            cand_idx = cand_idx[:max_local]
+        cand_parts = []
+        for q in _neighbor_parents(int(p)):
+            part = _slice_for_parent(int(q))
+            if part.numel() > 0:
+                cand_parts.append(part)
+        if len(cand_parts) == 0:
+            continue
+        cand_idx = torch.cat(cand_parts, dim=0)
+        if cand_idx.numel() <= 1:
+            continue
+        if int(cand_idx.numel()) > int(max_local):
+            cand_idx = cand_idx[: int(max_local)]
 
-        S = centers[torch.as_tensor(src_idx, device=device, dtype=torch.long)]  # (S,2)
-        C = centers[torch.as_tensor(cand_idx, device=device, dtype=torch.long)] # (M,2)
-        D = torch.cdist(S, C)                                                   # (S,M)
-        k = min(k_local + 1, C.size(0))  # +1 to drop self if present
-        nbr = torch.topk(D, k, largest=False).indices                           # (S,k)
+        S = centers_w.index_select(0, src_idx)   # (S,2)
+        C = centers_w.index_select(0, cand_idx)  # (M,2)
+        D = torch.cdist(S, C)                    # (S,M)
+        k_eff = min(k_take, int(C.size(0)))
+        nbr_pos = torch.topk(D, k_eff, largest=False).indices  # (S,k_eff)
 
-        # append pairs
-        for a in range(nbr.size(0)):
-            i_src = src_idx[a]
-            for pos in nbr[a].tolist():
-                j_cand = cand_idx[pos]
-                if j_cand == i_src:  # drop self here
-                    continue
-                rows.append(i_src)
-                cols.append(j_cand)
+        nbr_idx = cand_idx.index_select(0, nbr_pos.reshape(-1)).view(src_idx.size(0), k_eff)
+        src_rep = src_idx.view(-1, 1).expand(-1, k_eff)
+        keep = (nbr_idx != src_rep)
+        if keep.any():
+            rows_parts.append(src_rep[keep])
+            cols_parts.append(nbr_idx[keep])
 
-    if not rows:
-        return torch.empty(2, 0, dtype=torch.long, device=device)
+    if len(rows_parts) == 0:
+        return torch.empty(2, 0, dtype=torch.long, device=out_device)
 
-    u0 = torch.tensor(rows, dtype=torch.long, device=device)
-    v0 = torch.tensor(cols, dtype=torch.long, device=device)
+    u0 = torch.cat(rows_parts, dim=0).to(torch.long)
+    v0 = torch.cat(cols_parts, dim=0).to(torch.long)
 
-    # make undirected correctly (use copies, not the mutated tensors)
+    # make undirected
     u = torch.cat([u0, v0], dim=0)
     v = torch.cat([v0, u0], dim=0)
 
-    # drop any (rare) self-loops
-    mask = (u != v)
-    if not mask.any():
-        return torch.empty(2, 0, dtype=torch.long, device=device)
-    u = u[mask]; v = v[mask]
+    # drop self loops
+    keep = (u != v)
+    if not keep.any():
+        return torch.empty(2, 0, dtype=torch.long, device=out_device)
+    u = u[keep]
+    v = v[keep]
 
-    # MPS-safe dedup on CPU using 1-D keys
-    keys = (u.to(torch.int64) * N + v.to(torch.int64)).to("cpu")
-    keys = torch.unique(keys)  # 1-D unique is supported
-    u = (keys // N).to(device, torch.long)
-    v = (keys %  N).to(device, torch.long)
-
+    # dedup directed edges via 1-D keys (CPU unique is robust/safe)
+    keys = (u.to(torch.int64) * int(N) + v.to(torch.int64)).to("cpu")
+    keys = torch.unique(keys)
+    u = (keys // int(N)).to(out_device, torch.long)
+    v = (keys % int(N)).to(out_device, torch.long)
     return torch.stack([u, v], dim=0)
 
 
@@ -2032,6 +2059,7 @@ def _clip_pred_mesh_to_wedge(
     wedge_path,                     # matplotlib.path.Path or None
     cfg: Dict[str, Any],
     device: torch.device | str,
+    timing_out: Dict[str, float] | None = None,
 ):
     """
     Restrict a predicted mesh to the wedge domain, with optional boundary refinement.
@@ -2045,6 +2073,13 @@ def _clip_pred_mesh_to_wedge(
     """
     dev = torch.device(device)
 
+    timing = {
+        "lookup_classify_s": 0.0,
+        "lookup_refine_s": 0.0,
+        "edge_build_s": 0.0,
+        "legacy_geom_s": 0.0,
+    }
+
     # Normalize parents to flat long
     parent_flat = pred_parents.view(-1).long().to(pred_centers.device)
 
@@ -2054,6 +2089,9 @@ def _clip_pred_mesh_to_wedge(
         else:
             pred_ei = pred_ei.to(dev, dtype=torch.long)
         mask_pred_parent = _mask_from_parents(parent_flat, H, W)
+        if isinstance(timing_out, dict):
+            timing_out.clear()
+            timing_out.update(timing)
         return pred_centers, pred_levels, parent_flat, pred_ei, mask_pred_parent
 
     pol = cfg.get("policy", {})
@@ -2072,6 +2110,7 @@ def _clip_pred_mesh_to_wedge(
     did_fast_clip = False
 
     if use_lookup:
+        t_cls0 = time.perf_counter()
         lookup = _get_wedge_clip_level_lookup(
             wedge_path=wedge_path,
             H=H,
@@ -2107,8 +2146,10 @@ def _clip_pred_mesh_to_wedge(
         col = col[keep0]
         lvl = lvl[keep0]
         parent_flat = parent_flat[keep0]
+        timing["lookup_classify_s"] += float(time.perf_counter() - t_cls0)
 
         # ---------- Step 2 (lookup): refine boundary-crossing cells ----------
+        t_ref0 = time.perf_counter()
         for _ in range(Lmax + 1):
             fully_inside = _lookup_mask_values_by_level(
                 full_by_level, levels=lvl, row=row, col=col
@@ -2126,8 +2167,10 @@ def _clip_pred_mesh_to_wedge(
                 refine_mask=refine_mask,
                 refine_ratio=rr,
             )
+        timing["lookup_refine_s"] += float(time.perf_counter() - t_ref0)
 
         # ---------- Step 3 (lookup): final strict keep ----------
+        t_cls1 = time.perf_counter()
         fully_inside = _lookup_mask_values_by_level(
             full_by_level, levels=lvl, row=row, col=col
         )
@@ -2153,8 +2196,10 @@ def _clip_pred_mesh_to_wedge(
             refine_ratio=rr,
         ).to(pred_centers.device, dtype=pred_centers.dtype)
         did_fast_clip = True
+        timing["lookup_classify_s"] += float(time.perf_counter() - t_cls1)
 
     if not did_fast_clip:
+        t_legacy0 = time.perf_counter()
         # ---------- Step 1: keep cells that intersect the wedge ----------
         center_inside = _path_contains_points_torch(wedge_path, pred_centers, radius=radius)
 
@@ -2217,8 +2262,10 @@ def _clip_pred_mesh_to_wedge(
                 "After boundary refinement, no fully-inside cells remained. "
                 "This usually means Lmax is too low for the wedge geometry or the wedge/bbox mismatch."
             )
+        timing["legacy_geom_s"] += float(time.perf_counter() - t_legacy0)
 
     # ---------- Step 4: rebuild edges + mask ----------
+    t_edge0 = time.perf_counter()
     k_local   = int(cfg.get("edges", {}).get("k_local", 4))
     max_local = int(cfg.get("edges", {}).get("max_local", 2048))
 
@@ -2246,9 +2293,12 @@ def _clip_pred_mesh_to_wedge(
         ).to(dev, dtype=torch.long)
     if pred_ei.numel() == 0 or int(pred_ei.shape[1]) == 0:
         raise RuntimeError("Empty edge_index after wedge clipping/refinement.")
+    timing["edge_build_s"] += float(time.perf_counter() - t_edge0)
 
     mask_pred_parent = _mask_from_parents(parent_flat, H, W)
-
+    if isinstance(timing_out, dict):
+        timing_out.clear()
+        timing_out.update(timing)
     return pred_centers, pred_levels, parent_flat, pred_ei, mask_pred_parent
 
 
