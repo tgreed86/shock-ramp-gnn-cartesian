@@ -59,7 +59,7 @@
       "reset_to_coarse_each_step": true,
       "refine_only": true,
       "max_cells_per_step": 500000,
-      "policy_backend": "cnn",
+      "policy_backend": "gradient",
       "cnn": {
         "checkpoint_path": "./runs_mesh_policy_cnn/without_parent_masks/unet_hierarchical/500ep_lr-scheduler_3-6-26/mesh_policy_cnn_last.pt",
         "include_parent_mask": false,

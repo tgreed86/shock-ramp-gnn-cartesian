@@ -1445,6 +1445,8 @@ def _runtime_idw_backend_settings(
     allow_fallback = bool(idw_cfg.get("allow_fallback_to_exact", True))
     faiss_nlist = max(1, int(idw_cfg.get("faiss_nlist", 256)))
     faiss_nprobe = max(1, int(idw_cfg.get("faiss_nprobe", 16)))
+    faiss_cache = bool(idw_cfg.get("faiss_cache", True))
+    faiss_cache_max_entries = max(1, int(idw_cfg.get("faiss_cache_max_entries", 4)))
 
     out_dev = torch.device(out_device)
     if backend in ("faiss_flat", "faiss_ivf"):
@@ -1484,6 +1486,8 @@ def _runtime_idw_backend_settings(
     if backend in ("faiss_flat", "faiss_ivf"):
         backend_kwargs["faiss_nlist"] = int(faiss_nlist)
         backend_kwargs["faiss_nprobe"] = int(faiss_nprobe)
+        backend_kwargs["faiss_cache"] = bool(faiss_cache)
+        backend_kwargs["faiss_cache_max_entries"] = int(faiss_cache_max_entries)
     return backend, backend_kwargs
 
 
@@ -2044,6 +2048,26 @@ def _runtime_sort_unique_leaf_ij(
     lv = levels.view(-1).long()
     rv = row.view(-1).long()
     cv = col.view(-1).long()
+
+    # Use the original unique-dim path on backends that support it (CUDA/CPU),
+    # and keep a key-sort fallback for MPS where unique_dim is not implemented.
+    if lv.device.type != "mps":
+        trip = torch.stack([lv, rv, cv], dim=1)
+        trip = torch.unique(trip, dim=0)
+        lv_u = trip[:, 0].contiguous()
+        rv_u = trip[:, 1].contiguous()
+        cv_u = trip[:, 2].contiguous()
+        key = _cell_keys_level_ij(
+            levels=lv_u,
+            row=rv_u,
+            col=cv_u,
+            H=H,
+            W=W,
+            refine_ratio=refine_ratio,
+        )
+        order = torch.argsort(key)
+        return lv_u[order], rv_u[order], cv_u[order]
+
     key = _cell_keys_level_ij(
         levels=lv,
         row=rv,
@@ -3521,12 +3545,8 @@ def train_one_epoch_multi_step(
         batch_idx: int,
         batch_wall_s: float,
         *,
+        t_mesh_predict_s: float,
         t_mesh_materialize_s: float,
-        t_wedge_clip_s: float,
-        t_wedge_lookup_classify_s: float,
-        t_wedge_lookup_refine_s: float,
-        t_wedge_edge_build_s: float,
-        t_wedge_legacy_geom_s: float,
         t_edge_attr_s: float,
         t_idw_remap_s: float,
         n_rebuilds: int,
@@ -3536,8 +3556,8 @@ def train_one_epoch_multi_step(
         bi = int(batch_idx) + 1
         total = float(max(batch_wall_s, 1e-12))
         accounted = (
-            float(t_mesh_materialize_s)
-            + float(t_wedge_clip_s)
+            float(t_mesh_predict_s)
+            + float(t_mesh_materialize_s)
             + float(t_edge_attr_s)
             + float(t_idw_remap_s)
         )
@@ -3553,16 +3573,21 @@ def train_one_epoch_multi_step(
 
         print(
             f"{prefix} wall={total:.3f}s "
-            f"| idw_remap={float(t_idw_remap_s):.3f}s ({_pct(t_idw_remap_s):.1f}%) "
             f"| mesh_materialize={float(t_mesh_materialize_s):.3f}s ({_pct(t_mesh_materialize_s):.1f}%) "
-            f"| wedge_constraints_total={float(t_wedge_clip_s):.3f}s ({_pct(t_wedge_clip_s):.1f}%) "
-            f"| wedge_leaf_filter_lookup={float(t_wedge_lookup_classify_s):.3f}s ({_pct(t_wedge_lookup_classify_s):.1f}%) "
-            f"| wedge_parent_mask_constraints={float(t_wedge_lookup_refine_s):.3f}s ({_pct(t_wedge_lookup_refine_s):.1f}%) "
-            f"| wedge_postfilter_edge_build={float(t_wedge_edge_build_s):.3f}s ({_pct(t_wedge_edge_build_s):.1f}%) "
-            f"| wedge_legacy_geom_fallback={float(t_wedge_legacy_geom_s):.3f}s ({_pct(t_wedge_legacy_geom_s):.1f}%) "
+            f"| idw_remap={float(t_idw_remap_s):.3f}s ({_pct(t_idw_remap_s):.1f}%) "
             f"| edge_attr={float(t_edge_attr_s):.3f}s ({_pct(t_edge_attr_s):.1f}%) "
             f"| other={other:.3f}s ({_pct(other):.1f}%) "
             f"| rebuilds={int(n_rebuilds)}",
+            flush=True,
+        )
+        if total_batches > 0:
+            mesh_prefix = f"[RUNTIME-MESH-PREDICT] train batch {bi}/{total_batches}"
+        else:
+            mesh_prefix = f"[RUNTIME-MESH-PREDICT] train batch {bi}"
+        mesh_per_rebuild = float(t_mesh_predict_s) / float(max(1, int(n_rebuilds)))
+        print(
+            f"{mesh_prefix} total={float(t_mesh_predict_s):.3f}s ({_pct(t_mesh_predict_s):.1f}%) "
+            f"| per_rebuild={mesh_per_rebuild:.3f}s | rebuilds={int(n_rebuilds)}",
             flush=True,
         )
 
@@ -3581,12 +3606,8 @@ def train_one_epoch_multi_step(
         if batch_dbg:
             print(f"[HANG-DBG] batch fetched: idx={batch_idx}", flush=True)
 
+        batch_rt_mesh_predict_s = 0.0
         batch_rt_mesh_materialize_s = 0.0
-        batch_rt_wedge_clip_s = 0.0
-        batch_rt_wedge_lookup_classify_s = 0.0
-        batch_rt_wedge_lookup_refine_s = 0.0
-        batch_rt_wedge_edge_build_s = 0.0
-        batch_rt_wedge_legacy_geom_s = 0.0
         batch_rt_edge_attr_s = 0.0
         batch_rt_idw_remap_s = 0.0
         batch_rt_rebuilds = 0
@@ -4745,20 +4766,8 @@ def train_one_epoch_multi_step(
                         )
                         t_rebuild_s = time.perf_counter() - t_rebuild_t0
                         batch_rt_rebuilds += 1
+                        batch_rt_mesh_predict_s += float(rebuild_timing.get("mesh_predict_s", 0.0))
                         batch_rt_mesh_materialize_s += float(rebuild_timing.get("mesh_materialize_s", 0.0))
-                        batch_rt_wedge_clip_s += float(rebuild_timing.get("wedge_clip_s", 0.0))
-                        batch_rt_wedge_lookup_classify_s += float(
-                            rebuild_timing.get("wedge_lookup_classify_s", 0.0)
-                        )
-                        batch_rt_wedge_lookup_refine_s += float(
-                            rebuild_timing.get("wedge_lookup_refine_s", 0.0)
-                        )
-                        batch_rt_wedge_edge_build_s += float(
-                            rebuild_timing.get("wedge_edge_build_s", 0.0)
-                        )
-                        batch_rt_wedge_legacy_geom_s += float(
-                            rebuild_timing.get("wedge_legacy_geom_s", 0.0)
-                        )
                         batch_rt_edge_attr_s += float(rebuild_timing.get("edge_attr_s", 0.0))
 
                         if k == 0:
@@ -4967,12 +4976,8 @@ def train_one_epoch_multi_step(
             _maybe_print_runtime_mesh_batch_breakdown(
                 batch_idx,
                 batch_wall,
+                t_mesh_predict_s=batch_rt_mesh_predict_s,
                 t_mesh_materialize_s=batch_rt_mesh_materialize_s,
-                t_wedge_clip_s=batch_rt_wedge_clip_s,
-                t_wedge_lookup_classify_s=batch_rt_wedge_lookup_classify_s,
-                t_wedge_lookup_refine_s=batch_rt_wedge_lookup_refine_s,
-                t_wedge_edge_build_s=batch_rt_wedge_edge_build_s,
-                t_wedge_legacy_geom_s=batch_rt_wedge_legacy_geom_s,
                 t_edge_attr_s=batch_rt_edge_attr_s,
                 t_idw_remap_s=batch_rt_idw_remap_s,
                 n_rebuilds=batch_rt_rebuilds,
@@ -6714,6 +6719,8 @@ def main(config_path: str | None = None, out_dir: str | None = None):
     runtime_mesh_idw_cfg.setdefault("backend", "exact")
     runtime_mesh_idw_cfg.setdefault("faiss_nlist", 256)
     runtime_mesh_idw_cfg.setdefault("faiss_nprobe", 16)
+    runtime_mesh_idw_cfg.setdefault("faiss_cache", True)
+    runtime_mesh_idw_cfg.setdefault("faiss_cache_max_entries", 4)
     runtime_mesh_idw_cfg.setdefault("allow_fallback_to_exact", True)
     runtime_mesh_cnn_cfg = runtime_mesh_cfg.setdefault("cnn", {})
     if not isinstance(runtime_mesh_cnn_cfg, dict):
