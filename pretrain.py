@@ -642,7 +642,13 @@ def _normalize_builder_output_to_mesh(
         jj     = torch.as_tensor([c["j"]     for c in out], dtype=torch.int64, device=device).view(-1)
 
         centers = _centers_from_level_ij(
-            levels, ii, jj, H=H, W=W, bbox=bbox, device=device, refine_ratio=rr
+            levels=levels,
+            row=jj,
+            col=ii,
+            H=H,
+            W=W,
+            bbox=bbox,
+            refine_ratio=rr,
         ).to(dtype=torch.float32)
 
         # Parents: coarse parent index on level-0 grid.

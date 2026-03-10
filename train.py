@@ -20,7 +20,7 @@ Also produces qualitative PDFs of feature fields per sample using
 from __future__ import annotations
 print("[train.py] module import started", flush=True)
 from typing import Dict, Any, List, Tuple, Optional, Sequence
-import os, io, json, time, zipfile, random, sys, csv, datetime
+import os, io, json, time, zipfile, random, sys, csv, datetime, hashlib
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler, Subset
@@ -40,11 +40,14 @@ from pretrain import (
     precompute_pred_mesh_and_interps_for_rollout,
     CollateWithPrecompute,
     CollateWithDtOnly,
+    _build_starting_mesh_from_spec,
     build_amr_face_adjacency_edges,
     build_amr_local_knn_edges,
     dec_edge_attr_for_dyadic_quads,
     _clip_pred_mesh_to_wedge,
     _load_wedge_path_from_spec,
+    _get_wedge_clip_level_lookup,
+    _lookup_level_masks_on_device,
 )
 
 from utils.precomp_h5 import LazyPrecompH5
@@ -1719,6 +1722,604 @@ def _cell_keys_level_ij(
     return key.to(torch.long)
 
 
+_RUNTIME_WEDGE_CONSTRAINTS_CACHE: Dict[str, Dict[str, Any]] = {}
+_RUNTIME_BASE_MESH_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _runtime_lookup_mask_values_by_level(
+    mask_by_level: Dict[int, torch.Tensor],
+    *,
+    levels: torch.Tensor,
+    row: torch.Tensor,
+    col: torch.Tensor,
+) -> torch.Tensor:
+    lv = levels.view(-1).long()
+    rv = row.view(-1).long()
+    cv = col.view(-1).long()
+    out = torch.zeros(lv.shape[0], dtype=torch.bool, device=lv.device)
+    if lv.numel() == 0:
+        return out
+    lmin = int(lv.min().item())
+    lmax = int(lv.max().item())
+    for Lint in range(lmin, lmax + 1):
+        if Lint not in mask_by_level:
+            continue
+        sel = (lv == Lint)
+        if not bool(sel.any()):
+            continue
+        M = mask_by_level[Lint]
+        out[sel] = M[rv[sel], cv[sel]]
+    return out
+
+
+def _runtime_wedge_constraints_cache_key(
+    *,
+    wedge_path,
+    cfg: Dict[str, Any],
+    H: int,
+    W: int,
+    device: torch.device,
+) -> str:
+    verts = np.asarray(wedge_path.vertices, dtype=np.float64)
+    vhash = hashlib.sha1(verts.tobytes()).hexdigest()[:20]
+    bbox = _get_bbox(cfg)
+    xmin, xmax, ymin, ymax = [float(v) for v in bbox]
+    rr = _get_refine_ratio(cfg)
+    Lmax = int((cfg.get("policy", {}) or {}).get("max_level", 3))
+    dev = torch.device(device)
+    dkey = f"{dev.type}:{dev.index if dev.index is not None else -1}"
+    return (
+        f"v={vhash}|H={int(H)}|W={int(W)}|Lmax={int(Lmax)}|rr={int(rr)}|"
+        f"bbox={xmin:.16g},{xmax:.16g},{ymin:.16g},{ymax:.16g}|dev={dkey}"
+    )
+
+
+def _get_runtime_wedge_constraints(
+    *,
+    cfg: Dict[str, Any],
+    H: int,
+    W: int,
+    device: torch.device,
+    wedge_path,
+) -> Dict[str, Any]:
+    key = _runtime_wedge_constraints_cache_key(
+        wedge_path=wedge_path,
+        cfg=cfg,
+        H=H,
+        W=W,
+        device=device,
+    )
+    got = _RUNTIME_WEDGE_CONSTRAINTS_CACHE.get(key, None)
+    if got is not None:
+        return got
+
+    pol = cfg.get("policy", {}) or {}
+    Lmax = int(pol.get("max_level", 3))
+    rr = _get_refine_ratio(cfg)
+    bbox = _get_bbox(cfg)
+    xspan = float(bbox[1] - bbox[0])
+    yspan = float(bbox[3] - bbox[2])
+    radius = float(pol.get("wedge_clip_radius", 1e-9 * max(xspan, yspan)))
+    dev = torch.device(device)
+
+    lookup = _get_wedge_clip_level_lookup(
+        wedge_path=wedge_path,
+        H=H,
+        W=W,
+        Lmax=Lmax,
+        refine_ratio=rr,
+        bbox=bbox,
+        radius=radius,
+    )
+    full_by_level, intersect_by_level = _lookup_level_masks_on_device(lookup, dev)
+
+    leaf_full: Dict[int, torch.Tensor] = {}
+    parent_intersect: Dict[int, torch.Tensor] = {}
+    parent_boundary: Dict[int, torch.Tensor] = {}
+
+    for l in range(0, Lmax + 1):
+        leaf_full[l] = full_by_level[l].to(device=dev, dtype=torch.bool)
+    for L in range(1, Lmax + 1):
+        l = L - 1
+        inter = intersect_by_level[l].to(device=dev, dtype=torch.bool)
+        full = full_by_level[l].to(device=dev, dtype=torch.bool)
+        parent_intersect[L] = inter
+        # Cells that intersect but are not fully inside are always refined.
+        parent_boundary[L] = inter & (~full)
+
+    out = {
+        "max_level": int(Lmax),
+        "refine_ratio": int(rr),
+        "bbox": tuple(float(v) for v in bbox),
+        "leaf_full": leaf_full,
+        "parent_intersect": parent_intersect,
+        "parent_boundary": parent_boundary,
+    }
+    _RUNTIME_WEDGE_CONSTRAINTS_CACHE[key] = out
+    print(
+        f"[RUNTIME-WEDGE] built static constraints (H={int(H)} W={int(W)} Lmax={int(Lmax)} rr={int(rr)})",
+        flush=True,
+    )
+    return out
+
+
+def _runtime_apply_wedge_constraints_to_masks(
+    *,
+    masks_by_level: Dict[int, torch.Tensor],
+    constraints: Dict[str, Any],
+) -> Dict[int, torch.Tensor]:
+    rr = int(constraints["refine_ratio"])
+    Lmax = int(constraints["max_level"])
+    out: Dict[int, torch.Tensor] = {}
+
+    for L in range(1, Lmax + 1):
+        inter = constraints["parent_intersect"][L]
+        boundary = constraints["parent_boundary"][L]
+
+        m = masks_by_level.get(L, None)
+        if m is None:
+            m = torch.zeros_like(inter, dtype=torch.bool)
+        else:
+            m = m.to(device=inter.device, dtype=torch.bool)
+        if tuple(m.shape) != tuple(inter.shape):
+            raise RuntimeError(
+                f"Runtime wedge constraint shape mismatch at L={L}: "
+                f"mask={tuple(m.shape)} expected={tuple(inter.shape)}"
+            )
+
+        # Keep only intersecting parents and force boundary parents to refine.
+        m = (m & inter) | boundary
+
+        # Enforce hierarchy consistency.
+        if L > 1:
+            allow = F.interpolate(
+                out[L - 1].float().unsqueeze(0).unsqueeze(0),
+                scale_factor=float(rr),
+                mode="nearest",
+            )[0, 0].to(torch.bool)
+            m = m & allow[: m.shape[0], : m.shape[1]]
+
+        out[L] = m
+
+    return out
+
+
+def _runtime_filter_mesh_with_wedge_constraints(
+    *,
+    pred_centers: torch.Tensor,
+    pred_levels: torch.Tensor,
+    parent_flat: torch.Tensor,
+    cfg: Dict[str, Any],
+    H: int,
+    W: int,
+    device: torch.device,
+    constraints: Dict[str, Any],
+    timing_out: Dict[str, float] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    dev = torch.device(device)
+    timing = {"lookup_classify_s": 0.0, "edge_build_s": 0.0}
+
+    rr = int(constraints["refine_ratio"])
+    bbox = tuple(constraints["bbox"])
+    leaf_full: Dict[int, torch.Tensor] = constraints["leaf_full"]
+
+    t_cls0 = time.perf_counter()
+    row, col = _cell_level_ij_from_centers(
+        centers=pred_centers,
+        levels=pred_levels,
+        H=H,
+        W=W,
+        bbox=bbox,
+        refine_ratio=rr,
+    )
+    lvl = pred_levels.view(-1).long()
+    keep = _runtime_lookup_mask_values_by_level(leaf_full, levels=lvl, row=row, col=col)
+    pred_centers = pred_centers[keep]
+    pred_levels = pred_levels[keep]
+    parent_flat = parent_flat[keep]
+    timing["lookup_classify_s"] = float(time.perf_counter() - t_cls0)
+
+    if pred_centers.numel() == 0:
+        raise RuntimeError(
+            "Runtime wedge constrained mesh became empty after full-cell filter."
+        )
+
+    t_edge0 = time.perf_counter()
+    edge_method = str(cfg.get("edges", {}).get("method", "amr_local_knn")).lower()
+    if ("face" in edge_method):
+        pred_ei = build_amr_face_adjacency_edges(
+            pred_centers,
+            pred_levels,
+            H,
+            W,
+            bbox=bbox,
+            return_edge_attr=False,
+            refine_ratio=rr,
+        ).to(dev, dtype=torch.long)
+    else:
+        pred_ei = build_amr_local_knn_edges(
+            pred_centers,
+            parent_flat,
+            H,
+            W,
+            k_local=int(cfg.get("edges", {}).get("k_local", 4)),
+            max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
+        ).to(dev, dtype=torch.long)
+    if pred_ei.numel() == 0 or int(pred_ei.shape[1]) == 0:
+        raise RuntimeError("Empty edge_index after runtime wedge-constrained filtering.")
+    timing["edge_build_s"] = float(time.perf_counter() - t_edge0)
+
+    mask_pred_parent = _mask_from_parent_indices(parent_flat, H, W, dev)
+    if isinstance(timing_out, dict):
+        timing_out.clear()
+        timing_out.update(timing)
+    return pred_centers, pred_levels, parent_flat, pred_ei, mask_pred_parent
+
+
+def _runtime_base_mesh_cache_key(
+    *,
+    mesh_spec_path: str,
+    cfg: Dict[str, Any],
+    H: int,
+    W: int,
+    device: torch.device,
+) -> str:
+    st = os.stat(mesh_spec_path)
+    bbox = _get_bbox(cfg)
+    xmin, xmax, ymin, ymax = [float(v) for v in bbox]
+    rr = _get_refine_ratio(cfg)
+    Lmax = int((cfg.get("policy", {}) or {}).get("max_level", 3))
+    dev = torch.device(device)
+    dkey = f"{dev.type}:{dev.index if dev.index is not None else -1}"
+    return (
+        f"path={os.path.abspath(mesh_spec_path)}|mtime_ns={int(st.st_mtime_ns)}|size={int(st.st_size)}|"
+        f"H={int(H)}|W={int(W)}|Lmax={int(Lmax)}|rr={int(rr)}|"
+        f"bbox={xmin:.16g},{xmax:.16g},{ymin:.16g},{ymax:.16g}|dev={dkey}"
+    )
+
+
+def _runtime_centers_from_level_ij(
+    *,
+    levels: torch.Tensor,
+    row: torch.Tensor,
+    col: torch.Tensor,
+    H: int,
+    W: int,
+    bbox: Tuple[float, float, float, float],
+    refine_ratio: int,
+) -> torch.Tensor:
+    if levels.numel() == 0:
+        return torch.empty((0, 2), dtype=torch.float32, device=levels.device)
+
+    dev = levels.device
+    lv = levels.view(-1).long()
+    rr = int(refine_ratio)
+    max_l = int(torch.clamp(lv.max(), min=0).item())
+    rr_pows = torch.tensor([rr ** i for i in range(max_l + 1)], device=dev, dtype=torch.float32)
+    ww_l = (float(W) * rr_pows).index_select(0, lv.clamp(0, max_l))
+    hh_l = (float(H) * rr_pows).index_select(0, lv.clamp(0, max_l))
+
+    xmin, xmax, ymin, ymax = [float(v) for v in bbox]
+    xs = float(xmax - xmin)
+    ys = float(ymax - ymin)
+    cx = float(xmin) + (col.to(torch.float32) + 0.5) * (xs / ww_l)
+    cy = float(ymin) + (row.to(torch.float32) + 0.5) * (ys / hh_l)
+    return torch.stack([cx, cy], dim=-1).to(dtype=torch.float32)
+
+
+def _runtime_parents_from_level_ij(
+    *,
+    levels: torch.Tensor,
+    row: torch.Tensor,
+    col: torch.Tensor,
+    H: int,
+    W: int,
+    refine_ratio: int,
+) -> torch.Tensor:
+    if levels.numel() == 0:
+        return torch.empty((0,), dtype=torch.long, device=levels.device)
+    lv = levels.view(-1).long()
+    rr = int(refine_ratio)
+    max_l = int(torch.clamp(lv.max(), min=0).item())
+    rr_pows = torch.tensor([rr ** i for i in range(max_l + 1)], device=levels.device, dtype=torch.long)
+    scale = rr_pows.index_select(0, lv.clamp(0, max_l))
+    i0 = torch.div(col.view(-1).long(), scale, rounding_mode="floor")
+    j0 = torch.div(row.view(-1).long(), scale, rounding_mode="floor")
+    return (j0 * int(W) + i0).to(torch.long)
+
+
+def _runtime_sort_unique_leaf_ij(
+    *,
+    levels: torch.Tensor,
+    row: torch.Tensor,
+    col: torch.Tensor,
+    H: int,
+    W: int,
+    refine_ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if levels.numel() == 0:
+        empty = torch.empty((0,), dtype=torch.long, device=levels.device)
+        return empty, empty, empty
+
+    lv = levels.view(-1).long()
+    rv = row.view(-1).long()
+    cv = col.view(-1).long()
+    key = _cell_keys_level_ij(
+        levels=lv,
+        row=rv,
+        col=cv,
+        H=H,
+        W=W,
+        refine_ratio=refine_ratio,
+    )
+    order = torch.argsort(key)
+    lv_s = lv[order]
+    rv_s = rv[order]
+    cv_s = cv[order]
+    key_s = key[order]
+    keep = torch.ones((key_s.numel(),), dtype=torch.bool, device=key_s.device)
+    if key_s.numel() > 1:
+        keep[1:] = key_s[1:] != key_s[:-1]
+    return lv_s[keep], rv_s[keep], cv_s[keep]
+
+
+def _runtime_refine_leaf_set_from_policy_masks(
+    *,
+    base_levels: torch.Tensor,
+    base_row: torch.Tensor,
+    base_col: torch.Tensor,
+    masks_by_level: Dict[int, torch.Tensor],
+    H: int,
+    W: int,
+    refine_ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    rr = int(refine_ratio)
+    if rr < 2:
+        raise ValueError(f"refine_ratio must be >=2, got {refine_ratio}")
+
+    if base_levels.numel() == 0:
+        raise RuntimeError("Runtime starting base mesh is empty.")
+
+    lv = base_levels.view(-1).long().clone()
+    row = base_row.view(-1).long().clone()
+    col = base_col.view(-1).long().clone()
+
+    Lmax = max((int(k) for k in masks_by_level.keys()), default=0)
+    for L in range(1, Lmax + 1):
+        m = masks_by_level.get(L, None)
+        if m is None:
+            continue
+        m = m.to(device=lv.device, dtype=torch.bool)
+        exp_h = H * (rr ** (L - 1))
+        exp_w = W * (rr ** (L - 1))
+        if tuple(m.shape) != (int(exp_h), int(exp_w)):
+            raise RuntimeError(
+                f"Runtime mask shape mismatch at L={L}: got={tuple(m.shape)} expected={(int(exp_h), int(exp_w))}"
+            )
+
+        parent_level = L - 1
+        sel_parent = (lv == parent_level)
+        if not bool(sel_parent.any()):
+            continue
+
+        idx_parent = torch.nonzero(sel_parent, as_tuple=False).view(-1)
+        refine_local = m[row[idx_parent], col[idx_parent]]
+        if not bool(refine_local.any()):
+            continue
+
+        idx_refine = idx_parent[refine_local]
+        keep = torch.ones((lv.shape[0],), dtype=torch.bool, device=lv.device)
+        keep[idx_refine] = False
+
+        pr = row[idx_refine]
+        pc = col[idx_refine]
+        n_ref = int(pr.numel())
+        child_count = rr * rr
+
+        offs = torch.arange(rr, device=lv.device, dtype=torch.long)
+        oy, ox = torch.meshgrid(offs, offs, indexing="ij")
+        oy = oy.reshape(1, child_count)
+        ox = ox.reshape(1, child_count)
+
+        child_row = pr.view(-1, 1) * rr + oy
+        child_col = pc.view(-1, 1) * rr + ox
+        child_lv = torch.full((n_ref, child_count), int(L), dtype=torch.long, device=lv.device)
+
+        lv = torch.cat([lv[keep], child_lv.reshape(-1)], dim=0)
+        row = torch.cat([row[keep], child_row.reshape(-1)], dim=0)
+        col = torch.cat([col[keep], child_col.reshape(-1)], dim=0)
+
+    return _runtime_sort_unique_leaf_ij(
+        levels=lv,
+        row=row,
+        col=col,
+        H=H,
+        W=W,
+        refine_ratio=rr,
+    )
+
+
+def _runtime_build_edges_from_mesh(
+    *,
+    pred_centers: torch.Tensor,
+    pred_levels: torch.Tensor,
+    parent_flat: torch.Tensor,
+    cfg: Dict[str, Any],
+    H: int,
+    W: int,
+    bbox: Tuple[float, float, float, float],
+    refine_ratio: int,
+    device: torch.device,
+) -> torch.Tensor:
+    dev = torch.device(device)
+    edge_method = str(cfg.get("edges", {}).get("method", "amr_local_knn")).lower()
+    if ("face" in edge_method):
+        pred_ei = build_amr_face_adjacency_edges(
+            pred_centers,
+            pred_levels,
+            H,
+            W,
+            bbox=bbox,
+            return_edge_attr=False,
+            refine_ratio=refine_ratio,
+        ).to(dev, dtype=torch.long)
+    else:
+        pred_ei = build_amr_local_knn_edges(
+            pred_centers,
+            parent_flat,
+            H,
+            W,
+            k_local=int(cfg.get("edges", {}).get("k_local", 4)),
+            max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
+        ).to(dev, dtype=torch.long)
+    if pred_ei.numel() == 0 or int(pred_ei.shape[1]) == 0:
+        raise RuntimeError("Empty edge_index for runtime mesh.")
+    return pred_ei
+
+
+def _get_runtime_starting_mesh_base(
+    *,
+    cfg: Dict[str, Any],
+    H: int,
+    W: int,
+    dx: float,
+    dy: float,
+    device: torch.device,
+    mesh_spec_path: str,
+) -> Dict[str, Any]:
+    key = _runtime_base_mesh_cache_key(
+        mesh_spec_path=mesh_spec_path,
+        cfg=cfg,
+        H=H,
+        W=W,
+        device=device,
+    )
+    got = _RUNTIME_BASE_MESH_CACHE.get(key, None)
+    if got is not None:
+        return got
+
+    dev = torch.device(device)
+    rr = _get_refine_ratio(cfg)
+    bbox = _get_bbox(cfg)
+
+    centers, levels, _parents, _ei, _mask_parent = _build_starting_mesh_from_spec(
+        mesh_spec_path,
+        cfg,
+        H,
+        W,
+        float(dx),
+        float(dy),
+        device=dev,
+    )
+    centers = centers.to(device=dev, dtype=torch.float32)
+    levels = levels.to(device=dev, dtype=torch.long).view(-1)
+
+    row, col = _cell_level_ij_from_centers(
+        centers=centers,
+        levels=levels,
+        H=H,
+        W=W,
+        bbox=bbox,
+        refine_ratio=rr,
+    )
+    levels, row, col = _runtime_sort_unique_leaf_ij(
+        levels=levels,
+        row=row,
+        col=col,
+        H=H,
+        W=W,
+        refine_ratio=rr,
+    )
+    parents = _runtime_parents_from_level_ij(
+        levels=levels,
+        row=row,
+        col=col,
+        H=H,
+        W=W,
+        refine_ratio=rr,
+    )
+    mask_parent = _mask_from_parent_indices(parents, H, W, dev)
+
+    out = {
+        "levels": levels,
+        "row": row,
+        "col": col,
+        "parents": parents,
+        "parent_mask": mask_parent,
+    }
+    _RUNTIME_BASE_MESH_CACHE[key] = out
+
+    lv_cpu = levels.detach().cpu()
+    if lv_cpu.numel() > 0:
+        uniq, cnt = torch.unique(lv_cpu, return_counts=True)
+        lv_summary = ", ".join([f"L{int(u)}={int(c)}" for u, c in zip(uniq.tolist(), cnt.tolist())])
+    else:
+        lv_summary = "empty"
+    print(
+        f"[RUNTIME-BASE-MESH] loaded from spec: cells={int(levels.numel())} ({lv_summary})",
+        flush=True,
+    )
+    return out
+
+
+def _runtime_build_mesh_from_starting_leaf_base(
+    *,
+    base_mesh: Dict[str, Any],
+    masks_by_level: Dict[int, torch.Tensor],
+    cfg: Dict[str, Any],
+    H: int,
+    W: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    dev = torch.device(device)
+    rr = _get_refine_ratio(cfg)
+    bbox = _get_bbox(cfg)
+
+    base_levels = base_mesh["levels"].to(device=dev, dtype=torch.long)
+    base_row = base_mesh["row"].to(device=dev, dtype=torch.long)
+    base_col = base_mesh["col"].to(device=dev, dtype=torch.long)
+
+    pred_levels, pred_row, pred_col = _runtime_refine_leaf_set_from_policy_masks(
+        base_levels=base_levels,
+        base_row=base_row,
+        base_col=base_col,
+        masks_by_level=masks_by_level,
+        H=H,
+        W=W,
+        refine_ratio=rr,
+    )
+    pred_centers = _runtime_centers_from_level_ij(
+        levels=pred_levels,
+        row=pred_row,
+        col=pred_col,
+        H=H,
+        W=W,
+        bbox=bbox,
+        refine_ratio=rr,
+    ).to(device=dev, dtype=torch.float32)
+    parent_flat = _runtime_parents_from_level_ij(
+        levels=pred_levels,
+        row=pred_row,
+        col=pred_col,
+        H=H,
+        W=W,
+        refine_ratio=rr,
+    ).to(device=dev, dtype=torch.long)
+    pred_ei = _runtime_build_edges_from_mesh(
+        pred_centers=pred_centers,
+        pred_levels=pred_levels,
+        parent_flat=parent_flat,
+        cfg=cfg,
+        H=H,
+        W=W,
+        bbox=bbox,
+        refine_ratio=rr,
+        device=dev,
+    )
+    mask_pred_parent = _mask_from_parent_indices(parent_flat, H, W, dev)
+    return pred_centers, pred_levels, parent_flat, pred_ei, mask_pred_parent
+
+
 def _map_pred_to_next_pred(pred_centers_src,
                            feats_src,
                            levels_src,
@@ -1920,6 +2521,20 @@ def _runtime_mesh_backend(cfg: Dict[str, Any]) -> str:
     if raw not in ("gradient", "cnn"):
         raise ValueError(
             f"train.runtime_mesh.policy_backend must be 'gradient' or 'cnn', got '{raw}'"
+        )
+    return raw
+
+
+def _runtime_mesh_domain_mode(cfg: Dict[str, Any]) -> str:
+    rt_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
+    raw = str(rt_cfg.get("domain_mode", "wedge_lookup")).strip().lower()
+    if raw in ("wedge", "lookup", "wedge_constraints", "wedge_lookup_constraints"):
+        raw = "wedge_lookup"
+    if raw in ("starting", "starting_base", "starting_mesh_base", "base_mesh"):
+        raw = "starting_mesh"
+    if raw not in ("wedge_lookup", "starting_mesh"):
+        raise ValueError(
+            f"train.runtime_mesh.domain_mode must be 'wedge_lookup' or 'starting_mesh', got '{raw}'"
         )
     return raw
 
@@ -2153,6 +2768,8 @@ def _runtime_build_pred_mesh_from_state(
     wedge_path,
     need_edge_attr: bool,
     runtime_mesh_policy: Dict[str, Any] | None = None,
+    runtime_wedge_constraints: Dict[str, Any] | None = None,
+    runtime_base_mesh: Dict[str, Any] | None = None,
     timing_out: Dict[str, float] | None = None,
 ):
     """
@@ -2175,6 +2792,7 @@ def _runtime_build_pred_mesh_from_state(
     dev = torch.device(device)
     rr = _get_refine_ratio(cfg)
     rt_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
+    domain_mode = _runtime_mesh_domain_mode(cfg)
     reset_each = bool(rt_cfg.get("reset_to_coarse_each_step", True))
     detach_policy_input = bool(rt_cfg.get("detach_policy_input", True))
 
@@ -2183,11 +2801,20 @@ def _runtime_build_pred_mesh_from_state(
     level_t = level_t.to(dev, dtype=torch.long).view(-1)
     parents_t = parents_t.to(dev, dtype=torch.long).view(-1)
 
-    if wedge_path is None:
-        raise RuntimeError("Runtime mesh mode requires wedge clipping; wedge_path is None.")
+    if domain_mode == "starting_mesh":
+        if runtime_base_mesh is None:
+            raise RuntimeError(
+                "Runtime mesh domain_mode='starting_mesh' requires runtime_base_mesh."
+            )
+    else:
+        if wedge_path is None and runtime_wedge_constraints is None:
+            raise RuntimeError("Runtime mesh mode requires wedge clipping; wedge_path is None.")
 
     if reset_each:
-        mask_t_parent = torch.zeros((H, W), dtype=torch.bool, device=dev)
+        if domain_mode == "starting_mesh":
+            mask_t_parent = runtime_base_mesh["parent_mask"].to(device=dev, dtype=torch.bool)
+        else:
+            mask_t_parent = torch.zeros((H, W), dtype=torch.bool, device=dev)
     else:
         mask_t_parent = _mask_from_parent_indices(parents_t, H, W, dev)
 
@@ -2224,66 +2851,79 @@ def _runtime_build_pred_mesh_from_state(
         )
     timing["mesh_predict_s"] = float(time.perf_counter() - t_policy_t0)
 
-    xmin, xmax, ymin, ymax = _get_bbox(cfg)
-    t_mesh_mat_t0 = time.perf_counter()
-    pred_centers, pred_levels, pred_parents, pred_ei = dynamic_cells_from_parent_masks(
-        masks_pred_by_level,
-        H,
-        W,
-        xmin,
-        xmax,
-        ymin,
-        ymax,
-        refine_ratio=rr,
-    )
-    timing["mesh_materialize_s"] = float(time.perf_counter() - t_mesh_mat_t0)
-    parent_flat = pred_parents.view(-1).long()
-
-    # Defer edge construction to the wedge-clip stage when wedge clipping is active.
-    # This avoids building the same edge graph twice per runtime step.
-    pred_ei = torch.empty((2, 0), dtype=torch.long, device=dev)
-    if wedge_path is None:
-        edge_method = str(cfg.get("edges", {}).get("method", "knn")).lower()
-        if "face" in edge_method:
-            pred_ei = build_amr_face_adjacency_edges(
-                pred_centers,
-                pred_levels,
-                H,
-                W,
-                bbox=tuple(cfg["data"]["bbox"]),
-                return_edge_attr=False,
-                refine_ratio=rr,
+    if domain_mode == "starting_mesh":
+        t_mesh_mat_t0 = time.perf_counter()
+        pred_centers, pred_levels, parent_flat, pred_ei, mask_pred_parent = _runtime_build_mesh_from_starting_leaf_base(
+            base_mesh=runtime_base_mesh,
+            masks_by_level=masks_pred_by_level,
+            cfg=cfg,
+            H=H,
+            W=W,
+            device=dev,
+        )
+        timing["mesh_materialize_s"] = float(time.perf_counter() - t_mesh_mat_t0)
+    else:
+        xmin, xmax, ymin, ymax = _get_bbox(cfg)
+        if runtime_wedge_constraints is not None:
+            t_wref0 = time.perf_counter()
+            masks_pred_by_level = _runtime_apply_wedge_constraints_to_masks(
+                masks_by_level=masks_pred_by_level,
+                constraints=runtime_wedge_constraints,
             )
-            pred_ei = pred_ei.to(dev, dtype=torch.long)
-        else:
-            pred_ei = build_amr_local_knn_edges(
-                pred_centers,
-                parent_flat,
-                H,
-                W,
-                k_local=int(cfg.get("edges", {}).get("k_local", 4)),
-                max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
-            ).to(dev, dtype=torch.long)
+            timing["wedge_lookup_refine_s"] = float(time.perf_counter() - t_wref0)
 
-    t_wedge_t0 = time.perf_counter()
-    wedge_timing: Dict[str, float] = {}
-    pred_centers, pred_levels, parent_flat, pred_ei, mask_pred_parent = _clip_pred_mesh_to_wedge(
-        pred_centers=pred_centers,
-        pred_levels=pred_levels,
-        pred_parents=parent_flat,
-        pred_ei=pred_ei,
-        H=H,
-        W=W,
-        wedge_path=wedge_path,
-        cfg=cfg,
-        device=dev,
-        timing_out=wedge_timing,
-    )
-    timing["wedge_clip_s"] = float(time.perf_counter() - t_wedge_t0)
-    timing["wedge_lookup_classify_s"] = float(wedge_timing.get("lookup_classify_s", 0.0))
-    timing["wedge_lookup_refine_s"] = float(wedge_timing.get("lookup_refine_s", 0.0))
-    timing["wedge_edge_build_s"] = float(wedge_timing.get("edge_build_s", 0.0))
-    timing["wedge_legacy_geom_s"] = float(wedge_timing.get("legacy_geom_s", 0.0))
+        t_mesh_mat_t0 = time.perf_counter()
+        pred_centers, pred_levels, pred_parents, pred_ei = dynamic_cells_from_parent_masks(
+            masks_pred_by_level,
+            H,
+            W,
+            xmin,
+            xmax,
+            ymin,
+            ymax,
+            refine_ratio=rr,
+        )
+        timing["mesh_materialize_s"] = float(time.perf_counter() - t_mesh_mat_t0)
+        parent_flat = pred_parents.view(-1).long()
+
+        # Defer edge construction until after wedge-domain filtering.
+        pred_ei = torch.empty((2, 0), dtype=torch.long, device=dev)
+        t_wedge_t0 = time.perf_counter()
+        if runtime_wedge_constraints is not None:
+            wedge_fast_timing: Dict[str, float] = {}
+            pred_centers, pred_levels, parent_flat, pred_ei, mask_pred_parent = _runtime_filter_mesh_with_wedge_constraints(
+                pred_centers=pred_centers,
+                pred_levels=pred_levels,
+                parent_flat=parent_flat,
+                cfg=cfg,
+                H=H,
+                W=W,
+                device=dev,
+                constraints=runtime_wedge_constraints,
+                timing_out=wedge_fast_timing,
+            )
+            timing["wedge_lookup_classify_s"] = float(wedge_fast_timing.get("lookup_classify_s", 0.0))
+            timing["wedge_edge_build_s"] = float(wedge_fast_timing.get("edge_build_s", 0.0))
+            timing["wedge_legacy_geom_s"] = 0.0
+        else:
+            wedge_timing: Dict[str, float] = {}
+            pred_centers, pred_levels, parent_flat, pred_ei, mask_pred_parent = _clip_pred_mesh_to_wedge(
+                pred_centers=pred_centers,
+                pred_levels=pred_levels,
+                pred_parents=parent_flat,
+                pred_ei=pred_ei,
+                H=H,
+                W=W,
+                wedge_path=wedge_path,
+                cfg=cfg,
+                device=dev,
+                timing_out=wedge_timing,
+            )
+            timing["wedge_lookup_classify_s"] = float(wedge_timing.get("lookup_classify_s", 0.0))
+            timing["wedge_lookup_refine_s"] = float(wedge_timing.get("lookup_refine_s", 0.0))
+            timing["wedge_edge_build_s"] = float(wedge_timing.get("edge_build_s", 0.0))
+            timing["wedge_legacy_geom_s"] = float(wedge_timing.get("legacy_geom_s", 0.0))
+        timing["wedge_clip_s"] = float(time.perf_counter() - t_wedge_t0)
 
     pred_centers = pred_centers.to(dev, dtype=torch.float32)
     pred_levels = pred_levels.to(dev, dtype=torch.long)
@@ -2799,17 +3439,38 @@ def train_one_epoch_multi_step(
     runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
     runtime_update_every = int(runtime_mesh_cfg.get("update_every_steps", 1))
     runtime_mesh_backend = _runtime_mesh_backend(cfg)
+    runtime_domain_mode = _runtime_mesh_domain_mode(cfg)
     runtime_idw_backend = "exact"
     runtime_idw_backend_kwargs: Dict[str, Any] = {}
     runtime_bbox = _get_bbox(cfg)
     runtime_refine_ratio = _get_refine_ratio(cfg)
     runtime_need_edge_attr = bool(need_phy and (not use_mls))
     runtime_wedge_path = None
+    runtime_wedge_constraints = None
+    runtime_base_mesh = None
     if runtime_mesh_enabled:
         mesh_spec_path = cfg.get("mesh", {}).get("starting_mesh_path", None)
         if not mesh_spec_path:
             raise RuntimeError("Runtime mesh mode requires cfg['mesh']['starting_mesh_path'].")
-        runtime_wedge_path = _load_wedge_path_from_spec(str(mesh_spec_path), cfg)
+        if runtime_domain_mode == "starting_mesh":
+            runtime_base_mesh = _get_runtime_starting_mesh_base(
+                cfg=cfg,
+                H=H,
+                W=W,
+                dx=float(dx),
+                dy=float(dy),
+                device=device,
+                mesh_spec_path=str(mesh_spec_path),
+            )
+        else:
+            runtime_wedge_path = _load_wedge_path_from_spec(str(mesh_spec_path), cfg)
+            runtime_wedge_constraints = _get_runtime_wedge_constraints(
+                cfg=cfg,
+                H=H,
+                W=W,
+                device=device,
+                wedge_path=runtime_wedge_path,
+            )
         runtime_idw_backend, runtime_idw_backend_kwargs = _runtime_idw_backend_settings(
             cfg,
             out_device=device,
@@ -2819,7 +3480,7 @@ def train_one_epoch_multi_step(
                 "Runtime mesh backend is 'cnn' but runtime_mesh_policy was not loaded."
             )
         print(
-            f"[RUNTIME-MESH] train loop active (backend={runtime_mesh_backend}, "
+            f"[RUNTIME-MESH] train loop active (backend={runtime_mesh_backend}, domain_mode={runtime_domain_mode}, "
             f"idw_backend={runtime_idw_backend}, update_every_steps={runtime_update_every})"
         )
 
@@ -2894,11 +3555,11 @@ def train_one_epoch_multi_step(
             f"{prefix} wall={total:.3f}s "
             f"| idw_remap={float(t_idw_remap_s):.3f}s ({_pct(t_idw_remap_s):.1f}%) "
             f"| mesh_materialize={float(t_mesh_materialize_s):.3f}s ({_pct(t_mesh_materialize_s):.1f}%) "
-            f"| wedge_clip={float(t_wedge_clip_s):.3f}s ({_pct(t_wedge_clip_s):.1f}%) "
-            f"| wedge_lookup_cls={float(t_wedge_lookup_classify_s):.3f}s ({_pct(t_wedge_lookup_classify_s):.1f}%) "
-            f"| wedge_lookup_refine={float(t_wedge_lookup_refine_s):.3f}s ({_pct(t_wedge_lookup_refine_s):.1f}%) "
-            f"| wedge_edge_build={float(t_wedge_edge_build_s):.3f}s ({_pct(t_wedge_edge_build_s):.1f}%) "
-            f"| wedge_legacy_geom={float(t_wedge_legacy_geom_s):.3f}s ({_pct(t_wedge_legacy_geom_s):.1f}%) "
+            f"| wedge_constraints_total={float(t_wedge_clip_s):.3f}s ({_pct(t_wedge_clip_s):.1f}%) "
+            f"| wedge_leaf_filter_lookup={float(t_wedge_lookup_classify_s):.3f}s ({_pct(t_wedge_lookup_classify_s):.1f}%) "
+            f"| wedge_parent_mask_constraints={float(t_wedge_lookup_refine_s):.3f}s ({_pct(t_wedge_lookup_refine_s):.1f}%) "
+            f"| wedge_postfilter_edge_build={float(t_wedge_edge_build_s):.3f}s ({_pct(t_wedge_edge_build_s):.1f}%) "
+            f"| wedge_legacy_geom_fallback={float(t_wedge_legacy_geom_s):.3f}s ({_pct(t_wedge_legacy_geom_s):.1f}%) "
             f"| edge_attr={float(t_edge_attr_s):.3f}s ({_pct(t_edge_attr_s):.1f}%) "
             f"| other={other:.3f}s ({_pct(other):.1f}%) "
             f"| rebuilds={int(n_rebuilds)}",
@@ -4005,6 +4666,7 @@ def train_one_epoch_multi_step(
                 and (feat_tp1_on_pred_list is not None)
                 and (len(feat_t_on_pred_list) > 1)
                 and (len(feat_tp1_on_pred_list) > 1)
+                and (runtime_domain_mode != "starting_mesh")
             )
 
             for k in range(0, K - 1):
@@ -4077,6 +4739,8 @@ def train_one_epoch_multi_step(
                             wedge_path=runtime_wedge_path,
                             need_edge_attr=runtime_need_edge_attr,
                             runtime_mesh_policy=runtime_mesh_policy,
+                            runtime_wedge_constraints=runtime_wedge_constraints,
+                            runtime_base_mesh=runtime_base_mesh,
                             timing_out=rebuild_timing,
                         )
                         t_rebuild_s = time.perf_counter() - t_rebuild_t0
@@ -4627,17 +5291,38 @@ def evaluate_one_epoch_multi_step(
     runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
     runtime_update_every = int(runtime_mesh_cfg.get("update_every_steps", 1))
     runtime_mesh_backend = _runtime_mesh_backend(cfg)
+    runtime_domain_mode = _runtime_mesh_domain_mode(cfg)
     runtime_idw_backend = "exact"
     runtime_idw_backend_kwargs: Dict[str, Any] = {}
     runtime_bbox = _get_bbox(cfg)
     runtime_refine_ratio = _get_refine_ratio(cfg)
     runtime_need_edge_attr = bool(need_phy and (not use_mls))
     runtime_wedge_path = None
+    runtime_wedge_constraints = None
+    runtime_base_mesh = None
     if runtime_mesh_enabled:
         mesh_spec_path = cfg.get("mesh", {}).get("starting_mesh_path", None)
         if not mesh_spec_path:
             raise RuntimeError("Runtime mesh mode requires cfg['mesh']['starting_mesh_path'].")
-        runtime_wedge_path = _load_wedge_path_from_spec(str(mesh_spec_path), cfg)
+        if runtime_domain_mode == "starting_mesh":
+            runtime_base_mesh = _get_runtime_starting_mesh_base(
+                cfg=cfg,
+                H=H,
+                W=W,
+                dx=float(dx),
+                dy=float(dy),
+                device=device,
+                mesh_spec_path=str(mesh_spec_path),
+            )
+        else:
+            runtime_wedge_path = _load_wedge_path_from_spec(str(mesh_spec_path), cfg)
+            runtime_wedge_constraints = _get_runtime_wedge_constraints(
+                cfg=cfg,
+                H=H,
+                W=W,
+                device=device,
+                wedge_path=runtime_wedge_path,
+            )
         runtime_idw_backend, runtime_idw_backend_kwargs = _runtime_idw_backend_settings(
             cfg,
             out_device=device,
@@ -4647,7 +5332,7 @@ def evaluate_one_epoch_multi_step(
                 "Runtime mesh backend is 'cnn' but runtime_mesh_policy was not loaded."
             )
         print(
-            f"[RUNTIME-MESH] eval loop active (backend={runtime_mesh_backend}, "
+            f"[RUNTIME-MESH] eval loop active (backend={runtime_mesh_backend}, domain_mode={runtime_domain_mode}, "
             f"idw_backend={runtime_idw_backend}, update_every_steps={runtime_update_every})"
         )
 
@@ -5307,6 +5992,7 @@ def evaluate_one_epoch_multi_step(
                     and (feat_tp1_on_pred_list is not None)
                     and (len(feat_t_on_pred_list) > 1)
                     and (len(feat_tp1_on_pred_list) > 1)
+                    and (runtime_domain_mode != "starting_mesh")
                 )
 
                 for k in range(0, K - 1):
@@ -5382,6 +6068,8 @@ def evaluate_one_epoch_multi_step(
                                 wedge_path=runtime_wedge_path,
                                 need_edge_attr=runtime_need_edge_attr,
                                 runtime_mesh_policy=runtime_mesh_policy,
+                                runtime_wedge_constraints=runtime_wedge_constraints,
+                                runtime_base_mesh=runtime_base_mesh,
                             )
                             t_rebuild_s = time.perf_counter() - t_rebuild_t0
 
@@ -6017,6 +6705,7 @@ def main(config_path: str | None = None, out_dir: str | None = None):
     runtime_mesh_cfg.setdefault("update_every_steps", 1)
     runtime_mesh_cfg.setdefault("max_cells_per_step", 400_000)
     runtime_mesh_cfg.setdefault("policy_backend", "gradient")
+    runtime_mesh_cfg.setdefault("domain_mode", "wedge_lookup")
     runtime_mesh_cfg.setdefault("wedge_clip_use_lookup", True)
     runtime_mesh_cfg.setdefault("wedge_clip_lookup_fallback", False)
     runtime_mesh_idw_cfg = runtime_mesh_cfg.setdefault("idw", {})
@@ -6049,20 +6738,25 @@ def main(config_path: str | None = None, out_dir: str | None = None):
 
     if runtime_mesh_enabled:
         runtime_backend = _runtime_mesh_backend(cfg)
+        runtime_domain_mode = _runtime_mesh_domain_mode(cfg)
         if not bool(runtime_mesh_cfg.get("reset_to_coarse_each_step", True)):
-            raise RuntimeError("Runtime mesh mode requires reset_to_coarse_each_step=true for this workflow.")
+            raise RuntimeError(
+                "Runtime mesh mode requires reset_to_coarse_each_step=true "
+                "(interpreted as reset-to-starting-mesh when domain_mode='starting_mesh')."
+            )
         if not bool(runtime_mesh_cfg.get("refine_only", True)):
             raise RuntimeError("Runtime mesh mode requires refine_only=true for this workflow.")
-        if not bool(runtime_mesh_cfg.get("wedge_clip_use_lookup", True)):
-            raise RuntimeError(
-                "Runtime mesh mode requires train.runtime_mesh.wedge_clip_use_lookup=true "
-                "(lookup-only wedge clipping)."
-            )
-        if bool(runtime_mesh_cfg.get("wedge_clip_lookup_fallback", False)):
-            raise RuntimeError(
-                "Runtime mesh mode requires train.runtime_mesh.wedge_clip_lookup_fallback=false "
-                "(no fallback path)."
-            )
+        if runtime_domain_mode == "wedge_lookup":
+            if not bool(runtime_mesh_cfg.get("wedge_clip_use_lookup", True)):
+                raise RuntimeError(
+                    "Runtime mesh mode requires train.runtime_mesh.wedge_clip_use_lookup=true "
+                    "(lookup-only wedge clipping)."
+                )
+            if bool(runtime_mesh_cfg.get("wedge_clip_lookup_fallback", False)):
+                raise RuntimeError(
+                    "Runtime mesh mode requires train.runtime_mesh.wedge_clip_lookup_fallback=false "
+                    "(no fallback path)."
+                )
         if runtime_backend == "cnn":
             ckpt_raw = runtime_mesh_cnn_cfg.get("checkpoint_path", "")
             ckpt_path = os.path.abspath(os.path.expanduser(str(ckpt_raw))) if ckpt_raw else ""

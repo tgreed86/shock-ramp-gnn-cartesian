@@ -52,6 +52,7 @@
     "validation_every_epochs": 5,
     "runtime_mesh": {
       "enabled": true,
+      "domain_mode": "starting_mesh",
       "warm_start_from_precompute": false,
       "update_every_steps": 2,
       "detach_policy_input": true,
