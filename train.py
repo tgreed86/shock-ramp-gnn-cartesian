@@ -5979,6 +5979,8 @@ def main(config_path: str | None = None, out_dir: str | None = None):
     runtime_mesh_cfg.setdefault("update_every_steps", 1)
     runtime_mesh_cfg.setdefault("max_cells_per_step", 400_000)
     runtime_mesh_cfg.setdefault("policy_backend", "gradient")
+    runtime_mesh_cfg.setdefault("wedge_clip_use_lookup", True)
+    runtime_mesh_cfg.setdefault("wedge_clip_lookup_fallback", False)
     runtime_mesh_idw_cfg = runtime_mesh_cfg.setdefault("idw", {})
     if not isinstance(runtime_mesh_idw_cfg, dict):
         raise ValueError("train.runtime_mesh.idw must be a JSON object when provided.")
@@ -6013,6 +6015,16 @@ def main(config_path: str | None = None, out_dir: str | None = None):
             raise RuntimeError("Runtime mesh mode requires reset_to_coarse_each_step=true for this workflow.")
         if not bool(runtime_mesh_cfg.get("refine_only", True)):
             raise RuntimeError("Runtime mesh mode requires refine_only=true for this workflow.")
+        if not bool(runtime_mesh_cfg.get("wedge_clip_use_lookup", True)):
+            raise RuntimeError(
+                "Runtime mesh mode requires train.runtime_mesh.wedge_clip_use_lookup=true "
+                "(lookup-only wedge clipping)."
+            )
+        if bool(runtime_mesh_cfg.get("wedge_clip_lookup_fallback", False)):
+            raise RuntimeError(
+                "Runtime mesh mode requires train.runtime_mesh.wedge_clip_lookup_fallback=false "
+                "(no fallback path)."
+            )
         if runtime_backend == "cnn":
             ckpt_raw = runtime_mesh_cnn_cfg.get("checkpoint_path", "")
             ckpt_path = os.path.abspath(os.path.expanduser(str(ckpt_raw))) if ckpt_raw else ""

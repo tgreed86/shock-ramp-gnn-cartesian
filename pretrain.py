@@ -23,6 +23,8 @@ from utils_geom import (
 )
 from utils.precomp_h5 import precomp_h5_is_usable
 
+_WEDGE_CLIP_LOOKUP_CACHE: Dict[str, Dict[str, Any]] = {}
+
 def _cfg_hash_for_cache(cfg):
     # Small hash so different policy/interp settings produce separate caches
     key = {
@@ -1086,6 +1088,271 @@ def _path_contains_points_torch(wedge_path, pts: torch.Tensor, radius: float = 0
     inside_np = wedge_path.contains_points(pts_np, radius=radius)
     return torch.from_numpy(inside_np).to(device=pts.device)
 
+
+def _wedge_lookup_cache_key(
+    *,
+    wedge_path,
+    H: int,
+    W: int,
+    Lmax: int,
+    refine_ratio: int,
+    bbox: tuple[float, float, float, float],
+    radius: float,
+) -> str:
+    verts = np.asarray(wedge_path.vertices, dtype=np.float64)
+    vhash = hashlib.sha1(verts.tobytes()).hexdigest()[:20]
+    xmin, xmax, ymin, ymax = [float(v) for v in bbox]
+    return (
+        f"v={vhash}|H={int(H)}|W={int(W)}|Lmax={int(Lmax)}|rr={int(refine_ratio)}|"
+        f"bbox={xmin:.16g},{xmax:.16g},{ymin:.16g},{ymax:.16g}|r={float(radius):.16g}"
+    )
+
+
+def _build_wedge_clip_level_lookup(
+    *,
+    wedge_path,
+    H: int,
+    W: int,
+    Lmax: int,
+    refine_ratio: int,
+    bbox: tuple[float, float, float, float],
+    radius: float,
+) -> Dict[str, Any]:
+    """
+    Precompute per-level cell classification masks:
+      - full[L][j,i]: all four corners inside wedge
+      - intersect[L][j,i]: center-inside OR any-corner-inside
+    """
+    xmin, xmax, ymin, ymax = [float(v) for v in bbox]
+    xspan = float(xmax - xmin)
+    yspan = float(ymax - ymin)
+    rr = int(refine_ratio)
+
+    full_cpu: Dict[int, torch.Tensor] = {}
+    intersect_cpu: Dict[int, torch.Tensor] = {}
+
+    for l in range(0, int(Lmax) + 1):
+        HH = int(H) * (rr ** int(l))
+        WW = int(W) * (rr ** int(l))
+        dxL = xspan / float(WW)
+        dyL = yspan / float(HH)
+
+        # Cell-vertex inclusion: evaluate once per vertex grid, then derive per-cell corner logic.
+        x_edges = xmin + np.arange(WW + 1, dtype=np.float64) * dxL
+        y_edges = ymin + np.arange(HH + 1, dtype=np.float64) * dyL
+        xv, yv = np.meshgrid(x_edges, y_edges, indexing="xy")
+        v_pts = np.stack([xv.reshape(-1), yv.reshape(-1)], axis=1)
+        v_in = wedge_path.contains_points(v_pts, radius=float(radius)).reshape(HH + 1, WW + 1)
+
+        c00 = v_in[:-1, :-1]
+        c10 = v_in[1:, :-1]
+        c01 = v_in[:-1, 1:]
+        c11 = v_in[1:, 1:]
+        full = c00 & c10 & c01 & c11
+        any_corner = c00 | c10 | c01 | c11
+
+        # Cell-center inclusion.
+        x_ctr = xmin + (np.arange(WW, dtype=np.float64) + 0.5) * dxL
+        y_ctr = ymin + (np.arange(HH, dtype=np.float64) + 0.5) * dyL
+        xc, yc = np.meshgrid(x_ctr, y_ctr, indexing="xy")
+        c_pts = np.stack([xc.reshape(-1), yc.reshape(-1)], axis=1)
+        center_in = wedge_path.contains_points(c_pts, radius=float(radius)).reshape(HH, WW)
+
+        intersect = center_in | any_corner
+        full_cpu[int(l)] = torch.from_numpy(full.astype(np.bool_))
+        intersect_cpu[int(l)] = torch.from_numpy(intersect.astype(np.bool_))
+
+    return {
+        "full_cpu": full_cpu,
+        "intersect_cpu": intersect_cpu,
+        "device_cache": {},  # keyed by device string
+    }
+
+
+def _get_wedge_clip_level_lookup(
+    *,
+    wedge_path,
+    H: int,
+    W: int,
+    Lmax: int,
+    refine_ratio: int,
+    bbox: tuple[float, float, float, float],
+    radius: float,
+) -> Dict[str, Any]:
+    key = _wedge_lookup_cache_key(
+        wedge_path=wedge_path,
+        H=H,
+        W=W,
+        Lmax=Lmax,
+        refine_ratio=refine_ratio,
+        bbox=bbox,
+        radius=radius,
+    )
+    entry = _WEDGE_CLIP_LOOKUP_CACHE.get(key, None)
+    if entry is None:
+        entry = _build_wedge_clip_level_lookup(
+            wedge_path=wedge_path,
+            H=H,
+            W=W,
+            Lmax=Lmax,
+            refine_ratio=refine_ratio,
+            bbox=bbox,
+            radius=radius,
+        )
+        _WEDGE_CLIP_LOOKUP_CACHE[key] = entry
+        print(
+            f"[WEDGE-LOOKUP] built cache for H={int(H)} W={int(W)} Lmax={int(Lmax)} rr={int(refine_ratio)}",
+            flush=True,
+        )
+    return entry
+
+
+def _lookup_level_masks_on_device(
+    lookup: Dict[str, Any],
+    device: torch.device,
+) -> tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor]]:
+    dev = torch.device(device)
+    if dev.type == "cpu":
+        return lookup["full_cpu"], lookup["intersect_cpu"]
+
+    dkey = f"{dev.type}:{dev.index if dev.index is not None else -1}"
+    dcache = lookup.get("device_cache", {})
+    got = dcache.get(dkey, None)
+    if got is None:
+        got = {
+            "full": {L: m.to(device=dev, dtype=torch.bool) for L, m in lookup["full_cpu"].items()},
+            "intersect": {L: m.to(device=dev, dtype=torch.bool) for L, m in lookup["intersect_cpu"].items()},
+        }
+        dcache[dkey] = got
+        lookup["device_cache"] = dcache
+    return got["full"], got["intersect"]
+
+
+def _cell_level_ij_from_centers(
+    *,
+    centers: torch.Tensor,
+    levels: torch.Tensor,
+    H: int,
+    W: int,
+    bbox: tuple[float, float, float, float],
+    refine_ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if centers.numel() == 0:
+        empty = torch.empty((0,), dtype=torch.long, device=centers.device)
+        return empty, empty
+
+    dev = centers.device
+    lv = levels.view(-1).long()
+    max_l = int(torch.clamp(lv.max(), min=0).item())
+    rr = int(refine_ratio)
+    rr_pows = torch.tensor([rr ** i for i in range(max_l + 1)], device=dev, dtype=torch.float32)
+    ww_l = (float(W) * rr_pows).index_select(0, lv.clamp(0, max_l))
+    hh_l = (float(H) * rr_pows).index_select(0, lv.clamp(0, max_l))
+
+    xmin, xmax, ymin, ymax = [float(v) for v in bbox]
+    xs = max(float(xmax - xmin), 1e-12)
+    ys = max(float(ymax - ymin), 1e-12)
+
+    col_f = ((centers[:, 0].to(torch.float32) - xmin) * ww_l / xs) - 0.5
+    row_f = ((centers[:, 1].to(torch.float32) - ymin) * hh_l / ys) - 0.5
+
+    col = torch.round(col_f).to(torch.long)
+    row = torch.round(row_f).to(torch.long)
+    ww_i = ww_l.to(torch.long)
+    hh_i = hh_l.to(torch.long)
+    col = torch.minimum(torch.maximum(col, torch.zeros_like(col)), ww_i - 1)
+    row = torch.minimum(torch.maximum(row, torch.zeros_like(row)), hh_i - 1)
+    return row, col
+
+
+def _centers_from_level_ij(
+    *,
+    levels: torch.Tensor,
+    row: torch.Tensor,
+    col: torch.Tensor,
+    H: int,
+    W: int,
+    bbox: tuple[float, float, float, float],
+    refine_ratio: int,
+) -> torch.Tensor:
+    if levels.numel() == 0:
+        return torch.empty((0, 2), dtype=torch.float32, device=levels.device)
+
+    dev = levels.device
+    lv = levels.view(-1).long()
+    max_l = int(torch.clamp(lv.max(), min=0).item())
+    rr = int(refine_ratio)
+    rr_pows = torch.tensor([rr ** i for i in range(max_l + 1)], device=dev, dtype=torch.float32)
+    ww_l = (float(W) * rr_pows).index_select(0, lv.clamp(0, max_l))
+    hh_l = (float(H) * rr_pows).index_select(0, lv.clamp(0, max_l))
+
+    xmin, xmax, ymin, ymax = [float(v) for v in bbox]
+    xs = float(xmax - xmin)
+    ys = float(ymax - ymin)
+    x = xmin + (col.to(torch.float32) + 0.5) * (xs / ww_l)
+    y = ymin + (row.to(torch.float32) + 0.5) * (ys / hh_l)
+    return torch.stack([x, y], dim=1).to(dtype=torch.float32)
+
+
+def _lookup_mask_values_by_level(
+    mask_by_level: Dict[int, torch.Tensor],
+    *,
+    levels: torch.Tensor,
+    row: torch.Tensor,
+    col: torch.Tensor,
+) -> torch.Tensor:
+    out = torch.zeros(levels.shape[0], dtype=torch.bool, device=levels.device)
+    if levels.numel() == 0:
+        return out
+    for L in torch.unique(levels).tolist():
+        Lint = int(L)
+        sel = (levels == Lint)
+        M = mask_by_level[Lint]
+        out[sel] = M[row[sel], col[sel]]
+    return out
+
+
+def _refine_cells_one_level_ij(
+    *,
+    row: torch.Tensor,
+    col: torch.Tensor,
+    levels: torch.Tensor,
+    parents: torch.Tensor,
+    refine_mask: torch.Tensor,
+    refine_ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    rr = int(refine_ratio)
+    keep_mask = ~refine_mask
+
+    row_keep = row[keep_mask]
+    col_keep = col[keep_mask]
+    lvl_keep = levels[keep_mask]
+    par_keep = parents[keep_mask]
+
+    row_ref = row[refine_mask]
+    col_ref = col[refine_mask]
+    lvl_ref = levels[refine_mask]
+    par_ref = parents[refine_mask]
+    if row_ref.numel() == 0:
+        return row, col, levels, parents
+
+    offs = torch.arange(rr, device=row.device, dtype=torch.long)
+    off_r, off_c = torch.meshgrid(offs, offs, indexing="ij")
+    child_row = row_ref.view(-1, 1, 1) * rr + off_r.view(1, rr, rr)
+    child_col = col_ref.view(-1, 1, 1) * rr + off_c.view(1, rr, rr)
+
+    child_count = rr * rr
+    row_child = child_row.reshape(-1)
+    col_child = child_col.reshape(-1)
+    lvl_child = (lvl_ref + 1).repeat_interleave(child_count)
+    par_child = par_ref.repeat_interleave(child_count)
+
+    new_row = torch.cat([row_keep, row_child], dim=0)
+    new_col = torch.cat([col_keep, col_child], dim=0)
+    new_lvl = torch.cat([lvl_keep, lvl_child], dim=0)
+    new_par = torch.cat([par_keep, par_child], dim=0)
+    return new_row, new_col, new_lvl, new_par
+
 def _load_mesh_spec(mesh_spec_path: str) -> dict:
     spec = torch.load(mesh_spec_path, map_location="cpu")
     if not isinstance(spec, dict):
@@ -1800,68 +2067,156 @@ def _clip_pred_mesh_to_wedge(
     yspan = float(bbox[3] - bbox[2])
     radius = float(pol.get("wedge_clip_radius", 1e-9 * max(xspan, yspan)))
 
-    # ---------- Step 1: keep cells that intersect the wedge ----------
-    center_inside = _path_contains_points_torch(wedge_path, pred_centers, radius=radius)
+    rt_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
+    use_lookup = bool(rt_cfg.get("wedge_clip_use_lookup", True))
+    did_fast_clip = False
 
-    corners = _cell_corners_from_centers_levels(
-        pred_centers, pred_levels, H, W, bbox, refine_ratio=rr
-    )  # (N,4,2)
-    corner_inside = _path_contains_points_torch(wedge_path, corners.reshape(-1, 2), radius=radius).view(-1, 4)
-    any_corner_inside = corner_inside.any(dim=1)
-
-    keep0 = center_inside | any_corner_inside
-    if not keep0.any():
-        raise RuntimeError(
-            "Wedge clipping removed all predicted cells. "
-            "Check wedge_mesh_spec.pt vs cfg['data']['bbox']."
+    if use_lookup:
+        lookup = _get_wedge_clip_level_lookup(
+            wedge_path=wedge_path,
+            H=H,
+            W=W,
+            Lmax=Lmax,
+            refine_ratio=rr,
+            bbox=bbox,
+            radius=radius,
         )
+        full_by_level, intersect_by_level = _lookup_level_masks_on_device(lookup, pred_centers.device)
 
-    pred_centers = pred_centers[keep0]
-    pred_levels  = pred_levels[keep0]
-    parent_flat  = parent_flat[keep0]
+        row, col = _cell_level_ij_from_centers(
+            centers=pred_centers,
+            levels=pred_levels,
+            H=H,
+            W=W,
+            bbox=bbox,
+            refine_ratio=rr,
+        )
+        lvl = pred_levels.view(-1).long()
 
-    # ---------- Step 2: boundary refinement until cells are fully inside ----------
-    # A cell is "fully inside" if all 4 corners are inside.
-    # Refine any cell that is not fully inside, up to Lmax.
-    for _ in range(Lmax + 1):
+        # ---------- Step 1 (lookup): keep cells that intersect wedge ----------
+        keep0 = _lookup_mask_values_by_level(
+            intersect_by_level, levels=lvl, row=row, col=col
+        )
+        if not keep0.any():
+            raise RuntimeError(
+                "Wedge clipping removed all predicted cells. "
+                "Check wedge_mesh_spec.pt vs cfg['data']['bbox']."
+            )
+
+        row = row[keep0]
+        col = col[keep0]
+        lvl = lvl[keep0]
+        parent_flat = parent_flat[keep0]
+
+        # ---------- Step 2 (lookup): refine boundary-crossing cells ----------
+        for _ in range(Lmax + 1):
+            fully_inside = _lookup_mask_values_by_level(
+                full_by_level, levels=lvl, row=row, col=col
+            )
+            crossing = ~fully_inside
+            refine_mask = crossing & (lvl < Lmax)
+            if not refine_mask.any():
+                break
+
+            row, col, lvl, parent_flat = _refine_cells_one_level_ij(
+                row=row,
+                col=col,
+                levels=lvl,
+                parents=parent_flat,
+                refine_mask=refine_mask,
+                refine_ratio=rr,
+            )
+
+        # ---------- Step 3 (lookup): final strict keep ----------
+        fully_inside = _lookup_mask_values_by_level(
+            full_by_level, levels=lvl, row=row, col=col
+        )
+        row = row[fully_inside]
+        col = col[fully_inside]
+        lvl = lvl[fully_inside]
+        parent_flat = parent_flat[fully_inside]
+
+        if row.numel() == 0:
+            raise RuntimeError(
+                "After boundary refinement, no fully-inside cells remained. "
+                "This usually means Lmax is too low for the wedge geometry or the wedge/bbox mismatch."
+            )
+
+        pred_levels = lvl
+        pred_centers = _centers_from_level_ij(
+            levels=pred_levels,
+            row=row,
+            col=col,
+            H=H,
+            W=W,
+            bbox=bbox,
+            refine_ratio=rr,
+        ).to(pred_centers.device, dtype=pred_centers.dtype)
+        did_fast_clip = True
+
+    if not did_fast_clip:
+        # ---------- Step 1: keep cells that intersect the wedge ----------
+        center_inside = _path_contains_points_torch(wedge_path, pred_centers, radius=radius)
+
+        corners = _cell_corners_from_centers_levels(
+            pred_centers, pred_levels, H, W, bbox, refine_ratio=rr
+        )  # (N,4,2)
+        corner_inside = _path_contains_points_torch(wedge_path, corners.reshape(-1, 2), radius=radius).view(-1, 4)
+        any_corner_inside = corner_inside.any(dim=1)
+
+        keep0 = center_inside | any_corner_inside
+        if not keep0.any():
+            raise RuntimeError(
+                "Wedge clipping removed all predicted cells. "
+                "Check wedge_mesh_spec.pt vs cfg['data']['bbox']."
+            )
+
+        pred_centers = pred_centers[keep0]
+        pred_levels  = pred_levels[keep0]
+        parent_flat  = parent_flat[keep0]
+
+        # ---------- Step 2: boundary refinement until cells are fully inside ----------
+        # A cell is "fully inside" if all 4 corners are inside.
+        # Refine any cell that is not fully inside, up to Lmax.
+        for _ in range(Lmax + 1):
+            corners = _cell_corners_from_centers_levels(
+                pred_centers, pred_levels, H, W, bbox, refine_ratio=rr
+            )
+            corner_inside = _path_contains_points_torch(wedge_path, corners.reshape(-1, 2), radius=radius).view(-1, 4)
+            fully_inside = corner_inside.all(dim=1)
+
+            # Cells that still cross boundary
+            crossing = ~fully_inside
+
+            # Refine those that can still be refined
+            refine_mask = crossing & (pred_levels < Lmax)
+
+            if not refine_mask.any():
+                break
+
+            pred_centers, pred_levels, parent_flat = _refine_cells_one_level(
+                pred_centers, pred_levels, parent_flat,
+                refine_mask=refine_mask,
+                H=H, W=W, bbox=bbox,
+                refine_ratio=rr,
+            )
+
+        # ---------- Step 3: final strict keep (no cells outside wedge) ----------
         corners = _cell_corners_from_centers_levels(
             pred_centers, pred_levels, H, W, bbox, refine_ratio=rr
         )
         corner_inside = _path_contains_points_torch(wedge_path, corners.reshape(-1, 2), radius=radius).view(-1, 4)
         fully_inside = corner_inside.all(dim=1)
 
-        # Cells that still cross boundary
-        crossing = ~fully_inside
+        pred_centers = pred_centers[fully_inside]
+        pred_levels  = pred_levels[fully_inside]
+        parent_flat  = parent_flat[fully_inside]
 
-        # Refine those that can still be refined
-        refine_mask = crossing & (pred_levels < Lmax)
-
-        if not refine_mask.any():
-            break
-
-        pred_centers, pred_levels, parent_flat = _refine_cells_one_level(
-            pred_centers, pred_levels, parent_flat,
-            refine_mask=refine_mask,
-            H=H, W=W, bbox=bbox,
-            refine_ratio=rr,
-        )
-
-    # ---------- Step 3: final strict keep (no cells outside wedge) ----------
-    corners = _cell_corners_from_centers_levels(
-        pred_centers, pred_levels, H, W, bbox, refine_ratio=rr
-    )
-    corner_inside = _path_contains_points_torch(wedge_path, corners.reshape(-1, 2), radius=radius).view(-1, 4)
-    fully_inside = corner_inside.all(dim=1)
-
-    pred_centers = pred_centers[fully_inside]
-    pred_levels  = pred_levels[fully_inside]
-    parent_flat  = parent_flat[fully_inside]
-
-    if pred_centers.numel() == 0:
-        raise RuntimeError(
-            "After boundary refinement, no fully-inside cells remained. "
-            "This usually means Lmax is too low for the wedge geometry or the wedge/bbox mismatch."
-        )
+        if pred_centers.numel() == 0:
+            raise RuntimeError(
+                "After boundary refinement, no fully-inside cells remained. "
+                "This usually means Lmax is too low for the wedge geometry or the wedge/bbox mismatch."
+            )
 
     # ---------- Step 4: rebuild edges + mask ----------
     k_local   = int(cfg.get("edges", {}).get("k_local", 4))
