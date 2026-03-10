@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections import OrderedDict
 import torch
 import torch.nn.functional as F
 
@@ -180,6 +181,59 @@ def unique_undirected(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
     return ei[:, keep]
 
 
+# Bounded LRU cache for FAISS indexes keyed by source tensor identity/config.
+_FAISS_INDEX_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
+
+
+def _faiss_cache_key(
+    *,
+    src_xy: torch.Tensor,
+    index_kind: str,
+    faiss_nlist: int,
+    faiss_nprobe: int,
+) -> tuple:
+    dev = src_xy.device
+    return (
+        str(dev.type),
+        int(dev.index) if dev.index is not None else -1,
+        str(src_xy.dtype),
+        int(src_xy.shape[0]),
+        int(src_xy.shape[1]),
+        int(src_xy.data_ptr()),
+        str(index_kind),
+        int(faiss_nlist),
+        int(faiss_nprobe),
+    )
+
+
+def _faiss_cache_get(key: tuple, src_xy: torch.Tensor) -> dict | None:
+    entry = _FAISS_INDEX_CACHE.get(key)
+    if entry is None:
+        return None
+    src_ref = entry.get("src_ref", None)
+    if src_ref is None:
+        _FAISS_INDEX_CACHE.pop(key, None)
+        return None
+    if (
+        int(src_ref.data_ptr()) != int(src_xy.data_ptr())
+        or tuple(src_ref.shape) != tuple(src_xy.shape)
+        or src_ref.device != src_xy.device
+        or src_ref.dtype != src_xy.dtype
+    ):
+        _FAISS_INDEX_CACHE.pop(key, None)
+        return None
+    _FAISS_INDEX_CACHE.move_to_end(key)
+    return entry
+
+
+def _faiss_cache_put(key: tuple, entry: dict, max_entries: int) -> None:
+    _FAISS_INDEX_CACHE[key] = entry
+    _FAISS_INDEX_CACHE.move_to_end(key)
+    cap = max(1, int(max_entries))
+    while len(_FAISS_INDEX_CACHE) > cap:
+        _FAISS_INDEX_CACHE.popitem(last=False)
+
+
 @torch.no_grad()
 def build_idw_map(
     dst_xy: torch.Tensor,   # (N, 2)
@@ -191,6 +245,8 @@ def build_idw_map(
     backend: str = "exact",
     faiss_nlist: int = 256,
     faiss_nprobe: int = 16,
+    faiss_cache: bool = True,
+    faiss_cache_max_entries: int = 4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Return (idx, w) so that: dst_vals = sum_j w[:, j] * src_vals[idx[:, j]]
@@ -210,6 +266,8 @@ def build_idw_map(
             index_kind="flat",
             faiss_nlist=faiss_nlist,
             faiss_nprobe=faiss_nprobe,
+            faiss_cache=faiss_cache,
+            faiss_cache_max_entries=faiss_cache_max_entries,
         )
     if backend_key in ("faiss_ivf", "faiss", "ann", "approx"):
         return _build_idw_map_faiss(
@@ -221,6 +279,8 @@ def build_idw_map(
             index_kind="ivf",
             faiss_nlist=faiss_nlist,
             faiss_nprobe=faiss_nprobe,
+            faiss_cache=faiss_cache,
+            faiss_cache_max_entries=faiss_cache_max_entries,
         )
     raise ValueError(
         f"Unknown IDW backend '{backend}'. Expected one of: exact, faiss_flat, faiss_ivf."
@@ -297,6 +357,8 @@ def _build_idw_map_faiss(
     index_kind: str,
     faiss_nlist: int,
     faiss_nprobe: int,
+    faiss_cache: bool,
+    faiss_cache_max_entries: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     try:
         import faiss  # type: ignore
@@ -333,71 +395,103 @@ def _build_idw_map_faiss(
     use_gpu = (dev.type == "cuda")
     faiss_index = None
     torch_io_ok = False
+    cache_key = None
+    cache_hit = False
 
-    if use_gpu:
-        gpu_id = dev.index if dev.index is not None else 0
-        res = faiss.StandardGpuResources()
-        if index_kind == "flat":
-            faiss_index = faiss.GpuIndexFlatL2(res, dim)
-        else:
-            if M < max(64, k * 8):
-                faiss_index = faiss.GpuIndexFlatL2(res, dim)
+    if bool(faiss_cache):
+        cache_key = _faiss_cache_key(
+            src_xy=src_xy,
+            index_kind=index_kind,
+            faiss_nlist=faiss_nlist,
+            faiss_nprobe=faiss_nprobe,
+        )
+        cached = _faiss_cache_get(cache_key, src_xy)
+        if cached is not None:
+            faiss_index = cached.get("index", None)
+            torch_io_ok = bool(cached.get("torch_io_ok", False))
+            cache_hit = faiss_index is not None
+
+    if not cache_hit:
+        gpu_res = None
+        if use_gpu:
+            gpu_id = dev.index if dev.index is not None else 0
+            gpu_res = faiss.StandardGpuResources()
+            if index_kind == "flat":
+                faiss_index = faiss.GpuIndexFlatL2(gpu_res, dim)
             else:
-                nlist_eff = max(1, min(int(faiss_nlist), M))
-                quantizer = faiss.IndexFlatL2(dim)
-                cpu_ivf = faiss.IndexIVFFlat(quantizer, dim, nlist_eff, faiss.METRIC_L2)
-                faiss_index = faiss.index_cpu_to_gpu(res, gpu_id, cpu_ivf)
-                nprobe_eff = max(1, min(int(faiss_nprobe), nlist_eff))
-                try:
-                    faiss_index.nprobe = nprobe_eff
-                except Exception:
+                if M < max(64, k * 8):
+                    faiss_index = faiss.GpuIndexFlatL2(gpu_res, dim)
+                else:
+                    nlist_eff = max(1, min(int(faiss_nlist), M))
+                    quantizer = faiss.IndexFlatL2(dim)
+                    cpu_ivf = faiss.IndexIVFFlat(quantizer, dim, nlist_eff, faiss.METRIC_L2)
+                    faiss_index = faiss.index_cpu_to_gpu(gpu_res, gpu_id, cpu_ivf)
+                    nprobe_eff = max(1, min(int(faiss_nprobe), nlist_eff))
                     try:
-                        faiss.ParameterSpace().set_index_parameter(faiss_index, "nprobe", nprobe_eff)
+                        faiss_index.nprobe = nprobe_eff
                     except Exception:
-                        pass
-    else:
-        if index_kind == "flat":
-            faiss_index = faiss.IndexFlatL2(dim)
+                        try:
+                            faiss.ParameterSpace().set_index_parameter(faiss_index, "nprobe", nprobe_eff)
+                        except Exception:
+                            pass
         else:
-            if M < max(64, k * 8):
+            if index_kind == "flat":
                 faiss_index = faiss.IndexFlatL2(dim)
             else:
-                nlist_eff = max(1, min(int(faiss_nlist), M))
-                quantizer = faiss.IndexFlatL2(dim)
-                faiss_index = faiss.IndexIVFFlat(quantizer, dim, nlist_eff, faiss.METRIC_L2)
-                nprobe_eff = max(1, min(int(faiss_nprobe), nlist_eff))
-                try:
-                    faiss_index.nprobe = nprobe_eff
-                except Exception:
+                if M < max(64, k * 8):
+                    faiss_index = faiss.IndexFlatL2(dim)
+                else:
+                    nlist_eff = max(1, min(int(faiss_nlist), M))
+                    quantizer = faiss.IndexFlatL2(dim)
+                    faiss_index = faiss.IndexIVFFlat(quantizer, dim, nlist_eff, faiss.METRIC_L2)
+                    nprobe_eff = max(1, min(int(faiss_nprobe), nlist_eff))
                     try:
-                        faiss.ParameterSpace().set_index_parameter(faiss_index, "nprobe", nprobe_eff)
+                        faiss_index.nprobe = nprobe_eff
                     except Exception:
-                        pass
+                        try:
+                            faiss.ParameterSpace().set_index_parameter(faiss_index, "nprobe", nprobe_eff)
+                        except Exception:
+                            pass
 
-    assert faiss_index is not None
+        assert faiss_index is not None
 
-    # Train only for IVF indexes.
-    if hasattr(faiss_index, "is_trained") and (not faiss_index.is_trained):
-        trained = False
+        # Train only for IVF indexes.
+        if hasattr(faiss_index, "is_trained") and (not faiss_index.is_trained):
+            trained = False
+            try:
+                faiss_index.train(src_xy)
+                trained = True
+                torch_io_ok = True
+            except Exception:
+                pass
+            if not trained:
+                src_np = src_xy.detach().cpu().numpy()
+                faiss_index.train(src_np)
+                torch_io_ok = False
+
+        # Add source vectors.
         try:
-            faiss_index.train(src_xy)
-            trained = True
+            faiss_index.add(src_xy)
             torch_io_ok = True
         except Exception:
-            pass
-        if not trained:
             src_np = src_xy.detach().cpu().numpy()
-            faiss_index.train(src_np)
+            faiss_index.add(src_np)
             torch_io_ok = False
 
-    # Add source vectors.
-    try:
-        faiss_index.add(src_xy)
-        torch_io_ok = True
-    except Exception:
-        src_np = src_xy.detach().cpu().numpy()
-        faiss_index.add(src_np)
-        torch_io_ok = False
+        if cache_key is not None:
+            _faiss_cache_put(
+                cache_key,
+                {
+                    "index": faiss_index,
+                    "src_ref": src_xy,
+                    "torch_io_ok": bool(torch_io_ok),
+                    # Keep resources alive for CUDA indexes.
+                    "gpu_res": gpu_res,
+                },
+                max_entries=faiss_cache_max_entries,
+            )
+
+    assert faiss_index is not None
 
     idx_all = []
     w_all = []
@@ -430,6 +524,9 @@ def _build_idw_map_faiss(
         w_sel = _idw_weights_from_dist(d_sel, eps=eps)
         idx_all.append(i_sel)
         w_all.append(w_sel)
+
+    if cache_key is not None and cache_key in _FAISS_INDEX_CACHE:
+        _FAISS_INDEX_CACHE[cache_key]["torch_io_ok"] = bool(torch_io_ok)
 
     return torch.cat(idx_all, dim=0), torch.cat(w_all, dim=0)
 
