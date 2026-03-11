@@ -60,7 +60,7 @@ from torch.utils.data import DataLoader, SequentialSampler, Subset
 
 # Project imports – must exist in your repo.
 from dataset import CellRefineWindowDataset
-from pretrain import precompute_pred_mesh_and_interps_for_rollout, CollateWithPrecompute
+from pretrain import precompute_pred_mesh_and_interps_for_rollout, CollateWithPrecompute, CollateWithDtOnly
 from plots import (
     compute_plot_deltas,
     _recover_parent_mask,
@@ -72,6 +72,7 @@ from train import (
     build_model_from_cfg,
     evaluate_one_epoch_multi_step,
     _get_bbox,
+    _load_runtime_mesh_policy_from_cfg,
 )
 from models import ParcFeatureAdapter
 from utils_geom import build_idw_map, apply_idw_map
@@ -169,7 +170,7 @@ def _compute_dt_transitions(series):
     dt_ref = float(np.median(np.asarray(dts, dtype=np.float64)))
     return dts, dt_ref
 
-def _build_collate(precomp, dt_transitions, dt_ref):
+def _build_precomp_collate(precomp, dt_transitions, dt_ref):
     """Construct CollateWithPrecompute, passing dt metadata when supported."""
     try:
         inspect.signature(CollateWithPrecompute)
@@ -186,6 +187,11 @@ def _build_collate(precomp, dt_transitions, dt_ref):
         except TypeError:
             continue
     raise RuntimeError("Could not construct CollateWithPrecompute with available arguments.")
+
+
+def _build_dt_only_collate(dt_transitions, dt_ref):
+    """Construct runtime-mesh dt-only collate."""
+    return CollateWithDtOnly(dt_transitions=dt_transitions, dt_ref=dt_ref)
 
 def _maybe_empty_device_cache(device: torch.device):
     if device.type == "cuda":
@@ -1799,6 +1805,18 @@ def main():
                     help="Compute precomp only for required timesteps ('window') or for all ('all').")
     ap.add_argument("--precompute-device", type=str, default="cpu",
                     help="Device to use for precompute (typically cpu).")
+    ap.add_argument(
+        "--runtime-mesh-cnn-ckpt",
+        type=str,
+        default=None,
+        help="Optional override for train.runtime_mesh.cnn.checkpoint_path at rollout time.",
+    )
+    ap.add_argument(
+        "--runtime-mesh-spec-path",
+        type=str,
+        default=None,
+        help="Optional override for mesh.starting_mesh_path at rollout time.",
+    )
 
     # Raster controls
     ap.add_argument("--raster-mode", type=str, default="block", choices=["block", "idw"],
@@ -1862,6 +1880,24 @@ def main():
     if "data" not in cfg or "pt_path" not in cfg["data"]:
         raise RuntimeError("cfg['data']['pt_path'] must be set (or use --pt-path).")
 
+    # Optional runtime-mesh CNN checkpoint override (useful when moving runs across machines).
+    if args.runtime_mesh_cnn_ckpt is not None:
+        cfg.setdefault("train", {}).setdefault("runtime_mesh", {}).setdefault("cnn", {})[
+            "checkpoint_path"
+        ] = str(args.runtime_mesh_cnn_ckpt)
+        log(
+            "[RUNTIME-MESH] overriding train.runtime_mesh.cnn.checkpoint_path with "
+            f"--runtime-mesh-cnn-ckpt={args.runtime_mesh_cnn_ckpt}"
+        )
+
+    # Optional runtime-mesh spec override (useful when moving runs across machines).
+    if args.runtime_mesh_spec_path is not None:
+        cfg.setdefault("mesh", {})["starting_mesh_path"] = str(args.runtime_mesh_spec_path)
+        log(
+            "[RUNTIME-MESH] overriding mesh.starting_mesh_path with "
+            f"--runtime-mesh-spec-path={args.runtime_mesh_spec_path}"
+        )
+
     # Model device
     device_str = args.device if (args.device is not None) else cfg.get("device", "cpu")
     device = torch.device(device_str)
@@ -1905,6 +1941,41 @@ def main():
     # dt info (if present in snapshots)
     dt_transitions, dt_ref = _compute_dt_transitions(data_list)
 
+    runtime_mesh_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
+    runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
+    runtime_backend = str(runtime_mesh_cfg.get("policy_backend", "gradient")).strip().lower()
+    if runtime_backend in ("cnn_policy",):
+        runtime_backend = "cnn"
+
+    # For rollout with CNN runtime mesh, always rebuild every step.
+    if runtime_mesh_enabled and runtime_backend == "cnn":
+        rt_cfg_mut = cfg.setdefault("train", {}).setdefault("runtime_mesh", {})
+        prev_update_every = int(rt_cfg_mut.get("update_every_steps", 1))
+        prev_warm_start = bool(rt_cfg_mut.get("warm_start_from_precompute", True))
+        rt_cfg_mut["update_every_steps"] = 1
+        rt_cfg_mut["warm_start_from_precompute"] = False
+        if (prev_update_every != 1) or prev_warm_start:
+            log(
+                "[RUNTIME-MESH] CNN rollout override: forcing update_every_steps=1 "
+                "and warm_start_from_precompute=false (rebuild every step)."
+            )
+        runtime_mesh_cfg = rt_cfg_mut
+
+    runtime_warm_start_precomp = bool(runtime_mesh_cfg.get("warm_start_from_precompute", True))
+    use_precomp_collate = (not runtime_mesh_enabled) or runtime_warm_start_precomp
+    runtime_mesh_policy = None
+    if runtime_mesh_enabled:
+        log(
+            "[RUNTIME-MESH] rollout mode enabled "
+            f"(warm_start_from_precompute={runtime_warm_start_precomp})"
+        )
+        runtime_mesh_policy = _load_runtime_mesh_policy_from_cfg(
+            cfg,
+            device=device,
+            H=H,
+            W=W,
+        )
+
     # ----- Build dataset (CPU) -----
     with Timer("Build dataset"):
         full_ds = CellRefineWindowDataset(
@@ -1925,46 +1996,55 @@ def main():
 
     # ----- Precomp -----
     precomp = None
-    print("args.precomp_path:", args.precomp_path)
-    if args.precomp_path is not None:
-        log(f"[INFO] Loading precomp from {args.precomp_path}")
-        precomp = torch.load(args.precomp_path, map_location="cpu", weights_only=False)
-    elif (not args.recompute_precomp) and ("precomp" in ckpt):
-        log("[INFO] Using precomp from checkpoint.")
-        precomp = ckpt["precomp"]
-    print("precomp:", precomp)
+    if use_precomp_collate:
+        print("args.precomp_path:", args.precomp_path)
+        if args.precomp_path is not None:
+            log(f"[INFO] Loading precomp from {args.precomp_path}")
+            precomp = torch.load(args.precomp_path, map_location="cpu", weights_only=False)
+        elif (not args.recompute_precomp) and ("precomp" in ckpt):
+            log("[INFO] Using precomp from checkpoint.")
+            precomp = ckpt["precomp"]
+        print("precomp:", precomp)
 
-    if precomp is None:
-        steps = getattr(full_ds, "steps", None)
-        if steps is None:
-            raise RuntimeError("Dataset has no attribute 'steps'; cannot precompute precomp.")
+        if precomp is None:
+            steps = getattr(full_ds, "steps", None)
+            if steps is None:
+                raise RuntimeError("Dataset has no attribute 'steps'; cannot precompute precomp.")
 
-        pre_device = torch.device(str(args.precompute_device))
-        if args.precompute_scope == "window":
-            lo = window_idx
-            hi = window_idx + horizon + 1
-            steps_to_precompute = steps[lo:hi]
-            log(f"[INFO] Precomputing precomp for window steps [{lo}:{hi}] on {pre_device}...")
-        else:
-            steps_to_precompute = steps
-            log(f"[INFO] Precomputing precomp for ALL steps ({len(steps_to_precompute)}) on {pre_device}...")
+            pre_device = torch.device(str(args.precompute_device))
+            if args.precompute_scope == "window":
+                lo = window_idx
+                hi = window_idx + horizon + 1
+                steps_to_precompute = steps[lo:hi]
+                log(f"[INFO] Precomputing precomp for window steps [{lo}:{hi}] on {pre_device}...")
+            else:
+                steps_to_precompute = steps
+                log(f"[INFO] Precomputing precomp for ALL steps ({len(steps_to_precompute)}) on {pre_device}...")
 
-        with Timer("Precompute predicted meshes + maps"):
-            precomp = precompute_pred_mesh_and_interps_for_rollout(
-                steps=steps_to_precompute,
-                cfg=cfg,
-                H=H, W=W,
-                dx=dx, dy=dy,
-                device=pre_device,
-                progress=True,
+            with Timer("Precompute predicted meshes + maps"):
+                precomp = precompute_pred_mesh_and_interps_for_rollout(
+                    steps=steps_to_precompute,
+                    cfg=cfg,
+                    H=H, W=W,
+                    dx=dx, dy=dy,
+                    device=pre_device,
+                    progress=True,
+                )
+
+            if args.save_precomp is not None:
+                os.makedirs(os.path.dirname(args.save_precomp) or ".", exist_ok=True)
+                torch.save(precomp, args.save_precomp)
+                log(f"[INFO] Saved precomp to {args.save_precomp}")
+
+        collate = _build_precomp_collate(precomp, dt_transitions, dt_ref)
+    else:
+        log("[RUNTIME-MESH] warm_start_from_precompute=false; using dt-only collate (no precomp).")
+        if (args.precomp_path is not None) or bool(args.recompute_precomp) or (args.save_precomp is not None):
+            log(
+                "[RUNTIME-MESH] ignoring --precomp-path/--recompute-precomp/--save-precomp "
+                "because warm_start_from_precompute=false."
             )
-
-        if args.save_precomp is not None:
-            os.makedirs(os.path.dirname(args.save_precomp) or ".", exist_ok=True)
-            torch.save(precomp, args.save_precomp)
-            log(f"[INFO] Saved precomp to {args.save_precomp}")
-
-    collate = _build_collate(precomp, dt_transitions, dt_ref)
+        collate = _build_dt_only_collate(dt_transitions, dt_ref)
 
     test_loader = DataLoader(
         test_ds,
@@ -2068,6 +2148,7 @@ def main():
             collect_example_edges=bool(degree_diag_requested),
             budget_csv_path=budget_csv_path, 
             write_budgets=True,
+            runtime_mesh_policy=runtime_mesh_policy,
         )
     log(f"[TEST] loss={test_loss:.4e}")
 

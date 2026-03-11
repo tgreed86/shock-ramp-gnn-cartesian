@@ -2563,23 +2563,88 @@ def _runtime_mesh_domain_mode(cfg: Dict[str, Any]) -> str:
     return raw
 
 
-def _runtime_mesh_cnn_thresholds(cfg: Dict[str, Any]) -> tuple[float, Dict[int, float]]:
+def _runtime_mesh_cnn_thresholds(
+    cfg: Dict[str, Any],
+    *,
+    ckpt: Dict[str, Any] | None = None,
+    cfg_Lmax: int | None = None,
+    ckpt_path: str | None = None,
+) -> tuple[float, Dict[int, float], str]:
     rt_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
     cnn_cfg = rt_cfg.get("cnn", {}) or {}
-    thr_default = float(cnn_cfg.get("threshold_default", 0.5))
-    raw_map = cnn_cfg.get("threshold_by_level", {}) or {}
-    if not isinstance(raw_map, dict):
-        raise ValueError("train.runtime_mesh.cnn.threshold_by_level must be a JSON object.")
-    thr_by_level: Dict[int, float] = {}
-    for k, v in raw_map.items():
+    use_saved = bool(cnn_cfg.get("use_saved_thresholds", False))
+
+    if not use_saved:
+        thr_default = float(cnn_cfg.get("threshold_default", 0.5))
+        raw_map = cnn_cfg.get("threshold_by_level", {}) or {}
+        if not isinstance(raw_map, dict):
+            raise ValueError("train.runtime_mesh.cnn.threshold_by_level must be a JSON object.")
+        thr_by_level: Dict[int, float] = {}
+        for k, v in raw_map.items():
+            try:
+                L = int(k)
+            except Exception as e:
+                raise ValueError(
+                    f"Invalid level key in train.runtime_mesh.cnn.threshold_by_level: {k!r}"
+                ) from e
+            thr_by_level[L] = float(v)
+        return thr_default, thr_by_level, "config"
+
+    if not isinstance(ckpt, dict):
+        raise RuntimeError(
+            "train.runtime_mesh.cnn.use_saved_thresholds=true, but CNN checkpoint payload "
+            "is missing or invalid."
+        )
+
+    meta = ckpt.get("train_meta", {})
+    if not isinstance(meta, dict):
+        meta = {}
+
+    raw_saved_map = meta.get("sweep_best_threshold_by_level", None)
+
+    saved_by_level: Dict[int, float] = {}
+    if raw_saved_map is None:
+        where = f" ({ckpt_path})" if ckpt_path else ""
+        raise RuntimeError(
+            "train.runtime_mesh.cnn.use_saved_thresholds=true, but checkpoint is missing "
+            f"'train_meta.sweep_best_threshold_by_level'{where}."
+        )
+    if not isinstance(raw_saved_map, dict):
+        raise RuntimeError(
+            "train.runtime_mesh.cnn.use_saved_thresholds=true, but checkpoint field "
+            "'train_meta.sweep_best_threshold_by_level' is not a dict."
+        )
+    for k, v in raw_saved_map.items():
         try:
             L = int(k)
         except Exception as e:
-            raise ValueError(
-                f"Invalid level key in train.runtime_mesh.cnn.threshold_by_level: {k!r}"
+            raise RuntimeError(
+                "train.runtime_mesh.cnn.use_saved_thresholds=true, but checkpoint has "
+                f"invalid sweep threshold level key: {k!r}"
             ) from e
-        thr_by_level[L] = float(v)
-    return thr_default, thr_by_level
+        saved_by_level[L] = float(v)
+
+    if len(saved_by_level) == 0:
+        where = f" ({ckpt_path})" if ckpt_path else ""
+        raise RuntimeError(
+            "train.runtime_mesh.cnn.use_saved_thresholds=true, but "
+            f"'train_meta.sweep_best_threshold_by_level' is empty{where}."
+        )
+
+    if cfg_Lmax is None:
+        cfg_Lmax = int(cfg.get("policy", {}).get("max_level", cfg.get("data", {}).get("L_max", 3)))
+    missing = [int(L) for L in range(1, int(cfg_Lmax) + 1) if int(L) not in saved_by_level]
+    if missing:
+        where = f" ({ckpt_path})" if ckpt_path else ""
+        raise RuntimeError(
+            "train.runtime_mesh.cnn.use_saved_thresholds=true, but saved sweep thresholds do not "
+            f"cover all levels 1..{int(cfg_Lmax)}. Missing levels: {missing}{where}."
+        )
+
+    # All levels are explicitly provided by sweep_best_threshold_by_level.
+    # Keep a scalar for fallback path; it should not be used in normal operation.
+    thr_default = float(saved_by_level.get(1, 0.5))
+    return thr_default, saved_by_level, "checkpoint_sweep"
 
 
 def _load_runtime_mesh_policy_from_cfg(
@@ -2665,7 +2730,12 @@ def _load_runtime_mesh_policy_from_cfg(
         gy, gx = torch.meshgrid(yy, xx, indexing="ij")
         coord_grid = torch.stack([gx, gy], dim=0).contiguous()
 
-    thr_default, thr_by_level = _runtime_mesh_cnn_thresholds(cfg)
+    thr_default, thr_by_level, thr_source = _runtime_mesh_cnn_thresholds(
+        cfg,
+        ckpt=ckpt if isinstance(ckpt, dict) else None,
+        cfg_Lmax=cfg_Lmax,
+        ckpt_path=ckpt_path,
+    )
 
     ctx = {
         "backend": "cnn",
@@ -2690,7 +2760,15 @@ def _load_runtime_mesh_policy_from_cfg(
         f"model_type={ctx['model_type']}",
         f"max_level={ctx['max_level']}",
         f"refine_ratio={ctx['refine_ratio']}",
+        f"threshold_source={thr_source}",
+        f"threshold_default={ctx['threshold_default']:.6g}",
     )
+    if len(thr_by_level) > 0:
+        print(
+            "[RUNTIME-MESH] CNN threshold_by_level:",
+            {int(k): float(v) for k, v in sorted(thr_by_level.items(), key=lambda kv: int(kv[0]))},
+            flush=True,
+        )
     return ctx
 
 
@@ -6699,6 +6777,7 @@ def main(config_path: str | None = None, out_dir: str | None = None):
 
     train_cfg = cfg.setdefault("train", {})
     train_cfg.setdefault("validation_every_epochs", 1)
+    train_cfg.setdefault("checkpoint_every_epochs", 1)
 
     # Runtime mesh defaults (infrastructure only in this commit)
     runtime_mesh_cfg = train_cfg.setdefault("runtime_mesh", {})
@@ -6730,6 +6809,7 @@ def main(config_path: str | None = None, out_dir: str | None = None):
     runtime_mesh_cnn_cfg.setdefault("include_coords", True)
     runtime_mesh_cnn_cfg.setdefault("threshold_default", 0.5)
     runtime_mesh_cnn_cfg.setdefault("threshold_by_level", {})
+    runtime_mesh_cnn_cfg.setdefault("use_saved_thresholds", False)
     runtime_mesh_cnn_cfg.setdefault("device", "same")
     step_log_cfg = runtime_mesh_cfg.setdefault("step_log", {})
     if not isinstance(step_log_cfg, dict):
@@ -7105,8 +7185,44 @@ def main(config_path: str | None = None, out_dir: str | None = None):
     print("  any nonfinite sigma:", bool((~torch.isfinite(sigma)).any().detach().cpu()))
 
     # -------- training loop --------
-    os.makedirs(cfg["train"]["save_dir"], exist_ok=True)
-    log_csv = os.path.join(cfg["train"]["save_dir"], "train_log.csv")
+    save_dir = cfg["train"]["save_dir"]
+    os.makedirs(save_dir, exist_ok=True)
+    log_csv = os.path.join(save_dir, "train_log.csv")
+    last_ckpt_path = os.path.join(save_dir, "last_model.pt")
+
+    # Save config once at startup.
+    save_config(save_dir, cfg)
+    print(f"[INFO] Saved config once: {os.path.join(save_dir, 'config.json')}")
+
+    checkpoint_every = int(cfg.get("train", {}).get("checkpoint_every_epochs", 1))
+    if checkpoint_every < 0:
+        raise ValueError("train.checkpoint_every_epochs must be >= 0.")
+    if checkpoint_every == 0:
+        print("[INFO] Periodic last-model checkpointing disabled (checkpoint_every_epochs=0).")
+    else:
+        print(
+            f"[INFO] Periodic last-model checkpointing every {checkpoint_every} epoch(s): {last_ckpt_path}"
+        )
+
+    def _build_last_checkpoint_payload(epoch: int) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "model": model.state_dict(),
+            "epoch": int(epoch),
+            "norm_stats": {
+                "mu": None if mu is None else mu.detach().cpu().tolist(),
+                "sigma": None if sigma is None else sigma.detach().cpu().tolist(),
+            },
+            "cfg": cfg,
+        }
+        # Optional states for robust restart/resume tooling.
+        payload["optimizer"] = opt.state_dict()
+        if scheduler is not None:
+            try:
+                payload["scheduler"] = scheduler.state_dict()
+            except Exception:
+                pass
+        return payload
+
     with open(log_csv, "w") as f:
         f.write("epoch,split,loss,mae\n")
 
@@ -7185,47 +7301,19 @@ def main(config_path: str | None = None, out_dir: str | None = None):
                 f"{dt:.1f}s | lr={_get_lr(opt):.3e}"
             )
 
-    def _precomp_to_cpu(precomp):
-        if precomp is None:
-            return None
-        if not hasattr(precomp, "items"):
-            return precomp
-        out = {}
-        for key, lst in precomp.items():
-            if isinstance(lst, list):
-                new_lst = []
-                for v in lst:
-                    if torch.is_tensor(v):
-                        new_lst.append(v.detach().cpu())
-                    elif isinstance(v, tuple):
-                        # handle (idx, w) style entries if you ever store tuples
-                        new_lst.append(
-                            tuple(x.detach().cpu() if torch.is_tensor(x) else x
-                                for x in v)
-                        )
-                    else:
-                        new_lst.append(v)
-                out[key] = new_lst
-            else:
-                out[key] = lst
-        return out
+        do_periodic_ckpt = (checkpoint_every > 0) and (
+            (epoch % checkpoint_every) == 0 or (epoch == total_epochs)
+        )
+        if do_periodic_ckpt:
+            torch.save(_build_last_checkpoint_payload(epoch), last_ckpt_path)
+            print(f"[INFO] Saved last checkpoint at epoch {epoch:03d}: {last_ckpt_path}")
 
-    precomp_cpu = _precomp_to_cpu(precomp)
-
-    # ---- save "last" bundle with norm stats & cfg for reproducibility ----
-    save_dict = {
-        "model": model.state_dict(),
-        "norm_stats": {
-            "mu": None if mu is None else mu.detach().cpu().tolist(),
-            "sigma": None if sigma is None else sigma.detach().cpu().tolist(),
-        },
-        "cfg": cfg,
-        "precomp": precomp_cpu
-    }
-    torch.save(save_dict, os.path.join(cfg["train"]["save_dir"], "last_model.pt"))
+    # Always write final last-model checkpoint when training loop completes.
+    torch.save(_build_last_checkpoint_payload(total_epochs), last_ckpt_path)
+    print(f"[INFO] Saved final last checkpoint at epoch {total_epochs:03d}: {last_ckpt_path}")
 
     plot_loss_curves(
-        os.path.join(cfg["train"]["save_dir"], "loss_curves.png"),
+        os.path.join(save_dir, "loss_curves.png"),
         list(range(1, len(TR) + 1)),
         TR, VL
     )
@@ -7259,8 +7347,6 @@ def main(config_path: str | None = None, out_dir: str | None = None):
         except Exception as e:
             print(f"[RUNTIME-MESH][WARN] failed to write step log summary: {e!r}")
 
-    # Save config file
-    save_config(os.path.join(cfg["train"]["save_dir"]), cfg)
                 
 if __name__ == "__main__":
     import argparse
