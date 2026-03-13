@@ -1275,10 +1275,37 @@ def predict_mask_from_gt_features(batch: Dict[str, torch.Tensor], cfg: Dict[str,
 
 # -------------------- Training / Evaluation (mesh‑first) --------------------
 
-def _build_X(feat, centers, levels, cfg):
+def _dt_hat_feature_column(
+    dt_hat: torch.Tensor | float,
+    *,
+    n_nodes: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return dt_hat as a per-node column of shape (N, 1)."""
+    if torch.is_tensor(dt_hat):
+        dt = dt_hat.to(device=device, dtype=dtype)
+    else:
+        dt = torch.tensor(float(dt_hat), device=device, dtype=dtype)
+
+    if dt.numel() == 1:
+        return dt.view(1, 1).expand(n_nodes, 1)
+    if dt.dim() == 1 and dt.numel() == n_nodes:
+        return dt.view(n_nodes, 1)
+    if dt.dim() == 2 and tuple(dt.shape) == (n_nodes, 1):
+        return dt
+
+    raise RuntimeError(
+        "Could not broadcast dt_hat to node feature column. "
+        f"Expected scalar or (N,) / (N,1), got shape={tuple(dt.shape)} with N={n_nodes}."
+    )
+
+
+def _build_X(feat, centers, levels, cfg, dt_hat=None):
     """
     Build node features for FeatureNet:
       [ physics_feat ] (+ [x,y] if use_pos) (+ [level] if use_level)
+      (+ [dt_hat_fixed] if features.build.use_dt_hat_fixed)
 
     feat:    (N, F) on whatever device we want to run the model on (cpu/cuda/mps)
     centers: (N, 2) (typically from precompute; may be on cpu)
@@ -1287,6 +1314,7 @@ def _build_X(feat, centers, levels, cfg):
     build_cfg = cfg.get("features", {}).get("build", {})
     use_pos   = build_cfg.get("use_pos", True)
     use_level = build_cfg.get("use_level", True)
+    use_dt_hat_fixed = bool(build_cfg.get("use_dt_hat_fixed", False))
 
     dev = feat.device
     Xs = [feat]  # already on dev
@@ -1300,10 +1328,32 @@ def _build_X(feat, centers, levels, cfg):
             lvl = lvl.unsqueeze(-1)
         Xs.append(lvl.to(dev).to(feat.dtype))
 
+    if use_dt_hat_fixed:
+        if dt_hat is None:
+            raise RuntimeError(
+                "features.build.use_dt_hat_fixed=true but dt_hat was not provided to _build_X."
+            )
+        Xs.append(
+            _dt_hat_feature_column(
+                dt_hat,
+                n_nodes=int(feat.size(0)),
+                device=dev,
+                dtype=feat.dtype,
+            )
+        )
+
     return torch.cat(Xs, dim=-1)
 
-def _forward_main_head(model: FeatureNet, X: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-    out = model(X, edge_index)
+def _forward_main_head(
+    model: FeatureNet,
+    X: torch.Tensor,
+    edge_index: torch.Tensor,
+    edge_attr: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if edge_attr is None:
+        out = model(X, edge_index)
+    else:
+        out = model(X, edge_index, edge_attr=edge_attr)
     if isinstance(out, (list, tuple)):
         return out[0]
     return out
@@ -2540,11 +2590,14 @@ def _runtime_mesh_backend(cfg: Dict[str, Any]) -> str:
     raw = str(rt_cfg.get("policy_backend", "gradient")).strip().lower()
     if raw in ("gt_gradients", "gradients", "gradient_policy"):
         raw = "gradient"
+    if raw in ("fast_gradient", "fast_gradients", "gradient_coarse", "coarse_gradient"):
+        raw = "gradient_fast"
     if raw in ("cnn_policy",):
         raw = "cnn"
-    if raw not in ("gradient", "cnn"):
+    if raw not in ("gradient", "gradient_fast", "cnn"):
         raise ValueError(
-            f"train.runtime_mesh.policy_backend must be 'gradient' or 'cnn', got '{raw}'"
+            "train.runtime_mesh.policy_backend must be "
+            f"'gradient', 'gradient_fast', or 'cnn', got '{raw}'"
         )
     return raw
 
@@ -2855,6 +2908,195 @@ def _runtime_predict_masks_from_cnn(
 
 
 @torch.no_grad()
+def _runtime_predict_masks_from_fast_gradients(
+    *,
+    feat_policy: torch.Tensor,
+    parents_t: torch.Tensor,
+    mask_t_parent: torch.Tensor,
+    cfg: Dict[str, Any],
+    H: int,
+    W: int,
+    dx: float,
+    dy: float,
+    device: torch.device,
+) -> Dict[int, torch.Tensor]:
+    """
+    Fast gradient backend for runtime mesh prediction.
+    - Aggregate dynamic node features to coarse HxW parent grid.
+    - Compute per-channel coarse-grid gradient magnitudes.
+    - Combine channels and apply hierarchical refine masks with parent gating.
+
+    This keeps the existing "gradient" backend unchanged and provides a fast
+    alternative for timing/quality comparison.
+    """
+    dev = torch.device(device)
+    pol = cfg.get("policy", {}) or {}
+    rr = _get_refine_ratio(cfg)
+    Lmax = int(pol.get("max_level", cfg.get("data", {}).get("L_max", 3)))
+
+    p_pow = float(pol.get("p", 1.0))
+    combine = str(pol.get("combine", "l2")).strip().lower()
+    weights = pol.get("refine_weights", None)
+
+    tau_by_level = pol.get("tau_by_level", None)
+    tau_low_def = float(pol.get("tau_low", 0.02))
+    tau_high_def = float(pol.get("tau_high", 0.03))
+
+    mode = str(pol.get("hysteresis_mode", "absolute")).strip().lower()
+    if mode not in ("absolute", "percentile"):
+        raise ValueError(
+            f"policy.hysteresis_mode must be 'absolute' or 'percentile', got {mode!r}"
+        )
+
+    pct_low_default = float(pol.get("percentile_low", 75.0))
+    pct_high_default = float(pol.get("percentile_high", 90.0))
+    pct_by_level = pol.get("percentiles_by_level", {})
+    if not isinstance(pct_by_level, dict):
+        pct_by_level = {}
+    pct_mode = str(pct_by_level.get("selection", "auto")).strip().lower()
+    if pct_mode not in ("auto", "global", "per_level", "per-level", "level", "levels"):
+        raise ValueError(
+            "policy.percentiles_by_level.selection must be one of: auto, global, per_level"
+        )
+    use_global_pct = (pct_mode == "global")
+    use_level_pct = (pct_mode in ("per_level", "per-level", "level", "levels"))
+
+    def _pct_level_entry(L: int):
+        if L in pct_by_level:
+            return pct_by_level[L]
+        s = str(L)
+        if s in pct_by_level:
+            return pct_by_level[s]
+        return None
+
+    def _taus(L: int) -> tuple[float, float]:
+        if isinstance(tau_by_level, dict):
+            ent = tau_by_level.get(L, tau_by_level.get(str(L), None))
+            if isinstance(ent, dict):
+                return float(ent.get("low", tau_low_def)), float(ent.get("high", tau_high_def))
+            if ent is not None:
+                return tau_low_def, float(ent)
+        return tau_low_def, tau_high_def
+
+    coarse = coarse_aggregate_from_dynamic(feat_policy, parents_t, H, W).to(dev, dtype=torch.float32)
+    Fdim = int(coarse.shape[1])
+    idxs = [int(c) for c in _resolve_channel_indices(cfg) if 0 <= int(c) < Fdim]
+    if len(idxs) == 0:
+        idxs = list(range(Fdim))
+    if len(idxs) == 0:
+        idxs = [0]
+
+    score_list: List[torch.Tensor] = []
+    for c in idxs:
+        score_list.append(_coarse_grad_mag(coarse[:, c], H, W, dx, dy, p=p_pow))
+    S = torch.stack(score_list, dim=0)  # (Csel, H*W)
+
+    if weights is not None:
+        w = torch.as_tensor(weights, device=S.device, dtype=S.dtype)
+        if w.numel() != S.size(0):
+            if w.numel() < S.size(0):
+                w = torch.cat([w, w.new_ones(S.size(0) - w.numel())])
+            else:
+                w = w[:S.size(0)]
+    else:
+        w = torch.ones(S.size(0), device=S.device, dtype=S.dtype)
+
+    if combine == "max":
+        s_ref = S.max(dim=0).values
+    elif combine in ("sum", "weighted_sum"):
+        s_ref = (w.view(-1, 1) * S).sum(dim=0)
+    else:  # l2 / weighted_l2
+        s_ref = torch.sqrt(((w.view(-1, 1) * S) ** 2).sum(dim=0))
+
+    g_base = torch.nan_to_num(
+        s_ref.view(H, W),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    ).to(dev)
+
+    xmin, xmax, ymin, ymax = _get_bbox(cfg)
+    masks_by_level: Dict[int, torch.Tensor] = {}
+
+    for L in range(1, Lmax + 1):
+        h_p = H * (rr ** (L - 1))
+        w_p = W * (rr ** (L - 1))
+        if (h_p, w_p) == (H, W):
+            g_parent = g_base
+        else:
+            g_parent = F.interpolate(
+                g_base[None, None],
+                size=(h_p, w_p),
+                mode="bilinear",
+                align_corners=False,
+            )[0, 0]
+        g_parent = torch.nan_to_num(g_parent, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if mode == "percentile":
+            if use_global_pct:
+                p_low, p_high = pct_low_default, pct_high_default
+            else:
+                pL = _pct_level_entry(L)
+                if use_level_pct and (pL is None):
+                    p_low, p_high = pct_low_default, pct_high_default
+                elif isinstance(pL, dict):
+                    p_low = float(pL.get("low", pct_low_default))
+                    p_high = float(pL.get("high", pct_high_default))
+                else:
+                    p_low, p_high = pct_low_default, pct_high_default
+            p_low = max(0.0, min(100.0, p_low))
+            p_high = max(0.0, min(100.0, p_high))
+            if p_low > p_high:
+                p_low, p_high = p_high, p_low
+            finite = torch.isfinite(g_parent)
+            if finite.any():
+                thr_low = torch.quantile(g_parent[finite], p_low / 100.0)
+                thr_high = torch.quantile(g_parent[finite], p_high / 100.0)
+            else:
+                thr_low = torch.as_tensor(float("inf"), device=dev, dtype=g_parent.dtype)
+                thr_high = torch.as_tensor(float("inf"), device=dev, dtype=g_parent.dtype)
+        else:
+            tau_low, tau_high = _taus(L)
+            thr_low = torch.as_tensor(tau_low, device=dev, dtype=g_parent.dtype)
+            thr_high = torch.as_tensor(tau_high, device=dev, dtype=g_parent.dtype)
+
+        if L == 1:
+            prev2d = mask_t_parent.to(dev, dtype=torch.float32).view(H, W)
+            if prev2d.shape != (h_p, w_p):
+                prev2d = F.interpolate(prev2d[None, None], size=(h_p, w_p), mode="nearest")[0, 0]
+            prev_mask = prev2d.bool()
+            keep = prev_mask & (g_parent > thr_low)
+            newr = (~prev_mask) & (g_parent > thr_high)
+            M = keep | newr
+        else:
+            M = g_parent > thr_high
+
+        if L > 1:
+            allow = F.interpolate(
+                masks_by_level[L - 1].float()[None, None],
+                scale_factor=float(rr),
+                mode="nearest",
+            )[0, 0].bool()
+            M = M & allow[:h_p, :w_p]
+
+        r_phys = float(pol.get(f"dilate_phys_L{L}", 0.0))
+        if r_phys > 0:
+            dxL_here = (xmax - xmin) / float(W * (rr ** (L - 1)))
+            r_cells = max(1, int(round(r_phys / max(dxL_here, 1e-12))))
+            k = 2 * r_cells + 1
+            M = F.max_pool2d(
+                M.float()[None, None],
+                kernel_size=k,
+                stride=1,
+                padding=r_cells,
+            )[0, 0].bool()
+
+        masks_by_level[L] = M
+
+    return {L: masks_by_level[L].to(device=device, dtype=torch.bool) for L in masks_by_level.keys()}
+
+
+@torch.no_grad()
 def _runtime_build_pred_mesh_from_state(
     *,
     centers_t: torch.Tensor,
@@ -2940,6 +3182,18 @@ def _runtime_build_pred_mesh_from_state(
             W=W,
             device=dev,
             runtime_mesh_policy=runtime_mesh_policy,
+        )
+    elif policy_backend == "gradient_fast":
+        masks_pred_by_level = _runtime_predict_masks_from_fast_gradients(
+            feat_policy=feat_policy,
+            parents_t=parents_t,
+            mask_t_parent=mask_t_parent,
+            cfg=cfg,
+            H=H,
+            W=W,
+            dx=dx,
+            dy=dy,
+            device=dev,
         )
     else:
         masks_pred_by_level = predict_masks_hierarchical_from_gt_gradients(
@@ -4156,7 +4410,7 @@ def train_one_epoch_multi_step(
                         _assert_finite("r_phy_abs", r_phy_abs)
 
                 # ----- build node input X (PARC appends operator inputs) -----
-                x_in = _build_X(norm_in, pred_centers, pred_levels, cfg)
+                x_in = _build_X(norm_in, pred_centers, pred_levels, cfg, dt_hat=dt_hat)
 
                 # Allow diffusion-only or advection-only PARC inputs:
                 # If one operator term is missing (None), substitute a correctly-shaped zero tensor.
@@ -4290,7 +4544,7 @@ def train_one_epoch_multi_step(
                     Fdim = x_in_abs.size(1)
 
                     # Base X is built from norm_in + geometry (pos, level, etc.)
-                    base_X = _build_X(norm_in, pred_centers, pred_levels, cfg)
+                    base_X = _build_X(norm_in, pred_centers, pred_levels, cfg, dt_hat=dt_hat)
 
                     print("\n[BASE_X BREAKDOWN]")
                     print("  base_X shape:", tuple(base_X.shape))
@@ -4538,7 +4792,7 @@ def train_one_epoch_multi_step(
                                         base_stage = base_stage + adv_w_stage * r_adv_stage
                                     r_phy_stage = _sanitize_ops_term(base_stage, cfg)
 
-                        x_stage_in = _build_X(norm_state, pred_centers, pred_levels, cfg)
+                        x_stage_in = _build_X(norm_state, pred_centers, pred_levels, cfg, dt_hat=dt_hat)
                         if parc_use and ((r_adv_stage is not None) or (r_diff_stage is not None)):
                             ref_stage = r_diff_stage if (r_diff_stage is not None) else r_adv_stage
                             r_adv_in_stage = r_adv_stage if (r_adv_stage is not None) else torch.zeros_like(ref_stage)
@@ -5077,8 +5331,6 @@ def train_one_epoch_multi_step(
         )
         pred_ea_1 = pred_ea_list[k + 1] if (pred_ea_list is not None) else None
 
-        print("Step 0")
-
         # --- Option A: move ONLY step-0 tensors to GPU here ---
         pred_centers_1 = _to_dev_nb(pred_centers_1)
         pred_levels_1  = _to_dev_nb(pred_levels_1)
@@ -5169,7 +5421,7 @@ def train_one_epoch_multi_step(
         # STEPS 1..K-2
         # ======================
         for k in range(1, K - 1):
-            print(f"\nStep {k}")
+            #print(f"\nStep {k}")
             pred_centers_next, pred_levels_next, pred_parents_next, pred_ei_next, mask_pred_next = _pred_mesh_for_step_strict(k, pred_lists=pred_lists)
             pred_ea_next = pred_ea_list[k + 1] if (pred_ea_list is not None) else None
 
@@ -5767,7 +6019,7 @@ def evaluate_one_epoch_multi_step(
                                 r_phy_abs = _sanitize_ops_term(base, cfg)
 
                     # Build node inputs
-                    x_in = _build_X(norm_in, pred_centers, pred_levels, cfg)
+                    x_in = _build_X(norm_in, pred_centers, pred_levels, cfg, dt_hat=dt_hat)
 
                     parc_extra = None
                     if parc_use:
@@ -5924,7 +6176,7 @@ def evaluate_one_epoch_multi_step(
                                             base_stage = base_stage + adv_w_stage * r_adv_stage
                                         r_phy_stage = _sanitize_ops_term(base_stage, cfg)
 
-                            x_stage_in = _build_X(norm_state, pred_centers, pred_levels, cfg)
+                            x_stage_in = _build_X(norm_state, pred_centers, pred_levels, cfg, dt_hat=dt_hat)
                             if parc_use and ((r_adv_stage is not None) or (r_diff_stage is not None)):
                                 ref_stage = r_diff_stage if (r_diff_stage is not None) else r_adv_stage
                                 r_adv_in_stage = r_adv_stage if (r_adv_stage is not None) else torch.zeros_like(ref_stage)
@@ -6653,9 +6905,12 @@ def parent_mask_from_selected(pred_parents: torch.Tensor,
 def build_model_from_cfg(cfg, device):
     use_cols = cfg.get("features", {}).get("use_columns", [0, 1, 2, 3])
     Fdim = int(cfg.get("features", {}).get("num_features", len(use_cols)))
+    model_cfg = cfg.get("model", {}) or {}
 
     b = cfg.get("features", {}).get("build", {})
     in_ch = Fdim + (2 if b.get("use_pos", True) else 0) + (1 if b.get("use_level", True) else 0)
+    if bool(b.get("use_dt_hat_fixed", False)):
+        in_ch += 1
 
     loss = cfg.get("loss", {}) or {}
     parc_on = bool(loss.get("parc", False) or loss.get("parc_inputs", False))
@@ -6663,14 +6918,20 @@ def build_model_from_cfg(cfg, device):
         in_ch += dec.parc_extra_in_channels(cfg, Fdim)
 
     out_ch = Fdim
+    conv_type = str(model_cfg.get("conv_type", "sage")).strip().lower()
+    edge_dim = int(model_cfg.get("edge_dim", 5)) if conv_type in ("gine", "nnconv") else None
+    nnconv_hidden = int(model_cfg.get("nnconv_hidden", model_cfg.get("hidden", 128)))
 
     model = FeatureNet(
         in_channels=in_ch,
         out_channels=out_ch,
-        hidden=int(cfg.get("model", {}).get("hidden", 128)),
-        layers=int(cfg.get("model", {}).get("layers", 3)),
-        dropout=float(cfg.get("model", {}).get("dropout", 0.1)),
+        hidden=int(model_cfg.get("hidden", 128)),
+        layers=int(model_cfg.get("layers", 3)),
+        dropout=float(model_cfg.get("dropout", 0.1)),
         make_score_head=True,
+        conv_type=conv_type,
+        edge_dim=edge_dim,
+        nnconv_hidden=nnconv_hidden,
     ).to(device)
 
     # -------------------------

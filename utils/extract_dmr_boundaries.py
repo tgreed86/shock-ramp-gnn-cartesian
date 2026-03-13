@@ -446,7 +446,7 @@ def main(argv=None):
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "map_file",
+        "--map_file",
         help="Path to DMR.plot.XXXXX.2d.map.hdf5 (only the map file is needed).",
     )
     parser.add_argument(

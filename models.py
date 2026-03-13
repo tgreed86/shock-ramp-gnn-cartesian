@@ -3,7 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 import time
 from torch_geometric.nn import GATConv, GraphUNet
-from torch_geometric.nn import SAGEConv
+from torch_geometric.nn import SAGEConv, GINEConv, NNConv
 import inspect
 from typing import Any, Dict
 
@@ -21,11 +21,43 @@ class FeatureNet(nn.Module):
         layers: int = 3,
         dropout: float = 0.1,
         make_score_head: bool = True,
+        conv_type: str = "sage",
+        edge_dim: int | None = None,
+        nnconv_hidden: int = 64,
     ):
         super().__init__()
         self.dropout = dropout
+        self.conv_type = str(conv_type).strip().lower()
+        if self.conv_type not in {"sage", "gine", "nnconv"}:
+            raise ValueError(
+                f"Unsupported FeatureNet conv_type '{conv_type}'. Use 'sage', 'gine', or 'nnconv'."
+            )
+        self.edge_dim = None if edge_dim is None else int(edge_dim)
         dims = [in_channels] + [hidden] * (layers - 1)
-        self.convs = nn.ModuleList([SAGEConv(dims[i], dims[i+1]) for i in range(len(dims)-1)])
+        self.convs = nn.ModuleList()
+        for i in range(len(dims) - 1):
+            in_ch = int(dims[i])
+            out_ch = int(dims[i + 1])
+            if self.conv_type == "sage":
+                self.convs.append(SAGEConv(in_ch, out_ch))
+            elif self.conv_type == "gine":
+                if self.edge_dim is None:
+                    raise ValueError("FeatureNet conv_type='gine' requires edge_dim in config.")
+                mlp = nn.Sequential(
+                    nn.Linear(in_ch, out_ch),
+                    nn.ReLU(),
+                    nn.Linear(out_ch, out_ch),
+                )
+                self.convs.append(GINEConv(mlp, edge_dim=self.edge_dim))
+            else:  # nnconv
+                if self.edge_dim is None:
+                    raise ValueError("FeatureNet conv_type='nnconv' requires edge_dim in config.")
+                edge_net = nn.Sequential(
+                    nn.Linear(self.edge_dim, int(nnconv_hidden)),
+                    nn.ReLU(),
+                    nn.Linear(int(nnconv_hidden), in_ch * out_ch),
+                )
+                self.convs.append(NNConv(in_ch, out_ch, nn=edge_net, aggr="mean"))
         self.feat_head = nn.Sequential(
             nn.Linear(hidden, hidden),
             nn.ReLU(),
@@ -41,7 +73,7 @@ class FeatureNet(nn.Module):
                 nn.Linear(hidden//2, 1)  # refine score (logit)
             )
 
-    def forward(self, X, edge_index):
+    def forward(self, X, edge_index, edge_attr=None):
         h = X
         hang_dbg_once = not hasattr(self, "_hang_dbg_once")
         if hang_dbg_once:
@@ -49,17 +81,33 @@ class FeatureNet(nn.Module):
                 ei_shape = tuple(edge_index.shape) if torch.is_tensor(edge_index) else None
             except Exception:
                 ei_shape = None
+            try:
+                ea_shape = tuple(edge_attr.shape) if torch.is_tensor(edge_attr) else None
+            except Exception:
+                ea_shape = None
             print(
                 f"[HANG-DBG] FeatureNet.forward start: X={tuple(X.shape)} "
-                f"dtype={X.dtype} dev={X.device} edge_index={ei_shape}",
+                f"dtype={X.dtype} dev={X.device} edge_index={ei_shape} "
+                f"edge_attr={ea_shape} conv_type={self.conv_type}",
                 flush=True,
             )
+
+        edge_attr_use = None
+        if self.conv_type != "sage":
+            if edge_attr is None:
+                raise RuntimeError(
+                    f"FeatureNet conv_type='{self.conv_type}' requires edge_attr, but got None."
+                )
+            edge_attr_use = edge_attr.to(device=h.device, dtype=h.dtype)
 
         for li, conv in enumerate(self.convs):
             t0 = time.perf_counter() if hang_dbg_once else None
             if hang_dbg_once:
                 print(f"[HANG-DBG] FeatureNet conv[{li}] begin", flush=True)
-            h = conv(h, edge_index)
+            if self.conv_type == "sage":
+                h = conv(h, edge_index)
+            else:
+                h = conv(h, edge_index, edge_attr_use)
             if hang_dbg_once:
                 print(
                     f"[HANG-DBG] FeatureNet conv[{li}] done in {time.perf_counter() - t0:.3f}s",

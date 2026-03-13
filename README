@@ -6,6 +6,13 @@ This outputs a single pt with all of the relevant info to continue.
 Then use extract_dmr_boundaries.py in utils/ to read from one of the hdf5 "map" files.
 This file extracts the physical shock ramp boundaries and saves that info to utils/wedge_mesh_spec.pt
 
+Before getting to mesh prediction, I first need to define the physical boundaries of the system;
+for shock ramp, the physical boundaries do not follow a rectangular space.
+I can do this with utils/extract_dmr_boundaries.py, which produces a file, wedge_mesh_spec.pt, from any one of the .map.hdf5 for the relevant simulation.
+This file should be specified in the config file under:
+"mesh": {
+    "starting_mesh_path":
+
 With the above steps complete, I can move to the mesh prediction. This can be done by running the main file,
 train.py, with "precomp_force_recompute": true in the config file under "train". This automatically
 runs the training after the mesh prediction and interpolation steps have completed. 

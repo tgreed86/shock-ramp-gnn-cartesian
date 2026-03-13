@@ -35,6 +35,19 @@ Notes:
     pretrain.precompute_pred_mesh_and_interps_for_rollout, pretrain.CollateWithPrecompute
     plots.compute_plot_deltas, plots._recover_parent_mask, plots._unwrap_delta, plots._fidx_or_none, plots._draw_amr_cells
     train.build_model_from_cfg, train.evaluate_one_epoch_multi_step, train._get_bbox
+
+Example command for CNN policy rollout:
+    python rollout_viz_v3.py \
+    --checkpoint ./runs_mesh_first/CNN_mesh_predictor/10ep_test/best_model.pt \
+    --start-t 20 \
+    --horizon 40 \
+    --out-dir ./runs_mesh_first/CNN_mesh_predictor/10ep_test/runtime_mesh_cnn_t20_h40 \
+    --fps 4 --device cpu \
+    --pt-path /Users/trevorreed/UVA_postdoc_stuff/gparc/data/shock_ramp/shock_ramp_amr.pt \
+    --unify-clims \
+    --config ./runs_mesh_first/CNN_mesh_predictor/10ep_test/config.json \
+    --runtime-mesh-cnn-ckpt ./runs_mesh_policy_cnn/without_parent_masks/unet_hierarchical/500ep_lr-scheduler_3-6-26/mesh_policy_cnn_best.pt \
+    --runtime-mesh-spec-path utils/wedge_mesh_spec.pt
 """
 
 import os
@@ -73,6 +86,7 @@ from train import (
     evaluate_one_epoch_multi_step,
     _get_bbox,
     _load_runtime_mesh_policy_from_cfg,
+    move_precomp_to_device,
 )
 from models import ParcFeatureAdapter
 from utils_geom import build_idw_map, apply_idw_map
@@ -122,6 +136,26 @@ def _load_pt_series(pt_path: str):
     else:
         data_list = torch.load(pt_path, map_location="cpu")
     return data_list
+
+
+def _load_precomp_artifact(precomp_path: str, *, T: int, H: int, W: int):
+    """
+    Load precomp from either:
+      - torch checkpoint artifact (.pt/.pth): torch.load(...)
+      - streaming HDF5 cache (.h5/.hdf5): LazyPrecompH5 via move_precomp_to_device(...)
+    """
+    path = os.path.expanduser(str(precomp_path))
+    low = path.lower()
+    if low.endswith((".h5", ".hdf5")):
+        h5_handle = {
+            "type": "h5",
+            "path": path,
+            "T": int(T),
+            "H": int(H),
+            "W": int(W),
+        }
+        return move_precomp_to_device(h5_handle, device="cpu")
+    return torch.load(path, map_location="cpu", weights_only=False)
 
 def _get_refine_ratio(cfg: dict) -> int:
     pol = cfg.get("policy", {}) or {}
@@ -1796,7 +1830,7 @@ def main():
 
     # Precomp controls
     ap.add_argument("--precomp-path", type=str, default=None,
-                    help="Optional path to load precomp (torch.load).")
+                    help="Optional precomp artifact path (.pt/.pth via torch.load, or .h5/.hdf5 streaming cache).")
     ap.add_argument("--save-precomp", type=str, default=None,
                     help="If set and precomp is computed, save it to this path (torch.save).")
     ap.add_argument("--recompute-precomp", action="store_true",
@@ -2000,7 +2034,7 @@ def main():
         print("args.precomp_path:", args.precomp_path)
         if args.precomp_path is not None:
             log(f"[INFO] Loading precomp from {args.precomp_path}")
-            precomp = torch.load(args.precomp_path, map_location="cpu", weights_only=False)
+            precomp = _load_precomp_artifact(args.precomp_path, T=T, H=H, W=W)
         elif (not args.recompute_precomp) and ("precomp" in ckpt):
             log("[INFO] Using precomp from checkpoint.")
             precomp = ckpt["precomp"]
@@ -2120,15 +2154,21 @@ def main():
 
     budget_csv_path = os.path.join(out_dir, "rollout_budgets.csv")
 
-    # Norm stats
-    norm_stats = ckpt.get("norm_stats", None)
+    # Norm stats: prefer checkpoint payload, then fall back to config payload.
+    norm_stats = ckpt.get("norm_stats", None) if isinstance(ckpt, dict) else None
+    if (not norm_stats) or (norm_stats.get("mu") is None):
+        cfg_norm = (cfg.get("features", {}) or {}).get("norm_stats", None)
+        if cfg_norm and (cfg_norm.get("mu") is not None):
+            norm_stats = cfg_norm
+            log("[INFO] Using normalization stats from config.")
+
     if norm_stats is not None and norm_stats.get("mu") is not None:
         mu = torch.tensor(norm_stats["mu"], dtype=torch.float32, device=device)
         sigma = torch.tensor(norm_stats["sigma"], dtype=torch.float32, device=device)
-        log("[INFO] Using normalization stats from checkpoint.")
+        log("[INFO] Normalization is enabled for rollout.")
     else:
         mu = sigma = None
-        log("[WARN] No normalization stats in checkpoint; proceeding without normalization.")
+        log("[WARN] No normalization stats found in checkpoint/config; proceeding without normalization.")
 
     degree_diag_requested = (args.degree_diag_steps is not None) and (str(args.degree_diag_steps).strip() != "")
 
