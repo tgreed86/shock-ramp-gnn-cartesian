@@ -1947,14 +1947,14 @@ def _shock_masked_entropy_diagnostic(
         )
 
     # NOTE:
-    # This diagnostic is metrics-only (no grad path). Keep on-device for CPU/CUDA,
-    # but route through CPU on MPS to avoid intermittent index_add_ placeholder errors.
-    if pred_abs.device.type == "mps":
-        pred_abs = pred_abs.detach().to("cpu")
-        gt_abs = gt_abs.detach().to("cpu")
-        pred_levels = pred_levels.detach().to("cpu")
-        pred_centers = pred_centers.detach().to("cpu")
-        pred_ei = pred_ei.detach().to("cpu") if pred_ei is not None else pred_ei
+    # Diagnostics are metrics-only (no grad path). On MPS we route to CPU to avoid
+    # intermittent index_add_ placeholder errors; otherwise keep native device.
+    diag_dev = torch.device("cpu") if pred_abs.device.type == "mps" else pred_abs.device
+    pred_abs = pred_abs.detach().to(diag_dev)
+    gt_abs = gt_abs.detach().to(diag_dev)
+    pred_levels = pred_levels.detach().to(diag_dev)
+    pred_centers = pred_centers.detach().to(diag_dev)
+    pred_ei = pred_ei.detach().to(diag_dev) if pred_ei is not None else pred_ei
 
     levels = pred_levels.view(-1)
     w = dec.cell_area_from_levels(

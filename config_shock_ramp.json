@@ -27,9 +27,9 @@
   "split": { "train": 0.85, "val": 0.1, "test": 0.05 },
 
   "train": {
-    "precomp_cache_path": "./cache/L2_uniform/shock_ramp_precomp_L2_uniform_faceAdj_DEC.h5",
+    "precomp_cache_path": "./cache/L3_uniform/shock_ramp_precomp_L3_uniform_faceAdj_DEC.h5",
     "precomp_force_recompute": false,
-    "epochs": 50,
+    "epochs": 5,
     "checkpoint_every_epochs": 5,
     "validation_every_epochs": 5,
     "batch_size": 1,
@@ -105,7 +105,7 @@
     "geometry_mode": "starting_refine",
     "_comment_geometry_mode": "gt_gradients or starting_refine for uniform mesh",
     "starting_refine_policy": "min_level",
-    "starting_refine_to_level": 2,
+    "starting_refine_to_level": 3,
     "refine_ratio": 2,
     "hysteresis_mode": "percentile",
     "percentile_low":  85.0,
