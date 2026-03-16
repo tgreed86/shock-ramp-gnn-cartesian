@@ -38,6 +38,7 @@ from utils_geom import build_idw_map, apply_idw_map, apply_precomputed_idw_map, 
 
 from pretrain import (
     precompute_pred_mesh_and_interps_for_rollout,
+    precompute_uniform_mesh_in_memory,
     CollateWithPrecompute,
     CollateWithDtOnly,
     _build_starting_mesh_from_spec,
@@ -1705,6 +1706,688 @@ def _runtime_step_log_write_summary(csv_path: str, summary_path: str) -> None:
                     f"  {m}: n={n} mean={mean:.6g} min={vmin:.6g} max={vmax:.6g} p95={p95:.6g}\n"
                 )
             f.write("\n")
+
+
+def _resolve_diagnostics_cfg(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    diagnostics = cfg.setdefault("diagnostics", {})
+    if not isinstance(diagnostics, dict):
+        raise ValueError("diagnostics must be a JSON object when provided.")
+
+    loss_cfg = cfg.get("loss", {}) or {}
+
+    entropy_cfg = diagnostics.setdefault("entropy", {})
+    if not isinstance(entropy_cfg, dict):
+        raise ValueError("diagnostics.entropy must be a JSON object when provided.")
+    entropy_cfg.setdefault("enabled", True)
+    entropy_cfg.setdefault("save_to_csv", True)
+
+    admiss_cfg = diagnostics.setdefault("admissibility", {})
+    if not isinstance(admiss_cfg, dict):
+        raise ValueError("diagnostics.admissibility must be a JSON object when provided.")
+    admiss_cfg.setdefault("enabled", True)
+    admiss_cfg.setdefault("save_to_csv", True)
+    admiss_cfg.setdefault("pre_sanitize", True)
+    admiss_cfg.setdefault("post_sanitize", True)
+    admiss_cfg.setdefault("rho_floor", loss_cfg.get("rho_floor", 1e-6))
+    admiss_cfg.setdefault("eint_floor", 0.0)
+    admiss_cfg.setdefault("p_floor", loss_cfg.get("p_floor", 0.0))
+
+    shock_cfg = diagnostics.setdefault("shock_masked_entropy", {})
+    if not isinstance(shock_cfg, dict):
+        raise ValueError("diagnostics.shock_masked_entropy must be a JSON object when provided.")
+    shock_cfg.setdefault("enabled", True)
+    shock_cfg.setdefault("save_to_csv", True)
+    shock_cfg.setdefault("source", "gt_density_gradient")
+    shock_cfg.setdefault("top_fraction", 0.10)
+    shock_cfg.setdefault("min_cells", 32)
+
+    resolved = {
+        "entropy": {
+            "enabled": bool(entropy_cfg.get("enabled", True)),
+            "save_to_csv": bool(entropy_cfg.get("save_to_csv", True)),
+        },
+        "admissibility": {
+            "enabled": bool(admiss_cfg.get("enabled", True)),
+            "save_to_csv": bool(admiss_cfg.get("save_to_csv", True)),
+            "pre_sanitize": bool(admiss_cfg.get("pre_sanitize", True)),
+            "post_sanitize": bool(admiss_cfg.get("post_sanitize", True)),
+            "rho_floor": float(admiss_cfg.get("rho_floor", loss_cfg.get("rho_floor", 1e-6))),
+            "eint_floor": float(admiss_cfg.get("eint_floor", 0.0)),
+            "p_floor": float(admiss_cfg.get("p_floor", loss_cfg.get("p_floor", 0.0))),
+        },
+        "shock_masked_entropy": {
+            "enabled": bool(shock_cfg.get("enabled", True)),
+            "save_to_csv": bool(shock_cfg.get("save_to_csv", True)),
+            "source": str(shock_cfg.get("source", "gt_density_gradient")).strip().lower(),
+            "top_fraction": float(shock_cfg.get("top_fraction", 0.10)),
+            "min_cells": int(shock_cfg.get("min_cells", 32)),
+        },
+    }
+
+    admiss_resolved = resolved["admissibility"]
+    if admiss_resolved["enabled"] and (not admiss_resolved["pre_sanitize"]) and (not admiss_resolved["post_sanitize"]):
+        raise ValueError(
+            "diagnostics.admissibility.enabled=true requires pre_sanitize=true or post_sanitize=true."
+        )
+
+    shock_resolved = resolved["shock_masked_entropy"]
+    if shock_resolved["enabled"]:
+        if not (0.0 < shock_resolved["top_fraction"] <= 1.0):
+            raise ValueError("diagnostics.shock_masked_entropy.top_fraction must be in (0, 1].")
+        if shock_resolved["min_cells"] < 1:
+            raise ValueError("diagnostics.shock_masked_entropy.min_cells must be >= 1.")
+        if shock_resolved["source"] != "gt_density_gradient":
+            raise ValueError(
+                "diagnostics.shock_masked_entropy.source currently supports only 'gt_density_gradient'."
+            )
+
+    return resolved
+
+
+def _admissibility_prefixes(admiss_cfg: Dict[str, Any]) -> List[str]:
+    prefixes: List[str] = []
+    if bool(admiss_cfg.get("pre_sanitize", False)):
+        prefixes.append("admiss_pre")
+    if bool(admiss_cfg.get("post_sanitize", False)):
+        prefixes.append("admiss_post")
+    return prefixes
+
+
+def _entropy_diagnostic_pair(
+    pred_abs: torch.Tensor,
+    gt_abs: torch.Tensor,
+    pred_levels: torch.Tensor,
+    cfg: Dict[str, Any],
+    *,
+    dx: float,
+    dy: float,
+    eps: float = 1e-12,
+) -> Dict[str, torch.Tensor]:
+    """
+    Entropy diagnostics on the prediction mesh.
+    total entropy uses the area integral of rho * s, where
+      s ~ log(p) - gamma * log(rho)
+    and therefore is an entropy proxy up to an additive constant.
+    """
+    if pred_abs.ndim != 2 or gt_abs.ndim != 2:
+        raise RuntimeError(
+            f"Entropy diagnostics expect [N,F] tensors, got pred={tuple(pred_abs.shape)} gt={tuple(gt_abs.shape)}"
+        )
+    if pred_abs.shape != gt_abs.shape:
+        raise RuntimeError(
+            f"Entropy diagnostic shape mismatch: pred={tuple(pred_abs.shape)} gt={tuple(gt_abs.shape)}"
+        )
+
+    levels = pred_levels.view(-1)
+    w = dec.cell_area_from_levels(
+        levels,
+        dx0=float(dx),
+        dy0=float(dy),
+        dtype=pred_abs.dtype,
+        device=pred_abs.device,
+        refine_ratio=_get_refine_ratio(cfg),
+    )
+    idx = dec.infer_feature_indices(cfg, pred_abs.size(1))
+
+    def _one(x_abs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        rho = x_abs[:, idx["rho"]].abs().clamp_min(eps)
+        s = dec.specific_entropy_from_conservative_state(x_abs, cfg, eps=eps, p_floor=eps)
+        total = (w * (rho * s)).sum()
+        mass = (w * rho).sum()
+        return total, mass
+
+    pred_total, pred_mass = _one(pred_abs)
+    gt_total, gt_mass = _one(gt_abs)
+    return {
+        "entropy_pred_total": pred_total,
+        "entropy_gt_total": gt_total,
+        "entropy_pred_mass": pred_mass,
+        "entropy_gt_mass": gt_mass,
+    }
+
+
+def _admissibility_diagnostic(
+    x_abs: torch.Tensor,
+    pred_levels: torch.Tensor,
+    cfg: Dict[str, Any],
+    *,
+    dx: float,
+    dy: float,
+    rho_floor: float,
+    eint_floor: float,
+    p_floor: float,
+    eps: float = 1e-12,
+) -> Dict[str, torch.Tensor]:
+    if x_abs.ndim != 2:
+        raise RuntimeError(f"Admissibility diagnostics expect [N,F], got {tuple(x_abs.shape)}")
+
+    levels = pred_levels.view(-1)
+    w = dec.cell_area_from_levels(
+        levels,
+        dx0=float(dx),
+        dy0=float(dy),
+        dtype=x_abs.dtype,
+        device=x_abs.device,
+        refine_ratio=_get_refine_ratio(cfg),
+    )
+    idx = dec.infer_feature_indices(cfg, x_abs.size(1))
+    rho = x_abs[:, idx["rho"]]
+    mx = x_abs[:, idx["mx"]]
+    my = x_abs[:, idx["my"]]
+    E = x_abs[:, idx["E"]]
+
+    finite_state = torch.isfinite(rho) & torch.isfinite(mx) & torch.isfinite(my) & torch.isfinite(E)
+    eint = dec.specific_internal_energy_from_conservative_state(x_abs, cfg, eps=eps)
+    p = dec.pressure_from_conservative_state(x_abs, cfg, eps=eps, clamp_min=None)
+
+    rho_violation = (~finite_state) | (rho <= float(rho_floor))
+    eint_violation = rho_violation | (~torch.isfinite(eint)) | (eint <= float(eint_floor))
+    p_violation = rho_violation | (~torch.isfinite(p)) | (p <= float(p_floor))
+
+    def _finite_min(t: torch.Tensor) -> torch.Tensor:
+        finite_t = t[torch.isfinite(t)]
+        if finite_t.numel() == 0:
+            return t.new_tensor(float("nan"))
+        return finite_t.min()
+
+    return {
+        "area_sum": w.sum(),
+        "rho_violation_area_sum": (w * rho_violation.to(w.dtype)).sum(),
+        "eint_violation_area_sum": (w * eint_violation.to(w.dtype)).sum(),
+        "p_violation_area_sum": (w * p_violation.to(w.dtype)).sum(),
+        "rho_min": _finite_min(rho),
+        "eint_min": _finite_min(eint),
+        "p_min": _finite_min(p),
+    }
+
+
+def _edge_geometry_from_centers(
+    centers: torch.Tensor,
+    edge_index: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    eps: float = 1e-12,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if centers.ndim != 2 or centers.size(1) < 2:
+        raise RuntimeError(f"Expected centers with shape [N,>=2], got {tuple(centers.shape)}")
+    if edge_index.ndim != 2 or edge_index.size(0) != 2:
+        raise RuntimeError(f"Expected edge_index with shape [2,E], got {tuple(edge_index.shape)}")
+
+    src = edge_index[0].long()
+    dst = edge_index[1].long()
+    xy = centers[:, :2].to(dtype=dtype)
+    delta = xy.index_select(0, dst) - xy.index_select(0, src)
+    nx = delta[:, 0]
+    ny = delta[:, 1]
+    dist = torch.sqrt((nx * nx + ny * ny).clamp_min(eps))
+    return nx, ny, dist
+
+
+def _shock_masked_entropy_diagnostic(
+    pred_abs: torch.Tensor,
+    gt_abs: torch.Tensor,
+    pred_levels: torch.Tensor,
+    pred_centers: torch.Tensor,
+    pred_ei: torch.Tensor,
+    cfg: Dict[str, Any],
+    *,
+    dx: float,
+    dy: float,
+    top_fraction: float,
+    min_cells: int,
+    eps: float = 1e-12,
+) -> Dict[str, torch.Tensor]:
+    if pred_abs.ndim != 2 or gt_abs.ndim != 2:
+        raise RuntimeError(
+            f"Shock-masked entropy diagnostics expect [N,F] tensors, got pred={tuple(pred_abs.shape)} gt={tuple(gt_abs.shape)}"
+        )
+    if pred_abs.shape != gt_abs.shape:
+        raise RuntimeError(
+            f"Shock-masked entropy shape mismatch: pred={tuple(pred_abs.shape)} gt={tuple(gt_abs.shape)}"
+        )
+
+    # NOTE:
+    # This diagnostic is metrics-only (no grad path). Keep on-device for CPU/CUDA,
+    # but route through CPU on MPS to avoid intermittent index_add_ placeholder errors.
+    if pred_abs.device.type == "mps":
+        pred_abs = pred_abs.detach().to("cpu")
+        gt_abs = gt_abs.detach().to("cpu")
+        pred_levels = pred_levels.detach().to("cpu")
+        pred_centers = pred_centers.detach().to("cpu")
+        pred_ei = pred_ei.detach().to("cpu") if pred_ei is not None else pred_ei
+
+    levels = pred_levels.view(-1)
+    w = dec.cell_area_from_levels(
+        levels,
+        dx0=float(dx),
+        dy0=float(dy),
+        dtype=pred_abs.dtype,
+        device=pred_abs.device,
+        refine_ratio=_get_refine_ratio(cfg),
+    )
+    total_area = w.sum()
+    zero = pred_abs.new_tensor(0.0)
+
+    if pred_abs.size(0) == 0 or pred_ei is None or pred_ei.numel() == 0:
+        return {
+            "shock_entropy_abs_diff_sum": zero,
+            "shock_entropy_diff_sum": zero,
+            "shock_entropy_mask_area_sum": zero,
+            "shock_entropy_total_area_sum": total_area,
+        }
+
+    idx = dec.infer_feature_indices(cfg, gt_abs.size(1))
+    rho_gt = gt_abs[:, idx["rho"]].reshape(-1, 1)
+    nx, ny, edge_dist = _edge_geometry_from_centers(pred_centers, pred_ei, dtype=pred_abs.dtype, eps=eps)
+    grad_rho = dec._compute_node_gradients_ls(rho_gt, pred_ei, nx, ny, edge_dist, eps=eps)
+    grad_mag = torch.sqrt((grad_rho[:, 0, 0] * grad_rho[:, 0, 0] + grad_rho[:, 0, 1] * grad_rho[:, 0, 1]).clamp_min(0.0))
+
+    valid_idx = torch.nonzero(torch.isfinite(grad_mag), as_tuple=False).view(-1)
+    if valid_idx.numel() == 0:
+        return {
+            "shock_entropy_abs_diff_sum": zero,
+            "shock_entropy_diff_sum": zero,
+            "shock_entropy_mask_area_sum": zero,
+            "shock_entropy_total_area_sum": total_area,
+        }
+
+    k = int(np.ceil(float(top_fraction) * float(valid_idx.numel())))
+    k = max(int(min_cells), k)
+    k = min(k, int(valid_idx.numel()))
+
+    top_rel = torch.topk(grad_mag.index_select(0, valid_idx), k=k, largest=True).indices
+    mask_idx = valid_idx.index_select(0, top_rel)
+    mask = torch.zeros((pred_abs.size(0),), dtype=torch.bool, device=pred_abs.device)
+    mask[mask_idx] = True
+
+    s_pred = dec.specific_entropy_from_conservative_state(pred_abs, cfg, eps=eps, p_floor=eps)
+    s_gt = dec.specific_entropy_from_conservative_state(gt_abs, cfg, eps=eps, p_floor=eps)
+    diff = s_pred - s_gt
+    mask = mask & torch.isfinite(diff)
+    if not torch.any(mask):
+        return {
+            "shock_entropy_abs_diff_sum": zero,
+            "shock_entropy_diff_sum": zero,
+            "shock_entropy_mask_area_sum": zero,
+            "shock_entropy_total_area_sum": total_area,
+        }
+
+    w_mask = w[mask]
+    diff_mask = diff[mask]
+    return {
+        "shock_entropy_abs_diff_sum": (w_mask * diff_mask.abs()).sum(),
+        "shock_entropy_diff_sum": (w_mask * diff_mask).sum(),
+        "shock_entropy_mask_area_sum": w_mask.sum(),
+        "shock_entropy_total_area_sum": total_area,
+    }
+
+
+def _new_entropy_accumulator() -> Dict[str, Any]:
+    return {
+        "num_steps": 0,
+        "entropy_pred_total_sum": None,
+        "entropy_gt_total_sum": None,
+        "entropy_pred_mass_sum": None,
+        "entropy_gt_mass_sum": None,
+    }
+
+
+def _accumulate_entropy_accumulator(acc: Dict[str, Any], diag: Dict[str, torch.Tensor]) -> None:
+    acc["num_steps"] += 1
+    for key in ("entropy_pred_total_sum", "entropy_gt_total_sum", "entropy_pred_mass_sum", "entropy_gt_mass_sum"):
+        src_key = key.replace("_sum", "")
+        val = diag[src_key].detach()
+        if acc[key] is None:
+            acc[key] = val.clone()
+        else:
+            acc[key] = acc[key] + val
+
+
+def _finalize_entropy_accumulator(acc: Dict[str, Any], *, eps: float = 1e-12) -> Dict[str, float]:
+    n_steps = int(acc.get("num_steps", 0))
+    if n_steps <= 0:
+        return {
+            "entropy_num_steps": 0,
+            "entropy_pred_total": float("nan"),
+            "entropy_gt_total": float("nan"),
+            "entropy_total_gap": float("nan"),
+            "entropy_pred_specific_mean": float("nan"),
+            "entropy_gt_specific_mean": float("nan"),
+            "entropy_specific_mean_gap": float("nan"),
+        }
+
+    pred_total_sum_t = acc.get("entropy_pred_total_sum")
+    gt_total_sum_t = acc.get("entropy_gt_total_sum")
+    pred_mass_sum_t = acc.get("entropy_pred_mass_sum")
+    gt_mass_sum_t = acc.get("entropy_gt_mass_sum")
+    if pred_total_sum_t is None or gt_total_sum_t is None or pred_mass_sum_t is None or gt_mass_sum_t is None:
+        raise RuntimeError("Entropy accumulator is incomplete despite num_steps > 0.")
+
+    pred_total_sum = float(pred_total_sum_t.detach().cpu().item())
+    gt_total_sum = float(gt_total_sum_t.detach().cpu().item())
+    pred_mass_sum = max(float(pred_mass_sum_t.detach().cpu().item()), eps)
+    gt_mass_sum = max(float(gt_mass_sum_t.detach().cpu().item()), eps)
+
+    pred_total = pred_total_sum / float(n_steps)
+    gt_total = gt_total_sum / float(n_steps)
+    pred_mean = pred_total_sum / pred_mass_sum
+    gt_mean = gt_total_sum / gt_mass_sum
+    return {
+        "entropy_num_steps": n_steps,
+        "entropy_pred_total": pred_total,
+        "entropy_gt_total": gt_total,
+        "entropy_total_gap": pred_total - gt_total,
+        "entropy_pred_specific_mean": pred_mean,
+        "entropy_gt_specific_mean": gt_mean,
+        "entropy_specific_mean_gap": pred_mean - gt_mean,
+    }
+
+
+def _new_admissibility_accumulator(admiss_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    acc: Dict[str, Any] = {"num_steps": 0}
+    for prefix in _admissibility_prefixes(admiss_cfg):
+        acc[f"{prefix}_area_sum"] = None
+        acc[f"{prefix}_rho_violation_area_sum"] = None
+        acc[f"{prefix}_eint_violation_area_sum"] = None
+        acc[f"{prefix}_p_violation_area_sum"] = None
+        acc[f"{prefix}_rho_min"] = None
+        acc[f"{prefix}_eint_min"] = None
+        acc[f"{prefix}_p_min"] = None
+    return acc
+
+
+def _running_min_update(prev: torch.Tensor | None, new: torch.Tensor) -> torch.Tensor:
+    new_detached = new.detach()
+    if prev is None:
+        return new_detached.clone()
+    prev_finite = torch.isfinite(prev)
+    new_finite = torch.isfinite(new_detached)
+    both_finite = prev_finite & new_finite
+    return torch.where(
+        both_finite,
+        torch.minimum(prev, new_detached),
+        torch.where(prev_finite, prev, new_detached),
+    )
+
+
+def _accumulate_admissibility_accumulator(
+    acc: Dict[str, Any],
+    diag: Dict[str, torch.Tensor],
+    *,
+    prefix: str,
+) -> None:
+    for key in ("area_sum", "rho_violation_area_sum", "eint_violation_area_sum", "p_violation_area_sum"):
+        acc_key = f"{prefix}_{key}"
+        val = diag[key].detach()
+        if acc[acc_key] is None:
+            acc[acc_key] = val.clone()
+        else:
+            acc[acc_key] = acc[acc_key] + val
+
+    for key in ("rho_min", "eint_min", "p_min"):
+        acc_key = f"{prefix}_{key}"
+        acc[acc_key] = _running_min_update(acc.get(acc_key), diag[key])
+
+
+def _finalize_admissibility_accumulator(
+    acc: Dict[str, Any],
+    admiss_cfg: Dict[str, Any],
+    *,
+    eps: float = 1e-12,
+) -> Dict[str, float]:
+    out: Dict[str, float] = {"admissibility_num_steps": int(acc.get("num_steps", 0))}
+    for prefix in _admissibility_prefixes(admiss_cfg):
+        area_sum_t = acc.get(f"{prefix}_area_sum")
+        rho_viol_t = acc.get(f"{prefix}_rho_violation_area_sum")
+        eint_viol_t = acc.get(f"{prefix}_eint_violation_area_sum")
+        p_viol_t = acc.get(f"{prefix}_p_violation_area_sum")
+
+        if area_sum_t is None or rho_viol_t is None or eint_viol_t is None or p_viol_t is None:
+            out[f"{prefix}_rho_violation_frac"] = float("nan")
+            out[f"{prefix}_eint_violation_frac"] = float("nan")
+            out[f"{prefix}_p_violation_frac"] = float("nan")
+        else:
+            area_sum = max(float(area_sum_t.detach().cpu().item()), eps)
+            out[f"{prefix}_rho_violation_frac"] = float(rho_viol_t.detach().cpu().item()) / area_sum
+            out[f"{prefix}_eint_violation_frac"] = float(eint_viol_t.detach().cpu().item()) / area_sum
+            out[f"{prefix}_p_violation_frac"] = float(p_viol_t.detach().cpu().item()) / area_sum
+
+        for key in ("rho_min", "eint_min", "p_min"):
+            min_t = acc.get(f"{prefix}_{key}")
+            out[f"{prefix}_{key}"] = float("nan") if min_t is None else float(min_t.detach().cpu().item())
+
+    return out
+
+
+def _new_shock_entropy_accumulator() -> Dict[str, Any]:
+    return {
+        "num_steps": 0,
+        "shock_entropy_abs_diff_sum": None,
+        "shock_entropy_diff_sum": None,
+        "shock_entropy_mask_area_sum": None,
+        "shock_entropy_total_area_sum": None,
+    }
+
+
+def _accumulate_shock_entropy_accumulator(acc: Dict[str, Any], diag: Dict[str, torch.Tensor]) -> None:
+    acc["num_steps"] += 1
+    for key in (
+        "shock_entropy_abs_diff_sum",
+        "shock_entropy_diff_sum",
+        "shock_entropy_mask_area_sum",
+        "shock_entropy_total_area_sum",
+    ):
+        val = diag[key].detach()
+        if acc[key] is None:
+            acc[key] = val.clone()
+        else:
+            acc[key] = acc[key] + val
+
+
+def _finalize_shock_entropy_accumulator(acc: Dict[str, Any], *, eps: float = 1e-12) -> Dict[str, float]:
+    n_steps = int(acc.get("num_steps", 0))
+    if n_steps <= 0:
+        return {
+            "shock_entropy_num_steps": 0,
+            "shock_entropy_specific_mae": float("nan"),
+            "shock_entropy_specific_bias": float("nan"),
+            "shock_entropy_mask_area_frac": float("nan"),
+        }
+
+    mask_area_t = acc.get("shock_entropy_mask_area_sum")
+    total_area_t = acc.get("shock_entropy_total_area_sum")
+    abs_diff_t = acc.get("shock_entropy_abs_diff_sum")
+    diff_t = acc.get("shock_entropy_diff_sum")
+    if mask_area_t is None or total_area_t is None or abs_diff_t is None or diff_t is None:
+        raise RuntimeError("Shock-masked entropy accumulator is incomplete despite num_steps > 0.")
+
+    mask_area = float(mask_area_t.detach().cpu().item())
+    total_area = max(float(total_area_t.detach().cpu().item()), eps)
+    if mask_area <= eps:
+        mae = float("nan")
+        bias = float("nan")
+    else:
+        mae = float(abs_diff_t.detach().cpu().item()) / mask_area
+        bias = float(diff_t.detach().cpu().item()) / mask_area
+
+    return {
+        "shock_entropy_num_steps": n_steps,
+        "shock_entropy_specific_mae": mae,
+        "shock_entropy_specific_bias": bias,
+        "shock_entropy_mask_area_frac": mask_area / total_area,
+    }
+    
+
+def _new_diagnostics_accumulator(diag_cfg: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    acc: Dict[str, Any] = {}
+    if diag_cfg["entropy"]["enabled"]:
+        acc["entropy"] = _new_entropy_accumulator()
+    if diag_cfg["admissibility"]["enabled"]:
+        acc["admissibility"] = _new_admissibility_accumulator(diag_cfg["admissibility"])
+    if diag_cfg["shock_masked_entropy"]["enabled"]:
+        acc["shock_masked_entropy"] = _new_shock_entropy_accumulator()
+    return acc
+
+
+def _record_enabled_step_diagnostics(
+    acc: Dict[str, Any],
+    *,
+    pred_raw_abs: torch.Tensor,
+    pred_used_abs: torch.Tensor,
+    gt_abs: torch.Tensor,
+    pred_levels: torch.Tensor,
+    pred_centers: torch.Tensor,
+    pred_ei: torch.Tensor,
+    cfg: Dict[str, Any],
+    diag_cfg: Dict[str, Dict[str, Any]],
+    dx: float,
+    dy: float,
+) -> None:
+    if diag_cfg["entropy"]["enabled"]:
+        diag = _entropy_diagnostic_pair(
+            pred_used_abs,
+            gt_abs,
+            pred_levels,
+            cfg,
+            dx=float(dx),
+            dy=float(dy),
+        )
+        _accumulate_entropy_accumulator(acc["entropy"], diag)
+
+    if diag_cfg["admissibility"]["enabled"]:
+        admiss_cfg = diag_cfg["admissibility"]
+        acc["admissibility"]["num_steps"] += 1
+        base_kwargs = {
+            "pred_levels": pred_levels,
+            "cfg": cfg,
+            "dx": float(dx),
+            "dy": float(dy),
+            "rho_floor": float(admiss_cfg["rho_floor"]),
+            "eint_floor": float(admiss_cfg["eint_floor"]),
+            "p_floor": float(admiss_cfg["p_floor"]),
+        }
+        if admiss_cfg["pre_sanitize"]:
+            diag_pre = _admissibility_diagnostic(pred_raw_abs, **base_kwargs)
+            _accumulate_admissibility_accumulator(acc["admissibility"], diag_pre, prefix="admiss_pre")
+        if admiss_cfg["post_sanitize"]:
+            diag_post = _admissibility_diagnostic(pred_used_abs, **base_kwargs)
+            _accumulate_admissibility_accumulator(acc["admissibility"], diag_post, prefix="admiss_post")
+
+    if diag_cfg["shock_masked_entropy"]["enabled"]:
+        shock_cfg = diag_cfg["shock_masked_entropy"]
+        diag = _shock_masked_entropy_diagnostic(
+            pred_used_abs,
+            gt_abs,
+            pred_levels,
+            pred_centers,
+            pred_ei,
+            cfg,
+            dx=float(dx),
+            dy=float(dy),
+            top_fraction=float(shock_cfg["top_fraction"]),
+            min_cells=int(shock_cfg["min_cells"]),
+        )
+        _accumulate_shock_entropy_accumulator(acc["shock_masked_entropy"], diag)
+
+
+def _finalize_diagnostics_accumulator(
+    acc: Dict[str, Any],
+    diag_cfg: Dict[str, Dict[str, Any]],
+) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    if diag_cfg["entropy"]["enabled"]:
+        out.update(_finalize_entropy_accumulator(acc["entropy"]))
+    if diag_cfg["admissibility"]["enabled"]:
+        out.update(_finalize_admissibility_accumulator(acc["admissibility"], diag_cfg["admissibility"]))
+    if diag_cfg["shock_masked_entropy"]["enabled"]:
+        out.update(_finalize_shock_entropy_accumulator(acc["shock_masked_entropy"]))
+    return out
+
+
+def _diagnostics_csv_fields(diag_cfg: Dict[str, Dict[str, Any]]) -> List[str]:
+    fields: List[str] = []
+    if diag_cfg["entropy"]["enabled"] and diag_cfg["entropy"]["save_to_csv"]:
+        fields.extend(
+            [
+                "entropy_pred_total",
+                "entropy_gt_total",
+                "entropy_total_gap",
+                "entropy_pred_specific_mean",
+                "entropy_gt_specific_mean",
+                "entropy_specific_mean_gap",
+            ]
+        )
+    if diag_cfg["admissibility"]["enabled"] and diag_cfg["admissibility"]["save_to_csv"]:
+        for prefix in _admissibility_prefixes(diag_cfg["admissibility"]):
+            fields.extend(
+                [
+                    f"{prefix}_rho_violation_frac",
+                    f"{prefix}_eint_violation_frac",
+                    f"{prefix}_p_violation_frac",
+                    f"{prefix}_rho_min",
+                    f"{prefix}_eint_min",
+                    f"{prefix}_p_min",
+                ]
+            )
+    if diag_cfg["shock_masked_entropy"]["enabled"] and diag_cfg["shock_masked_entropy"]["save_to_csv"]:
+        fields.extend(
+            [
+                "shock_entropy_specific_mae",
+                "shock_entropy_specific_bias",
+                "shock_entropy_mask_area_frac",
+            ]
+        )
+    return fields
+
+
+def _format_diag_float(v: float) -> str:
+    return f"{float(v):.3e}" if np.isfinite(v) else str(float(v))
+
+
+def _format_split_diagnostic_summary(
+    split: str,
+    stats: Dict[str, Any] | None,
+    diag_cfg: Dict[str, Dict[str, Any]],
+) -> str | None:
+    if stats is None:
+        return None
+
+    parts: List[str] = []
+    if diag_cfg["entropy"]["enabled"]:
+        s_pred = float(stats.get("entropy_pred_specific_mean", float("nan")))
+        s_gt = float(stats.get("entropy_gt_specific_mean", float("nan")))
+        s_gap = float(stats.get("entropy_specific_mean_gap", float("nan")))
+        parts.append(
+            f"Sent(mean)={_format_diag_float(s_pred)}/{_format_diag_float(s_gt)} (d={_format_diag_float(s_gap)})"
+        )
+
+    if diag_cfg["admissibility"]["enabled"]:
+        admiss_parts: List[str] = []
+        for prefix in _admissibility_prefixes(diag_cfg["admissibility"]):
+            rho_v = float(stats.get(f"{prefix}_rho_violation_frac", float("nan")))
+            eint_v = float(stats.get(f"{prefix}_eint_violation_frac", float("nan")))
+            p_v = float(stats.get(f"{prefix}_p_violation_frac", float("nan")))
+            label = "pre" if prefix.endswith("pre") else "post"
+            admiss_parts.append(
+                f"{label} rho/e/p={_format_diag_float(rho_v)}/{_format_diag_float(eint_v)}/{_format_diag_float(p_v)}"
+            )
+        if admiss_parts:
+            parts.append("Adm(" + "; ".join(admiss_parts) + ")")
+
+    if diag_cfg["shock_masked_entropy"]["enabled"]:
+        shock_mae = float(stats.get("shock_entropy_specific_mae", float("nan")))
+        shock_bias = float(stats.get("shock_entropy_specific_bias", float("nan")))
+        shock_area = float(stats.get("shock_entropy_mask_area_frac", float("nan")))
+        parts.append(
+            "ShockS("
+            f"mae={_format_diag_float(shock_mae)}, "
+            f"bias={_format_diag_float(shock_bias)}, "
+            f"area={_format_diag_float(shock_area)})"
+        )
+
+    if not parts:
+        return None
+    return f"[DIAG] {split}: " + " | ".join(parts)
 
 
 def _cell_level_ij_from_centers(
@@ -3665,19 +4348,24 @@ def train_one_epoch_multi_step(
     total_loss_accum = 0.0
     mae_accum = 0.0
     n_steps = 0
+    diag_cfg = _resolve_diagnostics_cfg(cfg)
+    diagnostics_accum = _new_diagnostics_accumulator(diag_cfg)
 
     dbg = cfg.get("debug", {})
     nan_watch = bool(dbg.get("nan_watch", True))          # turn on/off
     nan_watch_first_only = bool(dbg.get("nan_first_only", True))
     hang_watch = bool(dbg.get("hang_watch", True))
     hang_watch_batches = int(dbg.get("hang_watch_batches", 4))
-    if hang_watch_batches < 1:
-        hang_watch_batches = 1
+    if hang_watch_batches < 0:
+        hang_watch_batches = 0
+    # Effective enable: either master switch off, or 0 batches -> disabled.
+    hang_watch_enabled = bool(hang_watch and (hang_watch_batches > 0))
     print_batch_time = bool(dbg.get("print_batch_time", False))
     print_runtime_mesh_batch_breakdown = bool(dbg.get("print_runtime_mesh_batch_breakdown", True))
-    progress_every_batches = int(dbg.get("progress_every_batches", 10))
-    if progress_every_batches < 1:
-        progress_every_batches = 1
+    progress_every_batches_raw = int(dbg.get("progress_every_batches", 10))
+    # 0 (or negative) disables periodic [PROGRESS] logging.
+    progress_print_enabled = bool(progress_every_batches_raw > 0)
+    progress_every_batches = max(1, int(progress_every_batches_raw))
 
     if not hasattr(train_one_epoch_multi_step, "_nan_printed"):
         train_one_epoch_multi_step._nan_printed = False
@@ -3691,6 +4379,29 @@ def train_one_epoch_multi_step(
 
     def _mark_printed():
         train_one_epoch_multi_step._nan_printed = True
+
+    def _record_step_diagnostics(
+        *,
+        pred_raw_abs: torch.Tensor,
+        pred_used_abs: torch.Tensor,
+        gt_abs: torch.Tensor,
+        pred_levels: torch.Tensor,
+        pred_centers: torch.Tensor,
+        pred_ei: torch.Tensor,
+    ) -> None:
+        _record_enabled_step_diagnostics(
+            diagnostics_accum,
+            pred_raw_abs=pred_raw_abs.detach(),
+            pred_used_abs=pred_used_abs.detach(),
+            gt_abs=gt_abs.detach(),
+            pred_levels=pred_levels.detach(),
+            pred_centers=pred_centers.detach(),
+            pred_ei=pred_ei.detach(),
+            cfg=cfg,
+            diag_cfg=diag_cfg,
+            dx=float(dx),
+            dy=float(dy),
+        )
 
     def _dump_state(tag, x):
         # expects channels [rho,mx,my,E] in first 4 or via infer_feature_indices
@@ -3856,6 +4567,8 @@ def train_one_epoch_multi_step(
                 print(f"[BATCH-TIME] train batch {bi}/{total_batches} wall={batch_wall_s:.3f}s", flush=True)
             else:
                 print(f"[BATCH-TIME] train batch {bi} wall={batch_wall_s:.3f}s", flush=True)
+        if not progress_print_enabled:
+            return
         if (bi % progress_every_batches) != 0:
             return
         elapsed = float(time.perf_counter() - epoch_loop_t0)
@@ -3924,7 +4637,7 @@ def train_one_epoch_multi_step(
         )
 
     for batch_idx, batch in enumerate(loader):
-        if hang_watch and (not hang_cap_notified) and (batch_idx == hang_watch_batches):
+        if hang_watch_enabled and (not hang_cap_notified) and (batch_idx == hang_watch_batches):
             print(
                 f"[HANG-DBG] detailed hang logs reached configured limit: "
                 f"debug.hang_watch_batches={hang_watch_batches}. "
@@ -3933,7 +4646,7 @@ def train_one_epoch_multi_step(
             )
             hang_cap_notified = True
 
-        batch_dbg = bool(hang_watch and (batch_idx < hang_watch_batches))
+        batch_dbg = bool(hang_watch_enabled and (batch_idx < hang_watch_batches))
         batch_t0 = time.perf_counter()
         if batch_dbg:
             print(f"[HANG-DBG] batch fetched: idx={batch_idx}", flush=True)
@@ -5218,6 +5931,14 @@ def train_one_epoch_multi_step(
                 window_loss_graph = loss_k if window_loss_graph is None else (window_loss_graph + loss_k)
 
                 state_feat = _enforce_physical_state(y_pred_abs_k, cfg, rho_floor=1e-6, E_floor=1e-6)
+                _record_step_diagnostics(
+                    pred_raw_abs=y_pred_abs_k,
+                    pred_used_abs=state_feat,
+                    gt_abs=x_tgt_abs,
+                    pred_levels=active_pred_levels,
+                    pred_centers=active_pred_centers,
+                    pred_ei=active_pred_ei,
+                )
                 state_centers = active_pred_centers
                 state_levels = active_pred_levels
                 state_parents = active_pred_parents
@@ -5416,6 +6137,14 @@ def train_one_epoch_multi_step(
         #    y_pred_abs0, tag="rollout_chain", step_k=0, rho_floor=1e-6, E_floor=1e-6
         #)
         pred_feats_k = _enforce_physical_state(y_pred_abs0, cfg, rho_floor=1e-6, E_floor=1e-6)
+        _record_step_diagnostics(
+            pred_raw_abs=y_pred_abs0,
+            pred_used_abs=pred_feats_k,
+            gt_abs=x_tgt_abs0,
+            pred_levels=pred_levels_1,
+            pred_centers=pred_centers_1,
+            pred_ei=pred_ei_1,
+        )
 
         # ======================
         # STEPS 1..K-2
@@ -5531,6 +6260,14 @@ def train_one_epoch_multi_step(
             #    y_pred_abs_k, tag="rollout_chain", step_k=k, rho_floor=1e-6, E_floor=1e-6
             #)
             pred_feats_k = _enforce_physical_state(y_pred_abs_k, cfg, rho_floor=1e-6, E_floor=1e-6)
+            _record_step_diagnostics(
+                pred_raw_abs=y_pred_abs_k,
+                pred_used_abs=pred_feats_k,
+                gt_abs=x_tgt_abs,
+                pred_levels=pred_levels_next,
+                pred_centers=pred_centers_next,
+                pred_ei=pred_ei_next,
+            )
 
         # ===== backward + step once per window =====
         if window_loss_graph is not None:
@@ -5554,7 +6291,12 @@ def train_one_epoch_multi_step(
         _maybe_print_batch_progress(batch_idx, float(time.perf_counter() - batch_t0))
 
     denom = max(n_steps, 1)
-    return total_loss_accum / denom, mae_accum / denom, {"num_windows": len(loader), "num_steps": n_steps}
+    stats = {
+        "num_windows": len(loader),
+        "num_steps": n_steps,
+        **_finalize_diagnostics_accumulator(diagnostics_accum, diag_cfg),
+    }
+    return total_loss_accum / denom, mae_accum / denom, stats
 
 def evaluate_one_epoch_multi_step(
     model,
@@ -5681,6 +6423,8 @@ def evaluate_one_epoch_multi_step(
     total_loss_accum = 0.0
     n_steps_total = 0
     examples = [] if collect_examples else None
+    diag_cfg = _resolve_diagnostics_cfg(cfg)
+    diagnostics_accum = _new_diagnostics_accumulator(diag_cfg)
 
     # ---- budgets (CSV) ----
     budget_rows = []
@@ -5742,6 +6486,29 @@ def evaluate_one_epoch_multi_step(
                 rec["mae"]  += mae_add
                 rec["mse"]  += mse_add
                 rec["gt2"]  += gt2_add
+
+    def _record_step_diagnostics(
+        *,
+        pred_raw_abs: torch.Tensor,
+        pred_used_abs: torch.Tensor,
+        gt_abs: torch.Tensor,
+        pred_levels: torch.Tensor,
+        pred_centers: torch.Tensor,
+        pred_ei: torch.Tensor,
+    ) -> None:
+        _record_enabled_step_diagnostics(
+            diagnostics_accum,
+            pred_raw_abs=pred_raw_abs.detach(),
+            pred_used_abs=pred_used_abs.detach(),
+            gt_abs=gt_abs.detach(),
+            pred_levels=pred_levels.detach(),
+            pred_centers=pred_centers.detach(),
+            pred_ei=pred_ei.detach(),
+            cfg=cfg,
+            diag_cfg=diag_cfg,
+            dx=float(dx),
+            dy=float(dy),
+        )
 
     def _append_example_step(
         *,
@@ -6635,6 +7402,14 @@ def evaluate_one_epoch_multi_step(
                         )
 
                     state_feat = _enforce_physical_state(y_pred_abs_k, cfg, rho_floor=1e-6, E_floor=1e-6)
+                    _record_step_diagnostics(
+                        pred_raw_abs=y_pred_abs_k,
+                        pred_used_abs=state_feat,
+                        gt_abs=x_tgt_abs,
+                        pred_levels=active_pred_levels,
+                        pred_centers=active_pred_centers,
+                        pred_ei=active_pred_ei,
+                    )
                     state_centers = active_pred_centers
                     state_levels = active_pred_levels
                     state_parents = active_pred_parents
@@ -6728,6 +7503,14 @@ def evaluate_one_epoch_multi_step(
 
             #pred_feats_k = y_pred_abs0
             pred_feats_k = _enforce_physical_state(y_pred_abs0, cfg, rho_floor=1e-6, E_floor=1e-6)
+            _record_step_diagnostics(
+                pred_raw_abs=y_pred_abs0,
+                pred_used_abs=pred_feats_k,
+                gt_abs=x_tgt_abs0,
+                pred_levels=pred_levels_1,
+                pred_centers=pred_centers_1,
+                pred_ei=pred_ei_1,
+            )
 
             # ===== STEPS 1..K-2 =====
             for k in range(1, K - 1):
@@ -6801,6 +7584,14 @@ def evaluate_one_epoch_multi_step(
                 # keep your existing propagation behavior
                 #pred_feats_k = _enforce_physical_state(y_pred_abs_k, rho_floor=1e-6, E_floor=1e-6)
                 pred_feats_k = _enforce_physical_state(y_pred_abs_k, cfg, rho_floor=1e-6, E_floor=1e-6)
+                _record_step_diagnostics(
+                    pred_raw_abs=y_pred_abs_k,
+                    pred_used_abs=pred_feats_k,
+                    gt_abs=x_tgt_abs,
+                    pred_levels=pred_levels_next,
+                    pred_centers=pred_centers_next,
+                    pred_ei=pred_ei_next,
+                )
 
 
     # ---- finalize metrics ----
@@ -6870,6 +7661,7 @@ def evaluate_one_epoch_multi_step(
     stats = {
         "num_windows": len(loader),
         "num_steps": n_steps_total,
+        **_finalize_diagnostics_accumulator(diagnostics_accum, diag_cfg),
         "maew_by_rollout_step": maew_by_step,
         "rell2w_by_rollout_step": rell2w_by_step,
         "maew_feat_by_rollout_step": maew_feat_by_step,
@@ -7039,6 +7831,14 @@ def main(config_path: str | None = None, out_dir: str | None = None):
     train_cfg = cfg.setdefault("train", {})
     train_cfg.setdefault("validation_every_epochs", 1)
     train_cfg.setdefault("checkpoint_every_epochs", 1)
+    train_cfg.setdefault("mesh_mode", "predicted")
+
+    mesh_mode = str(train_cfg.get("mesh_mode", "predicted")).strip().lower()
+    if mesh_mode not in ("predicted", "uniform"):
+        raise ValueError(
+            f"train.mesh_mode must be 'predicted' or 'uniform', got '{mesh_mode}'"
+        )
+    train_cfg["mesh_mode"] = mesh_mode
 
     # Runtime mesh defaults (infrastructure only in this commit)
     runtime_mesh_cfg = train_cfg.setdefault("runtime_mesh", {})
@@ -7078,6 +7878,7 @@ def main(config_path: str | None = None, out_dir: str | None = None):
     step_log_cfg.setdefault("enabled", False)
     step_log_cfg.setdefault("path", os.path.join(cfg.get("train", {}).get("save_dir", "."), "runtime_step_log.csv"))
     step_log_cfg.setdefault("append", False)
+    diag_cfg_main = _resolve_diagnostics_cfg(cfg)
 
     runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
     runtime_update_every = int(runtime_mesh_cfg.get("update_every_steps", 1))
@@ -7307,21 +8108,39 @@ def main(config_path: str | None = None, out_dir: str | None = None):
     use_precomp_collate = (not runtime_mesh_enabled) or runtime_warm_start_precomp
 
     if use_precomp_collate:
+        mesh_mode = str(cfg.get("train", {}).get("mesh_mode", "predicted")).strip().lower()
         cache_path = cfg["train"].get("precomp_cache_path", None)
         force_recompute = bool(cfg["train"].get("precomp_force_recompute", False))
-
-        precomp = precompute_pred_mesh_and_interps_for_rollout(
-            full_ds.steps,
-            cfg,
-            H,
-            W,
-            dx,
-            dy,
-            device=device,
-            progress=True,
-            cache_path=cache_path,
-            force_recompute=force_recompute,
-        )
+        if mesh_mode == "uniform":
+            if cache_path is None:
+                cache_dir = cfg.get("train", {}).get("cache_dir", cfg.get("train", {}).get("save_dir", "."))
+                cache_path = os.path.join(cache_dir, "precomp_uniform.h5")
+            print(f"[PRECOMP] train.mesh_mode=uniform: static-mesh precompute with cache_path={cache_path}")
+            precomp = precompute_uniform_mesh_in_memory(
+                full_ds.steps,
+                cfg,
+                H,
+                W,
+                dx,
+                dy,
+                device=device,
+                progress=True,
+                cache_path=cache_path,
+                force_recompute=force_recompute,
+            )
+        else:
+            precomp = precompute_pred_mesh_and_interps_for_rollout(
+                full_ds.steps,
+                cfg,
+                H,
+                W,
+                dx,
+                dy,
+                device=device,
+                progress=True,
+                cache_path=cache_path,
+                force_recompute=force_recompute,
+            )
 
         precomp = move_precomp_to_device(precomp, device="cpu")
 
@@ -7484,8 +8303,34 @@ def main(config_path: str | None = None, out_dir: str | None = None):
                 pass
         return payload
 
-    with open(log_csv, "w") as f:
-        f.write("epoch,split,loss,mae\n")
+    diag_log_fields = _diagnostics_csv_fields(diag_cfg_main)
+    log_fields = ["epoch", "split", "loss", "mae", *diag_log_fields]
+
+    def _log_row(
+        *,
+        epoch: int,
+        split: str,
+        loss_val: float,
+        mae_val: float | None,
+        stats: Dict[str, Any] | None,
+    ) -> Dict[str, Any]:
+        row = {
+            "epoch": int(epoch),
+            "split": str(split),
+            "loss": float(loss_val),
+            "mae": ("" if mae_val is None else float(mae_val)),
+        }
+        for key in diag_log_fields:
+            row[key] = ""
+        if stats is not None:
+            for key in diag_log_fields:
+                if key in stats and stats.get(key, None) is not None:
+                    row[key] = float(stats[key])
+        return row
+
+    with open(log_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=log_fields)
+        writer.writeheader()
 
     print("[INFO] Starting training...")
     total_epochs = int(cfg["train"]["epochs"])
@@ -7519,11 +8364,11 @@ def main(config_path: str | None = None, out_dir: str | None = None):
 
         TR.append(tr_loss)
         VL.append(vl_loss if run_validation else float("nan"))
-        with open(log_csv, "a") as f:
-            # epoch, split, loss, mae
-            f.write(f"{epoch},train,{tr_loss:.10f},{tr_mae:.10f}\n")
+        with open(log_csv, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=log_fields)
+            writer.writerow(_log_row(epoch=epoch, split="train", loss_val=tr_loss, mae_val=tr_mae, stats=tr_stats))
             if run_validation:
-                f.write(f"{epoch},val,{vl_loss:.6f}\n")
+                writer.writerow(_log_row(epoch=epoch, split="val", loss_val=vl_loss, mae_val=None, stats=vl_stats))
 
         # track best model by validation loss
         if run_validation and (vl_loss < best_val):
@@ -7551,6 +8396,12 @@ def main(config_path: str | None = None, out_dir: str | None = None):
                 f"val {vl_loss:.6f} | "
                 f"{dt:.1f}s | lr={_get_lr(opt):.3e}"
             )
+            tr_diag_line = _format_split_diagnostic_summary("train", tr_stats, diag_cfg_main)
+            if tr_diag_line is not None:
+                print(tr_diag_line)
+            vl_diag_line = _format_split_diagnostic_summary("val", vl_stats, diag_cfg_main)
+            if vl_diag_line is not None:
+                print(vl_diag_line)
         else:
             next_val_epoch = epoch + (val_every - (epoch % val_every))
             if next_val_epoch > total_epochs:
@@ -7561,6 +8412,9 @@ def main(config_path: str | None = None, out_dir: str | None = None):
                 f"val skipped (every {val_every}; next {next_val_epoch:03d}) | "
                 f"{dt:.1f}s | lr={_get_lr(opt):.3e}"
             )
+            tr_diag_line = _format_split_diagnostic_summary("train", tr_stats, diag_cfg_main)
+            if tr_diag_line is not None:
+                print(tr_diag_line)
 
         do_periodic_ckpt = (checkpoint_every > 0) and (
             (epoch % checkpoint_every) == 0 or (epoch == total_epochs)
@@ -7598,6 +8452,9 @@ def main(config_path: str | None = None, out_dir: str | None = None):
     )
 
     print(f"[TEST] loss={test_loss:.4e}")
+    test_diag_line = _format_split_diagnostic_summary("test", _test_stats, diag_cfg_main)
+    if test_diag_line is not None:
+        print(test_diag_line.replace("[DIAG]", "[TEST-DIAG]", 1))
 
     step_log_enabled, step_log_path, _step_log_append = _runtime_step_log_settings(cfg)
     if step_log_enabled:

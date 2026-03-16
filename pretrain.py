@@ -3113,6 +3113,512 @@ def precompute_pred_mesh_and_interps_for_rollout(
     }
 
 
+@torch.no_grad()
+def precompute_uniform_mesh_in_memory(
+    steps: List[Dict[str, Any]],
+    cfg: dict,
+    H: int,
+    W: int,
+    dx: float,
+    dy: float,
+    *,
+    device: str | torch.device = "cpu",
+    progress: bool = True,
+    cache_path: str | None = None,
+    force_recompute: bool = False,
+) -> Dict[str, Any]:
+    """
+    Build one static (uniform-mode) predicted mesh and reuse it for all timesteps.
+
+    If cache_path is provided, this streams precompute to one H5 file and returns
+    a lazy H5 handle descriptor: {"type":"h5", "path":...}. If cache_path is None,
+    it returns the in-memory dict-of-lists expected by CollateWithPrecompute.
+    """
+    dev = torch.device(device)
+    rr = _get_refine_ratio(cfg)
+    T = len(steps)
+    if T < 2:
+        raise RuntimeError("Need at least 2 timesteps for in-memory uniform precompute.")
+
+    mesh_cfg = cfg.get("mesh", {}) or {}
+    mesh_spec_raw = mesh_cfg.get("starting_mesh_path", None)
+    if not mesh_spec_raw:
+        raise RuntimeError("Uniform mesh mode requires cfg['mesh']['starting_mesh_path'].")
+    mesh_spec_path = os.path.abspath(os.path.expanduser(str(mesh_spec_raw)))
+    if not os.path.exists(mesh_spec_path):
+        raise FileNotFoundError(f"Uniform mesh mode expected mesh spec at: {mesh_spec_path}")
+
+    pol = cfg.get("policy", {}) or {}
+    refine_to_level = int(pol.get("starting_refine_to_level", 0))
+    refine_policy = str(pol.get("starting_refine_policy", "min_level")).strip().lower()
+    if refine_policy not in ("min_level", "level0_only"):
+        raise ValueError(f"Unknown starting_refine_policy='{refine_policy}'")
+
+    if cache_path is not None:
+        if not str(cache_path).endswith(".h5"):
+            raise ValueError(f"Uniform mesh precompute cache_path must end with .h5, got: {cache_path}")
+        cache_path = os.path.abspath(os.path.expanduser(str(cache_path)))
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+
+    def _cfg_sha1(_cfg: dict) -> str:
+        s = json.dumps(_cfg, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha1(s).hexdigest()
+
+    def _to_np(x: torch.Tensor, dtype=None) -> np.ndarray:
+        a = x.detach().cpu().numpy()
+        if dtype is not None:
+            a = a.astype(dtype, copy=False)
+        return a
+
+    def _write_ds(g, name: str, arr: np.ndarray, *, compress=True):
+        if name in g:
+            del g[name]
+        kwargs = {}
+        if compress:
+            kwargs = dict(compression="gzip", compression_opts=4, shuffle=True, chunks=True)
+        g.create_dataset(name, data=arr, **kwargs)
+
+    def _uniform_h5_signature() -> str:
+        st = os.stat(mesh_spec_path)
+        payload = {
+            "mesh_mode": "uniform",
+            "mesh_spec_path": mesh_spec_path,
+            "mesh_spec_size": int(st.st_size),
+            "mesh_spec_mtime_ns": int(st.st_mtime_ns),
+            "starting_refine_to_level": int(refine_to_level),
+            "starting_refine_policy": str(refine_policy),
+            "refine_ratio": int(rr),
+            "H": int(H),
+            "W": int(W),
+            "T": int(T),
+        }
+        s = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha1(s).hexdigest()
+
+    def _uniform_h5_usable(path: str) -> bool:
+        ok_base = precomp_h5_is_usable(
+            path,
+            cfg,
+            expected_steps=T,
+            H=H,
+            W=W,
+            require_dec=True,
+            require_pred2pred=True,
+            require_mls=False,
+            verbose=True,
+        )
+        if not ok_base:
+            return False
+        try:
+            sig = _uniform_h5_signature()
+            with h5py.File(path, "r") as f:
+                if "meta" not in f:
+                    print("[PRECOMP][UNIFORM] reject cache: missing /meta")
+                    return False
+                meta = f["meta"]
+                mode = meta.attrs.get("mesh_mode", "")
+                if isinstance(mode, (bytes, np.bytes_)):
+                    mode = mode.decode("utf-8")
+                mode = str(mode)
+                if mode != "uniform":
+                    print(f"[PRECOMP][UNIFORM] reject cache: mesh_mode='{mode}' (expected 'uniform')")
+                    return False
+
+                sig_stored = meta.attrs.get("uniform_signature_sha1", "")
+                if isinstance(sig_stored, (bytes, np.bytes_)):
+                    sig_stored = sig_stored.decode("utf-8")
+                sig_stored = str(sig_stored)
+                if sig_stored != sig:
+                    print(
+                        "[PRECOMP][UNIFORM] reject cache: signature mismatch "
+                        f"(stored={sig_stored}, current={sig})"
+                    )
+                    return False
+            return True
+        except Exception as e:
+            print(f"[PRECOMP][UNIFORM] reject cache: unreadable meta/signature ({e})")
+            return False
+
+    if cache_path is not None and (not force_recompute) and _uniform_h5_usable(cache_path):
+        print(f"[PRECOMP][UNIFORM] Using existing H5 cache: {cache_path}")
+        return {
+            "type": "h5",
+            "path": cache_path,
+            "T": int(T),
+            "H": int(H),
+            "W": int(W),
+            "dx": float(dx),
+            "dy": float(dy),
+            "bbox": cfg["data"]["bbox"],
+        }
+
+    def _refine_cells_one_level(
+        centers: torch.Tensor,
+        levels: torch.Tensor,
+        parents: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        lv = levels.to(torch.int64)
+        rr_t = torch.tensor(float(rr), device=lv.device)
+        dx_L = (torch.tensor(float(dx), device=lv.device) / torch.pow(rr_t, lv.to(torch.float32))).to(torch.float32)
+        dy_L = (torch.tensor(float(dy), device=lv.device) / torch.pow(rr_t, lv.to(torch.float32))).to(torch.float32)
+
+        c = centers.to(torch.float32)
+        x0 = c[:, 0]
+        y0 = c[:, 1]
+
+        frac = ((torch.arange(rr, dtype=torch.float32, device=c.device) + 0.5) / float(rr)) - 0.5
+        gx, gy = torch.meshgrid(frac, frac, indexing="xy")
+        child = torch.empty((c.shape[0], rr, rr, 2), dtype=torch.float32, device=c.device)
+        child[..., 0] = x0.view(-1, 1, 1) + dx_L.view(-1, 1, 1) * gx.view(1, rr, rr)
+        child[..., 1] = y0.view(-1, 1, 1) + dy_L.view(-1, 1, 1) * gy.view(1, rr, rr)
+
+        child_centers = child.reshape(-1, 2)
+        child_count = rr * rr
+        child_levels = (lv + 1).repeat_interleave(child_count)
+        child_parents = parents.repeat_interleave(child_count)
+        return child_centers, child_levels, child_parents
+
+    def _refine_mesh_to_target(
+        centers: torch.Tensor,
+        levels: torch.Tensor,
+        parents: torch.Tensor,
+        target_level: int,
+        policy_name: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        target_level = int(target_level)
+        if target_level <= 0:
+            return centers, levels.to(torch.int64), parents.to(torch.int64)
+
+        c = centers.clone().to(torch.float32)
+        l = levels.clone().to(torch.int64)
+        p = parents.clone().to(torch.int64)
+
+        if policy_name == "level0_only":
+            base_is_level0 = (l == 0)
+
+        while True:
+            if policy_name == "min_level":
+                need = (l < target_level)
+            else:
+                need = base_is_level0 & (l < target_level)
+            if not bool(need.any().item()):
+                break
+
+            keep = ~need
+            c_keep, l_keep, p_keep = c[keep], l[keep], p[keep]
+            c_need, l_need, p_need = c[need], l[need], p[need]
+            c_child, l_child, p_child = _refine_cells_one_level(c_need, l_need, p_need)
+
+            c = torch.cat([c_keep, c_child], dim=0)
+            l = torch.cat([l_keep, l_child], dim=0)
+            p = torch.cat([p_keep, p_child], dim=0)
+
+            if policy_name == "level0_only":
+                base_keep = base_is_level0[keep]
+                base_child = torch.ones((c_child.shape[0],), dtype=torch.bool, device=base_keep.device)
+                base_is_level0 = torch.cat([base_keep, base_child], dim=0)
+
+        return c, l, p
+
+    # Build base wedge mesh once.
+    base_c, base_l, base_p, base_ei, _base_mask_parent = _build_starting_mesh_from_spec(
+        mesh_spec_path,
+        cfg,
+        H,
+        W,
+        dx,
+        dy,
+        device=dev,
+    )
+    pred_c, pred_l, pred_p = _refine_mesh_to_target(
+        base_c,
+        base_l,
+        base_p,
+        refine_to_level,
+        refine_policy,
+    )
+
+    # Build/reuse edges once.
+    if (refine_to_level <= 0) and (base_ei is not None):
+        pred_e = base_ei.to(torch.int64)
+    else:
+        edge_method = str(cfg.get("edges", {}).get("method", "face")).lower()
+        if "face" in edge_method:
+            pred_e = build_amr_face_adjacency_edges(
+                pred_c,
+                pred_l,
+                H,
+                W,
+                bbox=tuple(cfg["data"]["bbox"]),
+                return_edge_attr=False,
+                refine_ratio=rr,
+            ).to(torch.int64)
+        else:
+            pred_e = build_amr_local_knn_edges(
+                pred_c,
+                pred_p,
+                H,
+                W,
+                k_local=int(cfg.get("edges", {}).get("k_local", 4)),
+                max_local=int(cfg.get("edges", {}).get("max_local", 2048)),
+            ).to(torch.int64)
+
+    wedge_path = _load_wedge_path_from_spec(mesh_spec_path, cfg=cfg)
+    pred_c, pred_l, pred_p, pred_e, mask_p = _clip_pred_mesh_to_wedge(
+        pred_c.to(dev),
+        pred_l.to(dev),
+        pred_p.to(dev),
+        pred_e.to(dev),
+        H,
+        W,
+        wedge_path=wedge_path,
+        cfg=cfg,
+        device=dev,
+    )
+
+    # Static geometry on CPU for storage/reuse.
+    pred_c_cpu = pred_c.detach().cpu().to(torch.float32)
+    pred_l_cpu = pred_l.detach().cpu().to(torch.int64)
+    pred_p_cpu = pred_p.detach().cpu().to(torch.int64)
+    pred_e_cpu = pred_e.detach().cpu().to(torch.int64)
+    mask_p_cpu = mask_p.detach().cpu().view(-1).to(torch.bool)
+
+    if pred_c_cpu.numel() == 0 or pred_e_cpu.numel() == 0:
+        raise RuntimeError("Uniform in-memory precompute produced empty mesh geometry.")
+
+    # Static DEC geometry once.
+    w_cpu, h_cpu, area_cpu, *_ = amr_cell_wh_area_from_levels(
+        pred_l_cpu,
+        dx0=float(dx),
+        dy0=float(dy),
+        refine_ratio=rr,
+    )
+    cell_wh_cpu = torch.stack([w_cpu, h_cpu], dim=1).to(torch.float32)
+    edge_attr_cpu = dec_edge_attr_for_dyadic_quads(
+        pred_c_cpu,
+        pred_l_cpu,
+        pred_e_cpu,
+        dx0=float(dx),
+        dy0=float(dy),
+        refine_ratio=rr,
+    ).to(torch.float32)
+
+    # Identity pred->pred map once (mesh is constant across all t).
+    k_interp = int(cfg.get("loss", {}).get("interp_k", 8))
+    if k_interp < 1:
+        raise ValueError("loss.interp_k must be >=1 for uniform in-memory precompute.")
+    N = int(pred_c_cpu.shape[0])
+    idx_id = torch.arange(N, dtype=torch.int64).view(-1, 1).repeat(1, k_interp)
+    w_id = torch.full((N, k_interp), fill_value=(1.0 / float(k_interp)), dtype=torch.float32)
+
+    # Mapping device for GT->pred interpolation.
+    speed = cfg.get("speed", {}) or {}
+    idw_on_cpu = bool(speed.get("idw_on_cpu", dev.type == "mps"))
+    map_dev = torch.device("cpu") if idw_on_cpu else dev
+    pred_c_map = pred_c_cpu.to(map_dev)
+    pred_l_map = pred_l_cpu.to(map_dev)
+    pred_p_map = pred_p_cpu.to(map_dev)
+    mask_p_map_2d = mask_p_cpu.view(H, W).to(map_dev)
+
+    precomp: Dict[str, Any] | None = None
+    h5_file = None
+    if cache_path is None:
+        # Build precomp dict in-memory (list indexed by absolute timestep).
+        precomp = {
+            "pred_centers": [None] * T,
+            "pred_levels": [None] * T,
+            "pred_parents": [None] * T,
+            "pred_ei": [None] * T,
+            "mask_pred": [None] * T,
+            "feat_t_on_pred": [None] * T,
+            "feat_tp1_on_pred": [None] * T,
+            "pred2pred_idx": [None] * T,
+            "pred2pred_w": [None] * T,
+            "pred_edge_attr": [None] * T,
+            "pred_cell_wh": [None] * T,
+            "pred_cell_area": [None] * T,
+            "pred_edge_attr_layout": "nx,ny,face_len,dual_len,tau",
+        }
+
+        # Geometry is constant for all usable destination timesteps (1..T-1).
+        for t in range(1, T):
+            precomp["pred_centers"][t] = pred_c_cpu
+            precomp["pred_levels"][t] = pred_l_cpu
+            precomp["pred_parents"][t] = pred_p_cpu
+            precomp["pred_ei"][t] = pred_e_cpu
+            precomp["mask_pred"][t] = mask_p_cpu
+            precomp["pred2pred_idx"][t] = idx_id
+            precomp["pred2pred_w"][t] = w_id
+            precomp["pred_edge_attr"][t] = edge_attr_cpu
+            precomp["pred_cell_wh"][t] = cell_wh_cpu
+            precomp["pred_cell_area"][t] = area_cpu.to(torch.float32)
+    else:
+        print(f"[PRECOMP][UNIFORM] Writing H5 cache: {cache_path}")
+        h5_file = h5py.File(cache_path, "w")
+        meta = h5_file.create_group("meta")
+        meta.attrs["H"] = int(H)
+        meta.attrs["W"] = int(W)
+        meta.attrs["dx"] = float(dx)
+        meta.attrs["dy"] = float(dy)
+        meta.attrs["bbox"] = np.asarray(cfg["data"]["bbox"], dtype=np.float64)
+        meta.attrs["refine_ratio"] = int(rr)
+        meta.attrs["T"] = int(T)
+        meta.attrs["cfg_sha1"] = _cfg_sha1(cfg)
+        meta.attrs["mesh_mode"] = np.bytes_("uniform")
+        meta.attrs["uniform_signature_sha1"] = np.bytes_(_uniform_h5_signature())
+        meta.attrs["starting_refine_to_level"] = int(refine_to_level)
+        meta.attrs["starting_refine_policy"] = np.bytes_(str(refine_policy))
+        meta.attrs["starting_mesh_path"] = np.bytes_(mesh_spec_path)
+        meta.attrs["pred_edge_attr_layout"] = np.bytes_("nx,ny,face_len,dual_len,tau")
+        meta.create_dataset("cfg_json", data=np.bytes_(json.dumps(cfg, sort_keys=True, default=str)))
+
+        idx_id_h5 = idx_id.to(torch.int32)
+        w_id_h5 = w_id.to(torch.float16)
+        mask_flat_u8 = mask_p_cpu.to(torch.uint8).view(-1)
+        area_f32 = area_cpu.to(torch.float32)
+
+        for t in range(1, T):
+            g = h5_file.create_group(f"t{int(t):05d}")
+            _write_ds(g, "pred_centers", _to_np(pred_c_cpu, dtype=np.float32))
+            _write_ds(g, "pred_levels", _to_np(pred_l_cpu.to(torch.int16), dtype=np.int16))
+            _write_ds(g, "pred_parents", _to_np(pred_p_cpu.to(torch.int32), dtype=np.int32))
+            _write_ds(g, "pred_ei", _to_np(pred_e_cpu.to(torch.int32), dtype=np.int32))
+            _write_ds(g, "mask_pred_parent_flat_u8", _to_np(mask_flat_u8, dtype=np.uint8))
+            _write_ds(g, "pred_edge_attr", _to_np(edge_attr_cpu, dtype=np.float32))
+            _write_ds(g, "pred_cell_wh", _to_np(cell_wh_cpu, dtype=np.float32))
+            _write_ds(g, "pred_cell_area", _to_np(area_f32, dtype=np.float32))
+            if t < (T - 1):
+                _write_ds(g, "pred2pred_idx_to_next", _to_np(idx_id_h5, dtype=np.int32))
+                _write_ds(g, "pred2pred_w_to_next", _to_np(w_id_h5, dtype=np.float16))
+            g.attrs["pred_edge_attr_layout"] = np.bytes_("nx,ny,face_len,dual_len,tau")
+            g.attrs["N_pred"] = int(pred_c_cpu.shape[0])
+            g.attrs["E"] = int(pred_e_cpu.shape[1]) if pred_e_cpu.numel() > 0 else 0
+        h5_file.flush()
+
+    # First-pass feature maps: GT(t)->pred(t+1), GT(t+1)->pred(t+1)
+    it = range(T - 1)
+    if progress:
+        try:
+            from tqdm import tqdm
+            it = tqdm(it, desc="[uniform precompute] GT->static-mesh mappings")
+        except Exception:
+            pass
+
+    for t in it:
+        dst = t + 1
+        s = steps[t]
+        s_next = steps[dst]
+
+        centers_t = (s["pos"] if torch.is_tensor(s["pos"]) else torch.as_tensor(s["pos"])).to(map_dev, dtype=torch.float32)
+        feat_t = (s["x"] if torch.is_tensor(s["x"]) else torch.as_tensor(s["x"])).to(map_dev, dtype=torch.float32)
+        level_t = s.get("level", None)
+        ij_t = s.get("ij", None)
+        if level_t is not None and ij_t is not None:
+            parents_t = _parents_from_level_ij(
+                level_t.to(map_dev),
+                ij_t.to(map_dev),
+                H,
+                W,
+                refine_ratio=rr,
+            )
+        elif "parents" in s:
+            parents_t = (s["parents"] if torch.is_tensor(s["parents"]) else torch.as_tensor(s["parents"])).to(map_dev, dtype=torch.long)
+        else:
+            xmin, xmax, ymin, ymax = cfg["data"]["bbox"]
+            parents_t = parents_from_pos(centers_t, H, W, xmin, xmax, ymin, ymax).to(map_dev, dtype=torch.long)
+        if "mask" in s:
+            mask_t_parent = (s["mask"] if torch.is_tensor(s["mask"]) else torch.as_tensor(s["mask"])).to(map_dev).view(H, W).to(torch.bool)
+        else:
+            mask_t_parent = _mask_from_parents(parents_t, H, W).to(map_dev).to(torch.bool)
+
+        centers_tp1 = (s_next["pos"] if torch.is_tensor(s_next["pos"]) else torch.as_tensor(s_next["pos"])).to(map_dev, dtype=torch.float32)
+        feat_tp1 = (s_next["x"] if torch.is_tensor(s_next["x"]) else torch.as_tensor(s_next["x"])).to(map_dev, dtype=torch.float32)
+        level_tp1 = s_next.get("level", None)
+        ij_tp1 = s_next.get("ij", None)
+        if level_tp1 is not None and ij_tp1 is not None:
+            parents_tp1 = _parents_from_level_ij(
+                level_tp1.to(map_dev),
+                ij_tp1.to(map_dev),
+                H,
+                W,
+                refine_ratio=rr,
+            )
+        elif "parents" in s_next:
+            parents_tp1 = (s_next["parents"] if torch.is_tensor(s_next["parents"]) else torch.as_tensor(s_next["parents"])).to(map_dev, dtype=torch.long)
+        else:
+            xmin, xmax, ymin, ymax = cfg["data"]["bbox"]
+            parents_tp1 = parents_from_pos(centers_tp1, H, W, xmin, xmax, ymin, ymax).to(map_dev, dtype=torch.long)
+        if "mask" in s_next:
+            mask_tp1_parent = (s_next["mask"] if torch.is_tensor(s_next["mask"]) else torch.as_tensor(s_next["mask"])).to(map_dev).view(H, W).to(torch.bool)
+        else:
+            mask_tp1_parent = _mask_from_parents(parents_tp1, H, W).to(map_dev).to(torch.bool)
+
+        ft_on_pred = _map_gt_on_pred_mesh_once(
+            src_centers=centers_t,
+            src_feats=feat_t,
+            mask_src_parent=mask_t_parent,
+            parents_src=parents_t,
+            pred_centers=pred_c_map,
+            pred_levels=pred_l_map,
+            pred_parents=pred_p_map,
+            mask_pred_parent=mask_p_map_2d,
+            H=H,
+            W=W,
+            device=map_dev,
+        )
+        f1_on_pred = _map_gt_on_pred_mesh_once(
+            src_centers=centers_tp1,
+            src_feats=feat_tp1,
+            mask_src_parent=mask_tp1_parent,
+            parents_src=parents_tp1,
+            pred_centers=pred_c_map,
+            pred_levels=pred_l_map,
+            pred_parents=pred_p_map,
+            mask_pred_parent=mask_p_map_2d,
+            H=H,
+            W=W,
+            device=map_dev,
+        )
+        if precomp is not None:
+            precomp["feat_t_on_pred"][dst] = ft_on_pred.detach().cpu().to(torch.float32)
+            precomp["feat_tp1_on_pred"][dst] = f1_on_pred.detach().cpu().to(torch.float32)
+        else:
+            g = h5_file[f"t{int(dst):05d}"]
+            _write_ds(g, "feat_t_on_pred", _to_np(ft_on_pred.to("cpu"), dtype=np.float32))
+            _write_ds(g, "feat_tp1_on_pred", _to_np(f1_on_pred.to("cpu"), dtype=np.float32))
+            if (dst % 8) == 0:
+                h5_file.flush()
+
+    lv_u, lv_c = torch.unique(pred_l_cpu, return_counts=True)
+    lv_summary = ", ".join([f"L{int(u)}={int(c)}" for u, c in zip(lv_u.tolist(), lv_c.tolist())])
+    print(
+        "[PRECOMP][UNIFORM] built static mesh:",
+        f"cells={int(pred_c_cpu.shape[0])}",
+        f"edges={int(pred_e_cpu.shape[1])}",
+        f"levels=({lv_summary})",
+        f"starting_refine_to_level={refine_to_level}",
+        f"starting_refine_policy={refine_policy}",
+        flush=True,
+    )
+    if h5_file is not None:
+        try:
+            h5_file.flush()
+        finally:
+            h5_file.close()
+        print(f"[PRECOMP][UNIFORM] Saved H5 precompute to {cache_path}")
+        return {
+            "type": "h5",
+            "path": cache_path,
+            "T": int(T),
+            "H": int(H),
+            "W": int(W),
+            "dx": float(dx),
+            "dy": float(dy),
+            "bbox": cfg["data"]["bbox"],
+        }
+    return precomp
+
+
 class CollateWithPrecompute:
     #def __init__(self, precomp: Dict[str, List], *, dt_transitions: torch.Tensor, dt_ref: torch.Tensor | float | None = None):
     #    self.precomp = precomp

@@ -27,11 +27,11 @@
   "split": { "train": 0.85, "val": 0.1, "test": 0.05 },
 
   "train": {
-    "precomp_cache_path": "./cache/first_simulation/all/shock_ramp_precomp_pLow85_pHigh95_faceAdj_DEC.h5",
+    "precomp_cache_path": "./cache/L2_uniform/shock_ramp_precomp_L2_uniform_faceAdj_DEC.h5",
     "precomp_force_recompute": false,
-    "epochs": 1,
+    "epochs": 50,
     "checkpoint_every_epochs": 5,
-    "validation_every_epochs": 1,
+    "validation_every_epochs": 5,
     "batch_size": 1,
     "lr": 0.0001,
     "weight_decay": 0.0,
@@ -44,8 +44,9 @@
     "_comment_interp_type": "value or none",
     "overlay_fill_value": 0.0,
     "knn_k": 8,
-    "mesh_mode": "predicted",
-    "save_dir": "./runs_mesh_first",
+    "mesh_mode": "uniform",
+    "_comment_mesh_mode": "predicted or uniform",
+    "save_dir": "./runs_uniform_mesh",
     "multi_step_K": 2,
     "uniform_H": 256,
     "uniform_W": 256,
@@ -54,9 +55,8 @@
     "rk4_ramp_epochs": 5,
     "teacher_forcing_uniform": false,
     "uniform_diag_edges": false,
-    "validation_every_epochs": 5,
     "runtime_mesh": {
-      "enabled": true,
+      "enabled": false,
       "domain_mode": "starting_mesh",
       "_comment_domain_mode": "starting_mesh resets to starting mesh every step",
       "warm_start_from_precompute": false,
@@ -65,7 +65,7 @@
       "reset_to_coarse_each_step": true,
       "refine_only": true,
       "max_cells_per_step": 500000,
-      "policy_backend": "cnn",
+      "policy_backend": "gradient_fast",
       "cnn": {
         "checkpoint_path": "./runs_mesh_policy_cnn/without_parent_masks/unet_hierarchical/500ep_lr-scheduler_3-6-26/mesh_policy_cnn_last.pt",
         "include_parent_mask": false,
@@ -102,9 +102,10 @@
   },
 
   "policy": {
-    "geometry_mode": "gt_gradients",
+    "geometry_mode": "starting_refine",
     "_comment_geometry_mode": "gt_gradients or starting_refine for uniform mesh",
-    "starting_refine_to_level": 0,
+    "starting_refine_policy": "min_level",
+    "starting_refine_to_level": 2,
     "refine_ratio": 2,
     "hysteresis_mode": "percentile",
     "percentile_low":  85.0,
@@ -189,6 +190,30 @@
     "ops_m_max": 0.0
   },
 
+  "diagnostics": {
+    "entropy": {
+      "enabled": false,
+      "save_to_csv": true
+    },
+    "admissibility": {
+      "enabled": true,
+      "save_to_csv": true,
+      "pre_sanitize": true,
+      "post_sanitize": true,
+      "rho_floor": 1e-6,
+      "eint_floor": 0.0,
+      "p_floor": 0.0
+    },
+    "shock_masked_entropy": {
+      "enabled": true,
+      "save_to_csv": true,
+      "source": "gt_density_gradient",
+      "_comment_source": "Currently only gt_density_gradient is supported.",
+      "top_fraction": 0.1,
+      "min_cells": 32
+    }
+  },
+
   "eval": {
     "checkpoint": "./runs_mesh_first/best.pt",
     "qual_pdf": "./qual_rollout.pdf",
@@ -232,9 +257,10 @@
     "parc_scale_watch": false,
     "print_norm_sanity_once": false,
     "teacher_force_ops": false,
-    "hang_watch_batches": 10,
-    "print_batch_time": true,
-    "print_runtime_mesh_batch_breakdown": true
+    "hang_watch_batches": 0,
+    "print_batch_time": false,
+    "progress_every_batches": 0,
+    "print_runtime_mesh_batch_breakdown": false
   },
 
   "speed": {

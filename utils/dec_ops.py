@@ -75,6 +75,20 @@ def _tstats(name: str, t: torch.Tensor, max_elems: int = 0):
 
     print(msg)
 
+def gas_gamma_from_cfg(cfg: dict, default: float = 1.4) -> float:
+    """
+    Resolve the ideal-gas gamma used by diagnostics/operators.
+    Prefer loss.gamma to match the active training config, then physics/eos fallbacks.
+    """
+    loss = cfg.get("loss", {}) or {}
+    physics = cfg.get("physics", {}) or {}
+    eos = cfg.get("eos", {}) or {}
+    for block in (loss, physics, eos):
+        gamma = block.get("gamma", None)
+        if gamma is not None:
+            return float(gamma)
+    return float(default)
+
 def pressure_from_conservative_state(
     x_abs: torch.Tensor,  # [N,F] with channels rho,mx,my,E
     cfg: dict,
@@ -94,9 +108,7 @@ def pressure_from_conservative_state(
     my  = x_abs[:, idx["my"]]
     E   = x_abs[:, idx["E"]]
 
-    # where to read gamma from cfg (with a safe default)
-    gamma = float(cfg.get("physics", {}).get("gamma",
-                 cfg.get("eos", {}).get("gamma", 1.4)))
+    gamma = gas_gamma_from_cfg(cfg)
 
     rho_safe = rho.abs().clamp_min(eps)
     kinetic = 0.5 * (mx * mx + my * my) / rho_safe
@@ -105,6 +117,46 @@ def pressure_from_conservative_state(
     if clamp_min is not None:
         p = p.clamp_min(float(clamp_min))
     return p
+
+def specific_internal_energy_from_conservative_state(
+    x_abs: torch.Tensor,  # [N,F] with channels rho,mx,my,E
+    cfg: dict,
+    *,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Specific internal energy from conservative variables:
+      e_int = E/rho - 0.5 * |u|^2
+
+    Assumes E is total energy density.
+    """
+    idx = infer_feature_indices(cfg, x_abs.size(1))
+    rho = x_abs[:, idx["rho"]]
+    mx  = x_abs[:, idx["mx"]]
+    my  = x_abs[:, idx["my"]]
+    E   = x_abs[:, idx["E"]]
+
+    rho_safe = rho.abs().clamp_min(eps)
+    kinetic_specific = 0.5 * (mx * mx + my * my) / (rho_safe * rho_safe)
+    return (E / rho_safe) - kinetic_specific
+
+def specific_entropy_from_conservative_state(
+    x_abs: torch.Tensor,  # [N,F] with channels rho,mx,my,E
+    cfg: dict,
+    *,
+    eps: float = 1e-12,
+    p_floor: float | None = None,
+) -> torch.Tensor:
+    """
+    Ideal-gas specific entropy proxy (up to an additive constant):
+      s ~ log(p) - gamma*log(rho)
+    """
+    idx = infer_feature_indices(cfg, x_abs.size(1))
+    rho = x_abs[:, idx["rho"]].abs().clamp_min(eps)
+    p_min = max(float(eps), float(p_floor if p_floor is not None else eps))
+    p = pressure_from_conservative_state(x_abs, cfg, eps=eps, clamp_min=p_min)
+    gamma = gas_gamma_from_cfg(cfg)
+    return torch.log(p) - gamma * torch.log(rho)
 
 def _normalize_reconstruction_kind(name: str) -> str:
     n = str(name).strip().lower()

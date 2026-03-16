@@ -36,18 +36,29 @@ Notes:
     plots.compute_plot_deltas, plots._recover_parent_mask, plots._unwrap_delta, plots._fidx_or_none, plots._draw_amr_cells
     train.build_model_from_cfg, train.evaluate_one_epoch_multi_step, train._get_bbox
 
+Example command for pre-caluclated mesh rollout:
+    python rollout_viz_v3.py --checkpoint runs_mesh_first/advection_diffusion/euler_adv/resid_weight-0/mse_loss/adv_at_all_steps/1000ep_5ts_window_bw-0_no-loss-sched/last_model.pt \                                                                                                                                                    
+        --start-t 50 \
+        --out-dir runs_mesh_first/advection_diffusion/euler_adv/resid_weight-0/mse_loss/adv_at_all_steps/1000ep_5ts_window_bw-0_no-loss-sched \
+        --horizon 100 \
+        --device cpu \
+        --progress-every 1 \
+        --unify-clims \
+        --raster-mode block --precomp-path cache/first_simulation/all/shock_ramp_precomp_pLow85_pHigh95_faceAdj_DEC.h5 \
+        --raster-lmax 3 --pt-path /Users/trevorreed/UVA_postdoc_stuff/gparc/data/shock_ramp/shock_ramp_amr.pt
+
 Example command for CNN policy rollout:
     python rollout_viz_v3.py \
-    --checkpoint ./runs_mesh_first/CNN_mesh_predictor/10ep_test/best_model.pt \
-    --start-t 20 \
-    --horizon 40 \
-    --out-dir ./runs_mesh_first/CNN_mesh_predictor/10ep_test/runtime_mesh_cnn_t20_h40 \
-    --fps 4 --device cpu \
-    --pt-path /Users/trevorreed/UVA_postdoc_stuff/gparc/data/shock_ramp/shock_ramp_amr.pt \
-    --unify-clims \
-    --config ./runs_mesh_first/CNN_mesh_predictor/10ep_test/config.json \
-    --runtime-mesh-cnn-ckpt ./runs_mesh_policy_cnn/without_parent_masks/unet_hierarchical/500ep_lr-scheduler_3-6-26/mesh_policy_cnn_best.pt \
-    --runtime-mesh-spec-path utils/wedge_mesh_spec.pt
+        --checkpoint ./runs_mesh_first/CNN_mesh_predictor/10ep_test/best_model.pt \
+        --start-t 20 \
+        --horizon 40 \
+        --out-dir ./runs_mesh_first/CNN_mesh_predictor/10ep_test/runtime_mesh_cnn_t20_h40 \
+        --fps 4 --device cpu \
+        --pt-path /Users/trevorreed/UVA_postdoc_stuff/gparc/data/shock_ramp/shock_ramp_amr.pt \
+        --unify-clims \
+        --config ./runs_mesh_first/CNN_mesh_predictor/10ep_test/config.json \
+        --runtime-mesh-cnn-ckpt ./runs_mesh_policy_cnn/without_parent_masks/unet_hierarchical/500ep_lr-scheduler_3-6-26/mesh_policy_cnn_best.pt \
+        --runtime-mesh-spec-path utils/wedge_mesh_spec.pt
 """
 
 import os
