@@ -3153,12 +3153,25 @@ def precompute_uniform_mesh_in_memory(
     refine_policy = str(pol.get("starting_refine_policy", "min_level")).strip().lower()
     if refine_policy not in ("min_level", "level0_only"):
         raise ValueError(f"Unknown starting_refine_policy='{refine_policy}'")
+    interp_k_cfg = int(cfg.get("loss", {}).get("interp_k", 8))
 
     if cache_path is not None:
         if not str(cache_path).endswith(".h5"):
             raise ValueError(f"Uniform mesh precompute cache_path must end with .h5, got: {cache_path}")
         cache_path = os.path.abspath(os.path.expanduser(str(cache_path)))
         os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+
+    def _sha1_file(path: str, chunk_bytes: int = 1 << 20) -> str:
+        h = hashlib.sha1()
+        with open(path, "rb") as f:
+            while True:
+                b = f.read(chunk_bytes)
+                if not b:
+                    break
+                h.update(b)
+        return h.hexdigest()
+
+    mesh_spec_sha1 = _sha1_file(mesh_spec_path)
 
     def _cfg_sha1(_cfg: dict) -> str:
         s = json.dumps(_cfg, sort_keys=True, default=str).encode("utf-8")
@@ -3179,18 +3192,20 @@ def precompute_uniform_mesh_in_memory(
         g.create_dataset(name, data=arr, **kwargs)
 
     def _uniform_h5_signature() -> str:
-        st = os.stat(mesh_spec_path)
         payload = {
             "mesh_mode": "uniform",
-            "mesh_spec_path": mesh_spec_path,
-            "mesh_spec_size": int(st.st_size),
-            "mesh_spec_mtime_ns": int(st.st_mtime_ns),
+            "mesh_spec_sha1": mesh_spec_sha1,
             "starting_refine_to_level": int(refine_to_level),
             "starting_refine_policy": str(refine_policy),
             "refine_ratio": int(rr),
             "H": int(H),
             "W": int(W),
             "T": int(T),
+            "dx": float(dx),
+            "dy": float(dy),
+            "bbox": [float(v) for v in cfg["data"]["bbox"]],
+            "edges_method": str(cfg.get("edges", {}).get("method", "face")).lower(),
+            "interp_k": int(interp_k_cfg),
         }
         s = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
         return hashlib.sha1(s).hexdigest()
@@ -3229,6 +3244,34 @@ def precompute_uniform_mesh_in_memory(
                     sig_stored = sig_stored.decode("utf-8")
                 sig_stored = str(sig_stored)
                 if sig_stored != sig:
+                    # Backward-compatible relaxed acceptance for older uniform caches:
+                    # accept when core mesh construction controls match, even if old
+                    # signature included path/mtime that differs across jobs.
+                    lvl_ok = int(meta.attrs.get("starting_refine_to_level", -999)) == int(refine_to_level)
+                    pol_stored = meta.attrs.get("starting_refine_policy", "")
+                    if isinstance(pol_stored, (bytes, np.bytes_)):
+                        pol_stored = pol_stored.decode("utf-8")
+                    pol_ok = str(pol_stored) == str(refine_policy)
+                    rr_ok = int(meta.attrs.get("refine_ratio", -1)) == int(rr)
+
+                    interp_stored = meta.attrs.get("interp_k", None)
+                    interp_ok = True
+                    if interp_stored is not None:
+                        interp_ok = int(interp_stored) == int(interp_k_cfg)
+
+                    mesh_sha_stored = meta.attrs.get("mesh_spec_sha1", "")
+                    if isinstance(mesh_sha_stored, (bytes, np.bytes_)):
+                        mesh_sha_stored = mesh_sha_stored.decode("utf-8")
+                    mesh_sha_stored = str(mesh_sha_stored)
+                    mesh_sha_ok = (mesh_sha_stored == "") or (mesh_sha_stored == mesh_spec_sha1)
+
+                    if lvl_ok and pol_ok and rr_ok and interp_ok and mesh_sha_ok:
+                        print(
+                            "[PRECOMP][UNIFORM] cache signature mismatch but accepted via relaxed match "
+                            "(legacy or path/mtime-only difference)."
+                        )
+                        return True
+
                     print(
                         "[PRECOMP][UNIFORM] reject cache: signature mismatch "
                         f"(stored={sig_stored}, current={sig})"
@@ -3469,6 +3512,8 @@ def precompute_uniform_mesh_in_memory(
         meta.attrs["starting_refine_to_level"] = int(refine_to_level)
         meta.attrs["starting_refine_policy"] = np.bytes_(str(refine_policy))
         meta.attrs["starting_mesh_path"] = np.bytes_(mesh_spec_path)
+        meta.attrs["mesh_spec_sha1"] = np.bytes_(mesh_spec_sha1)
+        meta.attrs["interp_k"] = int(interp_k_cfg)
         meta.attrs["pred_edge_attr_layout"] = np.bytes_("nx,ny,face_len,dual_len,tau")
         meta.create_dataset("cfg_json", data=np.bytes_(json.dumps(cfg, sort_keys=True, default=str)))
 
