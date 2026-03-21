@@ -20,6 +20,7 @@ from utils_geom import (
     dynamic_cells_from_parent_masks,
     _targeted_map_to_pred,
     parents_from_pos, build_idw_map,
+    infer_refine_ratio_from_level_ij_pos,
 )
 from utils.precomp_h5 import precomp_h5_is_usable
 
@@ -46,6 +47,65 @@ def _get_refine_ratio(cfg: dict) -> int:
     rr = int(rr)
     if rr < 2:
         raise ValueError(f"refine_ratio must be >=2, got {rr}")
+    return rr
+
+
+def _step_like_get(step: Any, key: str, default: Any = None) -> Any:
+    if isinstance(step, dict):
+        return step.get(key, default)
+    return getattr(step, key, default)
+
+
+def _infer_gt_refine_ratio_from_steps(
+    steps: List[Any],
+    cfg: dict,
+    H: int,
+    W: int,
+    *,
+    fallback_ratio: int,
+    log_prefix: str = "[PRECOMP][GT-RR]",
+) -> int:
+    data_cfg = cfg.get("data", {}) or {}
+    bbox_raw = data_cfg.get("bbox", (0.0, float(W), 0.0, float(H)))
+    if isinstance(bbox_raw, (list, tuple)) and len(bbox_raw) == 4:
+        bbox = tuple(float(v) for v in bbox_raw)
+    else:
+        bbox = (0.0, float(W), 0.0, float(H))
+
+    cand_raw = data_cfg.get("gt_refine_ratio_candidates", (2, 4, 8))
+    if isinstance(cand_raw, (list, tuple)):
+        candidates = tuple(int(v) for v in cand_raw if int(v) >= 2) or (2, 4, 8)
+    else:
+        candidates = (2, 4, 8)
+
+    for idx, step in enumerate(steps):
+        level = _step_like_get(step, "level", None)
+        ij = _step_like_get(step, "ij", None)
+        pos = _step_like_get(step, "pos", None)
+        if pos is None:
+            pos = _step_like_get(step, "xy", None)
+        if level is None or ij is None or pos is None:
+            continue
+
+        rr, info = infer_refine_ratio_from_level_ij_pos(
+            levels=torch.as_tensor(level),
+            ij=torch.as_tensor(ij),
+            pos_xy=torch.as_tensor(pos),
+            H=int(H),
+            W=int(W),
+            bbox=bbox,
+            candidate_ratios=tuple(candidates),
+            fallback_ratio=int(fallback_ratio),
+        )
+        print(
+            f"{log_prefix} inferred refine_ratio={int(rr)} "
+            f"(sample={idx} rmse={float(info.get('rmse', float('nan'))):.3e} "
+            f"orient={info.get('orientation', 'row_col')} ok={bool(info.get('ok', False))})"
+        )
+        return int(rr)
+
+    rr = max(2, int(fallback_ratio))
+    print(f"{log_prefix} fallback refine_ratio={rr} (missing level/ij/pos)")
     return rr
 
 def plot_precomputed_mesh_from_h5(
@@ -968,7 +1028,8 @@ def _build_starting_mesh_from_spec(
         raise RuntimeError(f"Expected dict mesh spec, got {type(spec)}")
 
     bbox = tuple(map(float, cfg["data"]["bbox"]))
-    n0 = int(spec.get("n0", W))
+    n0_x = int(spec.get("n0_x", spec.get("n0", W)))
+    n0_y = int(spec.get("n0_y", spec.get("n0", H)))
     max_level = int(spec.get("max_level", cfg.get("policy", {}).get("max_level", 3)))
 
     # --- call build_amr_mesh_for_wedge with signature-agnostic kwargs ---
@@ -1006,8 +1067,18 @@ def _build_starting_mesh_from_spec(
         kwargs["H"] = int(H)
     if "W" in params:
         kwargs["W"] = int(W)
-    if "n0" in params:
-        kwargs["n0"] = n0
+    has_rect_params = ("n0_x" in params) or ("n0_y" in params)
+    if "n0_x" in params:
+        kwargs["n0_x"] = int(n0_x)
+    if "n0_y" in params:
+        kwargs["n0_y"] = int(n0_y)
+    if "n0" in params and (not has_rect_params):
+        if int(n0_x) != int(n0_y):
+            raise RuntimeError(
+                "Mesh spec is rectangular (n0_x != n0_y), but build_amr_mesh_for_wedge "
+                "does not expose n0_x/n0_y parameters."
+            )
+        kwargs["n0"] = int(n0_x)
     if "max_level" in params:
         kwargs["max_level"] = max_level
     if "device" in params:
@@ -1051,8 +1122,18 @@ def _build_starting_mesh_from_spec(
         kwargs["H"] = int(H)
     if "W" in params:
         kwargs["W"] = int(W)
-    if "n0" in params:
-        kwargs["n0"] = n0
+    has_rect_params = ("n0_x" in params) or ("n0_y" in params)
+    if "n0_x" in params:
+        kwargs["n0_x"] = int(n0_x)
+    if "n0_y" in params:
+        kwargs["n0_y"] = int(n0_y)
+    if "n0" in params and (not has_rect_params):
+        if int(n0_x) != int(n0_y):
+            raise RuntimeError(
+                "Mesh spec is rectangular (n0_x != n0_y), but build_amr_mesh_for_wedge "
+                "does not expose n0_x/n0_y parameters."
+            )
+        kwargs["n0"] = int(n0_x)
     if "max_level" in params:
         kwargs["max_level"] = max_level
     if "device" in params:
@@ -1787,6 +1868,9 @@ def _build_pred_mesh_from_gt_gradients(
     """
     dev = torch.device(device)
     rr = _get_refine_ratio(cfg)
+    gt_rr = int(ex.get("gt_refine_ratio", rr)) if isinstance(ex, dict) else int(rr)
+    if gt_rr < 2:
+        gt_rr = int(rr)
 
     # -------------------------------
     # 1. GT(t) centers and features
@@ -1806,17 +1890,17 @@ def _build_pred_mesh_from_gt_gradients(
     # -------------------------------
     # 2. Parents on coarse (H,W) grid
     # -------------------------------
-    if "level_t" in ex and ex["level_t"] is not None and \
+    if "dyn_parents" in ex and ex["dyn_parents"] is not None:
+        parents_t = ex["dyn_parents"].to(dev)
+    elif "level_t" in ex and ex["level_t"] is not None and \
        "ij_t" in ex and ex["ij_t"] is not None:
         parents_t = _parents_from_level_ij(
             ex["level_t"].to(dev),
             ex["ij_t"].to(dev),
             H,
             W,
-            refine_ratio=rr,
+            refine_ratio=gt_rr,
         )
-    elif "dyn_parents" in ex and ex["dyn_parents"] is not None:
-        parents_t = ex["dyn_parents"].to(dev)
     else:
         xmin, xmax, ymin, ymax = cfg["data"]["bbox"]
         parents_t = parents_from_pos(
@@ -2647,6 +2731,14 @@ def precompute_pred_mesh_and_interps_for_rollout(
     T = len(steps)
     if T < 2:
         raise RuntimeError("Need at least 2 timesteps for rollout precompute.")
+    gt_refine_ratio = _infer_gt_refine_ratio_from_steps(
+        steps,
+        cfg,
+        H,
+        W,
+        fallback_ratio=refine_ratio,
+        log_prefix="[PRECOMP][GT-RR]",
+    )
 
     # ----------------- determine HDF5 cache path -----------------
     if cache_path is None:
@@ -2829,7 +2921,7 @@ def precompute_pred_mesh_and_interps_for_rollout(
 
             if level_t is not None and ij_t is not None:
                 parents_t = _parents_from_level_ij(
-                    level_t.to(dev), ij_t.to(dev), H, W, refine_ratio=refine_ratio
+                    level_t.to(dev), ij_t.to(dev), H, W, refine_ratio=gt_refine_ratio
                 )
             elif "parents" in s:
                 parents_t = s["parents"].to(dev)
@@ -2856,7 +2948,7 @@ def precompute_pred_mesh_and_interps_for_rollout(
 
             if level_tp1 is not None and ij_tp1 is not None:
                 parents_tp1 = _parents_from_level_ij(
-                    level_tp1.to(dev), ij_tp1.to(dev), H, W, refine_ratio=refine_ratio
+                    level_tp1.to(dev), ij_tp1.to(dev), H, W, refine_ratio=gt_refine_ratio
                 )
             elif "parents" in s_next:
                 parents_tp1 = s_next["parents"].to(dev)
@@ -2885,6 +2977,7 @@ def precompute_pred_mesh_and_interps_for_rollout(
                     "center_feat_t": feat_t,
                     "level_t": level_t.to(dev) if level_t is not None else None,
                     "ij_t": ij_t.to(dev) if ij_t is not None else None,
+                    "gt_refine_ratio": int(gt_refine_ratio),
                     "dyn_parents": parents_t,
                     "mask_t": mask_t_parent.view(-1),
                     "ei_t": ei_t.to(dev) if (ei_t is not None and torch.is_tensor(ei_t)) else None,
@@ -3139,6 +3232,14 @@ def precompute_uniform_mesh_in_memory(
     T = len(steps)
     if T < 2:
         raise RuntimeError("Need at least 2 timesteps for in-memory uniform precompute.")
+    gt_refine_ratio = _infer_gt_refine_ratio_from_steps(
+        steps,
+        cfg,
+        H,
+        W,
+        fallback_ratio=rr,
+        log_prefix="[PRECOMP][UNIFORM][GT-RR]",
+    )
 
     mesh_cfg = cfg.get("mesh", {}) or {}
     mesh_spec_raw = mesh_cfg.get("starting_mesh_path", None)
@@ -3564,7 +3665,7 @@ def precompute_uniform_mesh_in_memory(
                 ij_t.to(map_dev),
                 H,
                 W,
-                refine_ratio=rr,
+                refine_ratio=gt_refine_ratio,
             )
         elif "parents" in s:
             parents_t = (s["parents"] if torch.is_tensor(s["parents"]) else torch.as_tensor(s["parents"])).to(map_dev, dtype=torch.long)
@@ -3586,7 +3687,7 @@ def precompute_uniform_mesh_in_memory(
                 ij_tp1.to(map_dev),
                 H,
                 W,
-                refine_ratio=rr,
+                refine_ratio=gt_refine_ratio,
             )
         elif "parents" in s_next:
             parents_tp1 = (s_next["parents"] if torch.is_tensor(s_next["parents"]) else torch.as_tensor(s_next["parents"])).to(map_dev, dtype=torch.long)

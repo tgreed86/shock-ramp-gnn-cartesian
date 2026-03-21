@@ -21,7 +21,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
-from utils_geom import unique_undirected
+from utils_geom import unique_undirected, infer_refine_ratio_from_level_ij_pos
 
 
 # ------------------------------- Utilities ---------------------------------- #
@@ -117,6 +117,64 @@ def _linear_id(i: torch.Tensor, j: torch.Tensor, H: int, W: int) -> torch.Tensor
     Returns: [N] long tensor
     """
     return (i.long() * W) + j.long()
+
+
+def _step_like_get(step: Any, key: str, default: Any = None) -> Any:
+    if isinstance(step, dict):
+        return step.get(key, default)
+    return getattr(step, key, default)
+
+
+def _infer_gt_refine_ratio_from_steps(
+    steps: List[Any],
+    cfg: Dict[str, Any],
+    H: int,
+    W: int,
+    *,
+    fallback_ratio: int = 2,
+    log_prefix: str = "[GT-RR]",
+) -> int:
+    data_cfg = cfg.get("data", {}) if isinstance(cfg, dict) else {}
+    bbox_raw = data_cfg.get("bbox", (0.0, float(W), 0.0, float(H)))
+    if isinstance(bbox_raw, (list, tuple)) and len(bbox_raw) == 4:
+        bbox = tuple(float(v) for v in bbox_raw)
+    else:
+        bbox = (0.0, float(W), 0.0, float(H))
+
+    cand_raw = data_cfg.get("gt_refine_ratio_candidates", (2, 4, 8))
+    if isinstance(cand_raw, (list, tuple)):
+        candidates = tuple(int(v) for v in cand_raw if int(v) >= 2) or (2, 4, 8)
+    else:
+        candidates = (2, 4, 8)
+
+    for idx, s in enumerate(steps):
+        level = _step_like_get(s, "level", None)
+        ij = _step_like_get(s, "ij", None)
+        pos = _step_like_get(s, "pos", None)
+        if pos is None:
+            pos = _step_like_get(s, "xy", None)
+        if level is None or ij is None or pos is None:
+            continue
+        rr, info = infer_refine_ratio_from_level_ij_pos(
+            levels=torch.as_tensor(level),
+            ij=torch.as_tensor(ij),
+            pos_xy=torch.as_tensor(pos),
+            H=int(H),
+            W=int(W),
+            bbox=bbox,
+            candidate_ratios=tuple(candidates),
+            fallback_ratio=int(fallback_ratio),
+        )
+        print(
+            f"{log_prefix} inferred refine_ratio={int(rr)} "
+            f"(sample={idx} rmse={float(info.get('rmse', float('nan'))):.3e} "
+            f"orient={info.get('orientation', 'row_col')} ok={bool(info.get('ok', False))})"
+        )
+        return int(rr)
+
+    rr = max(2, int(fallback_ratio))
+    print(f"{log_prefix} fallback refine_ratio={rr} (missing level/ij/pos)")
+    return rr
 
 
 def _ensure_long(x: torch.Tensor) -> torch.Tensor:
@@ -340,7 +398,8 @@ def _select_feature_columns(x: Tensor, cfg: Dict[str, Any]) -> Tensor:
 def level_ij_to_centers_bbox(levels: torch.Tensor,
                              ij: torch.Tensor,
                              H: int, W: int,
-                             bbox: tuple[float, float, float, float]
+                             bbox: tuple[float, float, float, float],
+                             refine_ratio: int = 2,
                              ) -> torch.Tensor:
     """
     Convert per-cell (level, i, j) to (x,y) centers in bbox units.
@@ -355,7 +414,8 @@ def level_ij_to_centers_bbox(levels: torch.Tensor,
     levels = levels.view(-1).long()
     i = ij[:, 0].to(torch.float32)
     j = ij[:, 1].to(torch.float32)
-    scale = torch.pow(torch.tensor(2.0, device=levels.device), levels.to(torch.float32))  # 2^l
+    rr = max(2, int(refine_ratio))
+    scale = torch.pow(torch.tensor(float(rr), device=levels.device), levels.to(torch.float32))
 
     # Per-level cell size
     dx = dx0 / scale
@@ -368,7 +428,8 @@ def level_ij_to_centers_bbox(levels: torch.Tensor,
 @torch.no_grad()
 def _parents_from_level_ij(levels: torch.Tensor,
                            ij: torch.Tensor,
-                           H: int, W: int) -> torch.Tensor:
+                           H: int, W: int,
+                           refine_ratio: int = 2) -> torch.Tensor:
     """
     Map each level-l cell with indices (i,j) at its own resolution (H*2^l, W*2^l)
     to its coarse parent index in a flattened (H*W) coarse grid.
@@ -380,8 +441,9 @@ def _parents_from_level_ij(levels: torch.Tensor,
     i = ij[:, 0].long()
     j = ij[:, 1].long()
 
-    # scale = 2^level, elementwise
-    scale = torch.pow(torch.tensor(2, device=levels.device, dtype=torch.long), levels)
+    rr = max(2, int(refine_ratio))
+    # scale = refine_ratio^level, elementwise
+    scale = torch.pow(torch.tensor(rr, device=levels.device, dtype=torch.long), levels)
     # integer floor division to get coarse parent row/col
     row = torch.div(i, scale, rounding_mode='floor').clamp_(0, H - 1)
     col = torch.div(j, scale, rounding_mode='floor').clamp_(0, W - 1)
@@ -417,10 +479,11 @@ def _masks_by_level_from_ij(
     W: int,
     L_max: int,
     device: torch.device,
+    refine_ratio: int = 2,
 ) -> Dict[int, torch.Tensor]:
     """
     Build boolean per-level masks on canonical rasters:
-      - Level l mask lives on shape (H*2**l, W*2**l).
+      - Level l mask lives on shape (H*refine_ratio**l, W*refine_ratio**l).
     Only cells that are present in the snapshot at that level are True.
 
     Returns: dict {l: mask_l bool[H*2**l, W*2**l]} for l in 0..L_max,
@@ -429,10 +492,11 @@ def _masks_by_level_from_ij(
     masks: Dict[int, torch.Tensor] = {}
     level = _ensure_long(level)
     ij = torch.as_tensor(ij).to(torch.long)
+    rr = max(2, int(refine_ratio))
 
     for l in range(0, L_max + 1):
-        Hl = H * (2 ** l)
-        Wl = W * (2 ** l)
+        Hl = H * (rr ** l)
+        Wl = W * (rr ** l)
         mask = torch.zeros((Hl * Wl,), dtype=torch.bool, device=device)
 
         sel = (level == l).nonzero(as_tuple=False).view(-1)
@@ -461,6 +525,7 @@ def _parents_root_and_immediate(
     W: int,
     L_max: int,
     device: torch.device,
+    refine_ratio: int = 2,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Compute two parent maps for each cell:
@@ -470,10 +535,11 @@ def _parents_root_and_immediate(
 
     Returns:
       parent_root:  [N] long (0..H*W-1)
-      parent_immed: [N] long (for l>0, inside (H*2**(l-1))*(W*2**(l-1)))
+      parent_immed: [N] long (for l>0, inside (H*rr**(l-1))*(W*rr**(l-1)))
     """
     level = _ensure_long(level).to(device)
     ij = torch.as_tensor(ij, device=device).to(torch.long)
+    rr = max(2, int(refine_ratio))
     N = ij.size(0)
 
     parent_root = torch.empty((N,), dtype=torch.long, device=device)
@@ -487,12 +553,12 @@ def _parents_root_and_immediate(
         i = ij[sel, 0]
         j = ij[sel, 1]
 
-        # Root (coarse-level) parent: divide coordinates by 2**l
+        # Root (coarse-level) parent: divide coordinates by rr**l
         if l == 0:
             lin_root = _linear_id(i, j, H, W)
         else:
-            i0 = i // (2 ** l)
-            j0 = j // (2 ** l)
+            i0 = i // (rr ** l)
+            j0 = j // (rr ** l)
             lin_root = _linear_id(i0, j0, H, W)
 
         parent_root[sel] = lin_root
@@ -501,10 +567,10 @@ def _parents_root_and_immediate(
         if l == 0:
             lin_immed = _linear_id(i, j, H, W)
         else:
-            Hi = H * (2 ** (l - 1))
-            Wi = W * (2 ** (l - 1))
-            i1 = i // 2
-            j1 = j // 2
+            Hi = H * (rr ** (l - 1))
+            Wi = W * (rr ** (l - 1))
+            i1 = i // rr
+            j1 = j // rr
             lin_immed = _linear_id(i1, j1, Hi, Wi)
 
         parent_immed[sel] = lin_immed
@@ -599,6 +665,14 @@ class AMRTemporalDataset(Dataset):
                 H, W = _infer_HW_from_level0_count(lvl0, prefer_square=True)
 
         self.H, self.W = int(H), int(W)
+        self.gt_refine_ratio = _infer_gt_refine_ratio_from_steps(
+            self.seq,
+            self.cfg,
+            self.H,
+            self.W,
+            fallback_ratio=2,
+            log_prefix="[DATASET][GT-RR]",
+        )
 
         # dx, dy (coarse spacings)
         dx = self.seq[0].dx if self.seq[0].dx is not None else 1.0
@@ -658,15 +732,43 @@ class AMRTemporalDataset(Dataset):
         ij_tp1 = _ensure_long(torch.as_tensor(s_tp1.ij, device=self.device))
 
         # Per-level masks
-        masks_t = _masks_by_level_from_ij(level_t, ij_t, self.H, self.W, self.L_max, self.device)
-        masks_tp1 = _masks_by_level_from_ij(level_tp1, ij_tp1, self.H, self.W, self.L_max, self.device)
+        masks_t = _masks_by_level_from_ij(
+            level_t,
+            ij_t,
+            self.H,
+            self.W,
+            self.L_max,
+            self.device,
+            refine_ratio=self.gt_refine_ratio,
+        )
+        masks_tp1 = _masks_by_level_from_ij(
+            level_tp1,
+            ij_tp1,
+            self.H,
+            self.W,
+            self.L_max,
+            self.device,
+            refine_ratio=self.gt_refine_ratio,
+        )
 
         # Parent mappings (root & immediate)
         parent_root_t, parent_im_t = _parents_root_and_immediate(
-            level_t, ij_t, self.H, self.W, self.L_max, self.device
+            level_t,
+            ij_t,
+            self.H,
+            self.W,
+            self.L_max,
+            self.device,
+            refine_ratio=self.gt_refine_ratio,
         )
         parent_root_tp1, parent_im_tp1 = _parents_root_and_immediate(
-            level_tp1, ij_tp1, self.H, self.W, self.L_max, self.device
+            level_tp1,
+            ij_tp1,
+            self.H,
+            self.W,
+            self.L_max,
+            self.device,
+            refine_ratio=self.gt_refine_ratio,
         )
 
         # Optional XY
@@ -820,6 +922,14 @@ class CellRefineTemporalDataset(Dataset):
 
         # domain / grid setup
         self.H, self.W = _ensure_hw_from_cfg_or_data(data_list[0], cfg, H, W)
+        self.gt_refine_ratio = _infer_gt_refine_ratio_from_steps(
+            data_list,
+            self.cfg,
+            self.H,
+            self.W,
+            fallback_ratio=2,
+            log_prefix="[TEMPORAL][GT-RR]",
+        )
 
         # Prebuild a lightweight cache of (t, t+1) pairs
         self.cache: List[Dict[str, Tensor]] = []
@@ -841,9 +951,21 @@ class CellRefineTemporalDataset(Dataset):
             if ij_t is None or ij_tp1 is None:
                 raise RuntimeError("Expected 'ij' indices per center in amr_cells.pt for robust parent/mask logic.")
 
-            dyn_parents = _parents_from_level_ij(level_t, ij_t, self.H, self.W)      # (N_t,)
+            dyn_parents = _parents_from_level_ij(
+                level_t,
+                ij_t,
+                self.H,
+                self.W,
+                refine_ratio=self.gt_refine_ratio,
+            )      # (N_t,)
             mask_t      = _coarse_mask_from_level_parents(level_t,  dyn_parents, self.H, self.W)  # (H*W,)
-            parents_tp1 = _parents_from_level_ij(level_tp1, ij_tp1, self.H, self.W)  # only for mask at t+1
+            parents_tp1 = _parents_from_level_ij(
+                level_tp1,
+                ij_tp1,
+                self.H,
+                self.W,
+                refine_ratio=self.gt_refine_ratio,
+            )  # only for mask at t+1
             mask_tp1    = _coarse_mask_from_level_parents(level_tp1, parents_tp1, self.H, self.W)
 
             # --- edges (center graph) ---
@@ -921,6 +1043,14 @@ def preprocess_timesteps_once(
     assert isinstance(ds_in, list) and len(ds_in) >= 2, "Need ≥2 timesteps"
 
     H, W = _ensure_hw_from_cfg_or_data(ds_in[0], cfg, H, W)
+    gt_refine_ratio = _infer_gt_refine_ratio_from_steps(
+        ds_in,
+        cfg,
+        H,
+        W,
+        fallback_ratio=2,
+        log_prefix="[PREPROCESS][GT-RR]",
+    )
     processed: List[Data] = []
 
     for k, dt in enumerate(ds_in):
@@ -932,7 +1062,7 @@ def preprocess_timesteps_once(
         if ij is None:
             raise RuntimeError("Expected 'ij' per center for robust parent/mask logic.")
 
-        parents = _parents_from_level_ij(level, ij, H, W)
+        parents = _parents_from_level_ij(level, ij, H, W, refine_ratio=gt_refine_ratio)
         mask    = _coarse_mask_from_level_parents(level, parents, H, W)
         ei      = _safe_edge_index(dt)
         if ei.dtype != torch.long: ei = ei.long()
@@ -1018,6 +1148,14 @@ class CellRefineWindowDataset(Dataset):
             is_proc = False if is_processed_file is None else not is_processed_file
 
         self.H, self.W = _ensure_hw_from_cfg_or_data(self.steps[0], cfg, self.H, self.W)
+        self.gt_refine_ratio = _infer_gt_refine_ratio_from_steps(
+            self.steps,
+            self.cfg,
+            self.H,
+            self.W,
+            fallback_ratio=2,
+            log_prefix="[WINDOW][GT-RR]",
+        )
 
         # inside CellRefineWindowDataset.__init__ ...
         # after we've set: self.steps = series_or_loaded_list; self.H, self.W established
@@ -1053,7 +1191,13 @@ class CellRefineWindowDataset(Dataset):
                     raise RuntimeError("expected 'ij' indices per center for robust parent/mask logic.")
                 ij = ij.long()
 
-                parents = _parents_from_level_ij(level, ij, self.H, self.W)     # existing helper
+                parents = _parents_from_level_ij(
+                    level,
+                    ij,
+                    self.H,
+                    self.W,
+                    refine_ratio=self.gt_refine_ratio,
+                )
                 mask    = _coarse_mask_from_level_parents(level, parents, self.H, self.W)
 
                 if ei is None or (torch.is_tensor(ei) and ei.numel() == 0):
@@ -1140,5 +1284,3 @@ class CellRefineWindowDataset(Dataset):
             })
             
         return out
-
-

@@ -6,6 +6,133 @@ import torch.nn.functional as F
 
 
 @torch.no_grad()
+def infer_refine_ratio_from_level_ij_pos(
+    *,
+    levels: torch.Tensor,
+    ij: torch.Tensor,
+    pos_xy: torch.Tensor,
+    H: int,
+    W: int,
+    bbox: tuple[float, float, float, float],
+    candidate_ratios: tuple[int, ...] = (2, 4, 8),
+    fallback_ratio: int = 2,
+    max_samples: int = 200000,
+) -> tuple[int, dict]:
+    """
+    Infer AMR refine ratio from (level, ij, pos) by center-reconstruction error.
+
+    Candidate ratios are tested against both ij conventions:
+      - row_col: ij[:,0]=row, ij[:,1]=col
+      - col_row: ij[:,0]=col, ij[:,1]=row
+    The best (lowest RMSE) valid candidate is returned.
+    """
+    rr_fallback = max(2, int(fallback_ratio))
+    info: dict = {
+        "ok": False,
+        "reason": "",
+        "ratio": rr_fallback,
+        "rmse": float("inf"),
+        "orientation": "row_col",
+        "samples": 0,
+    }
+
+    if levels is None or ij is None or pos_xy is None:
+        info["reason"] = "missing_inputs"
+        return rr_fallback, info
+
+    lv = torch.as_tensor(levels).view(-1).long()
+    ijv = torch.as_tensor(ij)
+    pos = torch.as_tensor(pos_xy)
+    if ijv.ndim != 2 or ijv.size(-1) != 2 or pos.ndim != 2 or pos.size(-1) < 2:
+        info["reason"] = "bad_shapes"
+        return rr_fallback, info
+
+    n = min(int(lv.numel()), int(ijv.shape[0]), int(pos.shape[0]))
+    if n <= 0:
+        info["reason"] = "empty"
+        return rr_fallback, info
+
+    lv = lv[:n]
+    ijv = ijv[:n, :2].long()
+    pos = pos[:n, :2].to(torch.float32)
+
+    finite = torch.isfinite(pos).all(dim=1)
+    if not bool(finite.any().item()):
+        info["reason"] = "nonfinite_pos"
+        return rr_fallback, info
+
+    keep = finite.nonzero(as_tuple=False).view(-1)
+    if keep.numel() > int(max_samples):
+        step = max(1, int(keep.numel() // int(max_samples)))
+        keep = keep[::step][: int(max_samples)]
+
+    lv = lv.index_select(0, keep)
+    ijv = ijv.index_select(0, keep)
+    pos = pos.index_select(0, keep)
+    info["samples"] = int(lv.numel())
+
+    xmin, xmax, ymin, ymax = [float(v) for v in bbox]
+    xs = max(float(xmax - xmin), 1e-12)
+    ys = max(float(ymax - ymin), 1e-12)
+    dev = pos.device
+
+    best_rr = rr_fallback
+    best_rmse = float("inf")
+    best_orient = "row_col"
+
+    candidates = sorted({max(2, int(c)) for c in tuple(candidate_ratios) + (rr_fallback,)})
+    for rr in candidates:
+        scale = torch.pow(torch.tensor(float(rr), device=dev), lv.to(torch.float32))
+        ww = float(W) * scale
+        hh = float(H) * scale
+
+        for swap in (False, True):
+            if not swap:
+                row = ijv[:, 0].to(torch.float32)
+                col = ijv[:, 1].to(torch.float32)
+                orient = "row_col"
+            else:
+                row = ijv[:, 1].to(torch.float32)
+                col = ijv[:, 0].to(torch.float32)
+                orient = "col_row"
+
+            x_hat = xmin + (col + 0.5) * (xs / ww)
+            y_hat = ymin + (row + 0.5) * (ys / hh)
+            err2 = (x_hat - pos[:, 0]).pow(2) + (y_hat - pos[:, 1]).pow(2)
+            rmse = float(torch.sqrt(torch.mean(err2)).item())
+            if rmse < best_rmse:
+                best_rmse = rmse
+                best_rr = int(rr)
+                best_orient = orient
+
+    dx0 = xs / max(1.0, float(W))
+    dy0 = ys / max(1.0, float(H))
+    tol = 0.35 * max(dx0, dy0)
+    if best_rmse > tol:
+        info.update(
+            {
+                "ok": False,
+                "reason": "low_confidence",
+                "ratio": rr_fallback,
+                "rmse": float(best_rmse),
+                "orientation": best_orient,
+            }
+        )
+        return rr_fallback, info
+
+    info.update(
+        {
+            "ok": True,
+            "reason": "matched_centers",
+            "ratio": int(best_rr),
+            "rmse": float(best_rmse),
+            "orientation": best_orient,
+        }
+    )
+    return int(best_rr), info
+
+
+@torch.no_grad()
 def dynamic_cells_from_parent_masks(
     masks_by_level: dict[int, torch.Tensor],
     H: int, W: int,

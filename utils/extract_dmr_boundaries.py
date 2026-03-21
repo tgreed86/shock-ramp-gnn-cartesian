@@ -34,6 +34,8 @@ def save_wedge_mesh_spec_pt(
     out_path: str,
     boundaries: dict,
     n0: int = 64,
+    n0_x: int | None = None,
+    n0_y: int | None = None,
     max_level: int = 3,
 ):
     """
@@ -41,22 +43,35 @@ def save_wedge_mesh_spec_pt(
 
     We save:
       - outer polygon (and optionally the separate edges) as float32 tensors
-      - n0 (base grid size) and max_level as ints
+      - base grid size (n0_x, n0_y) and max_level as ints
 
     In another project you can:
       1) load this .pt file,
       2) reconstruct the boundaries dict,
-      3) call build_amr_mesh_for_wedge(boundaries, n0, max_level).
+      3) call build_amr_mesh_for_wedge(boundaries, n0_x, n0_y, max_level).
     """
+    if n0_x is None:
+        n0_x = int(n0)
+    if n0_y is None:
+        n0_y = int(n0)
+    n0_x = int(n0_x)
+    n0_y = int(n0_y)
+    if n0_x <= 0 or n0_y <= 0:
+        raise ValueError(f"n0_x and n0_y must be positive, got n0_x={n0_x}, n0_y={n0_y}")
+
     payload = {
         "outer_polygon_ccw": torch.from_numpy(boundaries["outer_polygon_ccw"]).float(),
         "bottom": torch.from_numpy(boundaries["bottom"]).float(),
         "top": torch.from_numpy(boundaries["top"]).float(),
         "left": torch.from_numpy(boundaries["left"]).float(),
         "right": torch.from_numpy(boundaries["right"]).float(),
-        "n0": int(n0),
+        "n0_x": n0_x,
+        "n0_y": n0_y,
         "max_level": int(max_level),
     }
+    # Backward compatibility for old readers that only know scalar n0.
+    if n0_x == n0_y:
+        payload["n0"] = int(n0_x)
     torch.save(payload, out_path)
     print(f"[INFO] Saved wedge mesh spec to '{out_path}'.")
 
@@ -243,12 +258,14 @@ def build_domain_polygon(boundaries: dict) -> Polygon:
 def build_amr_mesh_for_wedge(
     boundaries: dict,
     n0: int = 64,
+    n0_x: int | None = None,
+    n0_y: int | None = None,
     max_level: int = 3,
 ):
     """
     Build an AMR-style quadtree covering of the wedge domain.
 
-    Level-0: n0 x n0 cells on the bounding box of the wedge.
+    Level-0: n0_x x n0_y cells on the bounding box of the wedge.
     Levels 1..max_level: each cell splits into 4 children (quadtree).
     
     Rules:
@@ -265,7 +282,11 @@ def build_amr_mesh_for_wedge(
     boundaries : dict
         Output of `extract_boundaries`.
     n0 : int
-        Number of level-0 cells in each direction (n0 x n0).
+        Legacy scalar base resolution. Used when n0_x/n0_y are not provided.
+    n0_x : int or None
+        Number of level-0 cells in x (i direction).
+    n0_y : int or None
+        Number of level-0 cells in y (j direction).
     max_level : int
         Maximum AMR level (0 = coarsest).
 
@@ -281,8 +302,19 @@ def build_amr_mesh_for_wedge(
     P = build_domain_polygon(boundaries)
     xmin, ymin, xmax, ymax = P.bounds
 
-    dx0 = (xmax - xmin) / n0
-    dy0 = (ymax - ymin) / n0
+    if n0_x is None:
+        n0_x = int(n0)
+    if n0_y is None:
+        n0_y = int(n0)
+    n0_x = int(n0_x)
+    n0_y = int(n0_y)
+    if n0_x <= 0 or n0_y <= 0:
+        raise ValueError(f"n0_x and n0_y must be positive, got n0_x={n0_x}, n0_y={n0_y}")
+    if int(max_level) < 0:
+        raise ValueError(f"max_level must be >=0, got {max_level}")
+
+    dx0 = (xmax - xmin) / float(n0_x)
+    dy0 = (ymax - ymin) / float(n0_y)
 
     cells: list[dict] = []
 
@@ -335,9 +367,9 @@ def build_amr_mesh_for_wedge(
             subdivide(next_level, 2 * i + 1, 2 * j + 1, x0 + dx2, y0 + dy2, dx2, dy2)
 
     # Loop over level-0 grid and kick off recursion
-    for j0 in range(n0):
+    for j0 in range(n0_y):
         y0 = ymin + j0 * dy0
-        for i0 in range(n0):
+        for i0 in range(n0_x):
             x0 = xmin + i0 * dx0
             subdivide(level=0, i=i0, j=j0, x0=x0, y0=y0, dx=dx0, dy=dy0)
 
@@ -461,13 +493,51 @@ def main(argv=None):
         default="dmr_boundaries_level0.npz",
         help="Output .npz file where boundary arrays will be stored.",
     )
+    parser.add_argument(
+        "--mesh-spec-out",
+        default=None,
+        help=(
+            "Optional explicit output path for wedge mesh spec (.pt). "
+            "If omitted, defaults to '<dirname(output)>/wedge_mesh_spec.pt'."
+        ),
+    )
+    parser.add_argument(
+        "--n0",
+        type=int,
+        default=64,
+        help="Legacy scalar base coarse resolution for both x and y.",
+    )
+    parser.add_argument(
+        "--n0-x",
+        type=int,
+        default=None,
+        help="Base coarse resolution in x (overrides --n0 for x).",
+    )
+    parser.add_argument(
+        "--n0-y",
+        type=int,
+        default=None,
+        help="Base coarse resolution in y (overrides --n0 for y).",
+    )
+    parser.add_argument(
+        "--max-level",
+        type=int,
+        default=3,
+        help="Maximum AMR refinement level for wedge mesh generation.",
+    )
     args = parser.parse_args(argv)
 
     map_path = str(args.map_file)
     level = args.level
 
-    n0 = 64
-    max_level = 3
+    n0 = int(args.n0)
+    n0_x = int(args.n0_x) if args.n0_x is not None else n0
+    n0_y = int(args.n0_y) if args.n0_y is not None else n0
+    max_level = int(args.max_level)
+    if n0_x <= 0 or n0_y <= 0:
+        raise ValueError(f"--n0-x and --n0-y must be positive, got {n0_x} and {n0_y}")
+    if max_level < 0:
+        raise ValueError(f"--max-level must be >=0, got {max_level}")
 
     print(f"[INFO] Reading node mapping from '{map_path}' at level '{level}'...")
     X, Y, meta = build_level_node_coords(map_path, level=level)
@@ -481,8 +551,14 @@ def main(argv=None):
 
     plot_boundaries(boundaries, show_polygon=True, save_path=None)
         
-    # Build AMR mesh: 64x64 base grid, up to level 3
-    amr_cells = build_amr_mesh_for_wedge(boundaries, n0=n0, max_level=max_level)
+    # Build AMR mesh from requested base grid and refinement depth.
+    amr_cells = build_amr_mesh_for_wedge(
+        boundaries,
+        n0=n0,
+        n0_x=n0_x,
+        n0_y=n0_y,
+        max_level=max_level,
+    )
 
     print(f"[INFO] Built AMR mesh with {len(amr_cells)} cells total.")
     # For example, count cells at each level:
@@ -495,8 +571,22 @@ def main(argv=None):
     plt.show()
 
     # Save spec to reuse in PyTorch project
-    mesh_spec_path = os.path.join(os.path.dirname(args.output), "wedge_mesh_spec.pt")
-    save_wedge_mesh_spec_pt(mesh_spec_path, boundaries, n0=n0, max_level=max_level)
+    if args.mesh_spec_out is None:
+        mesh_spec_path = os.path.join(os.path.dirname(args.output), "wedge_mesh_spec.pt")
+    else:
+        mesh_spec_path = str(args.mesh_spec_out)
+    mesh_spec_path = os.path.expanduser(mesh_spec_path)
+    mesh_spec_dir = os.path.dirname(mesh_spec_path)
+    if mesh_spec_dir:
+        os.makedirs(mesh_spec_dir, exist_ok=True)
+    save_wedge_mesh_spec_pt(
+        mesh_spec_path,
+        boundaries,
+        n0=n0,
+        n0_x=n0_x,
+        n0_y=n0_y,
+        max_level=max_level,
+    )
 
     out_path = str(args.output)
     np.savez(

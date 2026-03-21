@@ -17,7 +17,11 @@
   "features": {
     "use_columns": [0, 1, 3],
     "names": ["density", "x_momentum", "energy"],
-    "normalize": true
+    "normalize": true,
+    "build": {
+      "use_dt_hat_fixed": false,
+      "_comment_use_dt_hat_fixed": "If true, append normalized dt_hat = dt_phys/dt_ref as one extra node feature."
+    }
   },
 
   "split": { "train": 0.8, "val": 0.1, "test": 0.1 },

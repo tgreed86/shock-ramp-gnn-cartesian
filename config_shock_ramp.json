@@ -4,9 +4,9 @@
 
   "data": {
     "pt_path": "/Users/trevorreed/UVA_postdoc_stuff/gparc/data/shock_ramp/shock_ramp_amr.pt",
-    "H": 64,
-    "W": 64,
-    "L_max": 3,
+    "H": 24,
+    "W": 96,
+    "L_max": 4,
     "bbox": [0.0, 1.0, 0.0, 1.0],
     "pre_train_dir": "./precomp_cache",
     "window_size": 5,
@@ -27,9 +27,9 @@
   "split": { "train": 0.85, "val": 0.1, "test": 0.05 },
 
   "train": {
-    "precomp_cache_path": "./cache/L3_uniform/shock_ramp_precomp_L3_uniform_faceAdj_DEC.h5",
-    "precomp_force_recompute": false,
-    "epochs": 5,
+    "precomp_cache_path": "./cache/L4_uniform/shock_ramp_precomp_L4_uniform_faceAdj_DEC.h5",
+    "precomp_force_recompute": true,
+    "epochs": 1,
     "checkpoint_every_epochs": 5,
     "validation_every_epochs": 5,
     "batch_size": 1,
@@ -46,7 +46,7 @@
     "knn_k": 8,
     "mesh_mode": "uniform",
     "_comment_mesh_mode": "predicted or uniform",
-    "save_dir": "./runs_uniform_mesh",
+    "save_dir": "./runs_mesh_first",
     "multi_step_K": 2,
     "uniform_H": 256,
     "uniform_W": 256,
@@ -105,7 +105,7 @@
     "geometry_mode": "starting_refine",
     "_comment_geometry_mode": "gt_gradients or starting_refine for uniform mesh",
     "starting_refine_policy": "min_level",
-    "starting_refine_to_level": 3,
+    "starting_refine_to_level": 4,
     "refine_ratio": 2,
     "hysteresis_mode": "percentile",
     "percentile_low":  85.0,
@@ -120,7 +120,7 @@
     "combine": "l2",
     "grad_channels": [0],
     "grad_norm": "l2",
-    "max_level": 3,
+    "max_level": 4,
     "tau_low":  1.0,
     "tau_high": 1.0
   },
@@ -175,8 +175,8 @@
 
     "parc_use_adapter": false,
     "parc_feat_norm": false,
-    "parc_feat_clip_pre": 50.0,
-    "parc_feat_clip_post": 10.0,
+    "parc_feat_clip_pre": 0.0,
+    "parc_feat_clip_post": 0.0,
     "parc_feat_norm_momentum": 0.02,
     "parc_gate_init": -3.0,
     "parc_gate_per_channel": false,
@@ -217,12 +217,11 @@
   "eval": {
     "checkpoint": "./runs_mesh_first/best.pt",
     "qual_pdf": "./qual_rollout.pdf",
-    "fine_L": 3,
     "show_mesh": true
   },
 
   "mesh": {
-    "starting_mesh_path": "./utils/wedge_mesh_spec.pt"
+    "starting_mesh_path": "./utils/wedge_mesh_spec_96x24_L4.pt"
   },
 
   "model": {

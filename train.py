@@ -7764,6 +7764,33 @@ def main(config_path: str | None = None, out_dir: str | None = None):
         cfg.setdefault("train", {})["save_dir"] = out_dir_abs
         print(f"[CLI] Overriding train.save_dir -> {out_dir_abs}")
 
+    # Canonical level settings:
+    # - policy.max_level controls AMR mask hierarchy / clipping depth.
+    # - data.L_max is kept in sync when missing.
+    # - eval.fine_L is auto-derived from policy.max_level (no separate tuning).
+    data_cfg = cfg.setdefault("data", {})
+    policy_cfg = cfg.setdefault("policy", {})
+    eval_cfg = cfg.setdefault("eval", {})
+
+    if "max_level" not in policy_cfg:
+        policy_cfg["max_level"] = int(data_cfg.get("L_max", 3))
+    if "L_max" not in data_cfg:
+        data_cfg["L_max"] = int(policy_cfg.get("max_level", 3))
+
+    lmax_policy = int(policy_cfg.get("max_level", 3))
+    lmax_data = int(data_cfg.get("L_max", lmax_policy))
+    if lmax_policy != lmax_data:
+        print(
+            f"[CFG][WARN] policy.max_level ({lmax_policy}) != data.L_max ({lmax_data}). "
+            "Using policy.max_level for AMR operations.",
+            flush=True,
+        )
+    eval_cfg["fine_L"] = int(lmax_policy)
+    print(
+        f"[CFG] effective levels: policy.max_level={lmax_policy}, data.L_max={lmax_data}, eval.fine_L={int(eval_cfg['fine_L'])}",
+        flush=True,
+    )
+
     idx = dec.infer_feature_indices(cfg, 4)
     print("[IDX]", idx)
     assert idx["rho"] == 0 and idx["mx"] == 1 and idx["my"] == 2 and idx["E"] == 3
