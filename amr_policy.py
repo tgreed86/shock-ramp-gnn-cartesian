@@ -547,6 +547,50 @@ def predict_masks_hierarchical_from_gt_gradients(
             pooled = torch.nn.functional.max_pool2d(G[Lc][None, None], kernel_size=scale, stride=scale)[0, 0]
             pooled_up[L] = torch.maximum(pooled_up[L], pooled)
 
+    # Reconstruct previous refine masks per level from current mesh state.
+    # prev_refine_by_level[L] lives on the parent grid for level L (shape H*rr^(L-1), W*rr^(L-1)).
+    prev_refine_by_level: Dict[int, torch.Tensor] = {}
+    level_t_raw = batch.get("level_t", None)
+    ij_t_raw = batch.get("ij_t", None)
+    if level_t_raw is not None and ij_t_raw is not None:
+        try:
+            lv_prev = torch.as_tensor(level_t_raw, device=dev).view(-1).long()
+            ij_prev = torch.as_tensor(ij_t_raw, device=dev)
+
+            if ij_prev.ndim >= 3 and ij_prev.shape[0] == 1:
+                ij_prev = ij_prev.squeeze(0)
+            if ij_prev.ndim == 2 and ij_prev.shape[0] == 2 and ij_prev.shape[1] != 2:
+                ij_prev = ij_prev.transpose(0, 1)
+            if ij_prev.ndim > 2 and ij_prev.shape[-1] == 2:
+                ij_prev = ij_prev.reshape(-1, 2)
+
+            if ij_prev.ndim == 2 and ij_prev.shape[1] == 2 and ij_prev.shape[0] == lv_prev.numel():
+                ij_prev = ij_prev.to(torch.long)
+                for L in range(1, maxL + 1):
+                    h_p = int(H * (rr ** (L - 1)))
+                    w_p = int(W * (rr ** (L - 1)))
+                    prev_mask_L = torch.zeros((h_p, w_p), dtype=torch.bool, device=dev)
+
+                    sel = (lv_prev >= int(L))
+                    if bool(sel.any()):
+                        rel_lv = (lv_prev[sel] - int(L - 1)).to(torch.long)
+                        parent_flat = _parents_from_level_ij(
+                            rel_lv,
+                            ij_prev[sel],
+                            h_p,
+                            w_p,
+                            refine_ratio=rr,
+                        ).view(-1).long()
+                        if parent_flat.numel() > 0:
+                            parent_flat = parent_flat.clamp_(0, h_p * w_p - 1)
+                            prev_mask_L.view(-1)[parent_flat] = True
+                    prev_refine_by_level[L] = prev_mask_L
+            elif dbg_thr:
+                print("[THR] warning: level_t/ij_t shape mismatch; falling back to L1 mask_t hysteresis only.")
+        except Exception as e:
+            if dbg_thr:
+                print(f"[THR] warning: failed to build per-level previous masks ({e}); using fallback.")
+
     # --- thresholding with absolute/percentile hysteresis (unchanged logic) ---
     masks_by_level = {}
     for L in range(1, maxL + 1):
@@ -588,12 +632,12 @@ def predict_masks_hierarchical_from_gt_gradients(
             print(f"[THR] L{L} mode={mode} thr_low={float(thr_low):.3e} thr_high={float(thr_high):.3e} "
                   f"min={gmin:.3e} max={gmax:.3e}")
 
-        # hysteresis / parent-child consistency: unchanged from your version
-        if L == 1 and ("mask_t" in batch):
-            prev_flat = batch["mask_t"].to(dev)
-            Gparent = Gparent
-            h_p, w_p = int(Gparent.shape[0]), int(Gparent.shape[1])
+        h_p, w_p = int(Gparent.shape[0]), int(Gparent.shape[1])
+        prev_mask = prev_refine_by_level.get(L, None)
 
+        # Backward-compatible fallback for L1 when richer previous level state is unavailable.
+        if prev_mask is None and L == 1 and ("mask_t" in batch):
+            prev_flat = batch["mask_t"].to(dev)
             H0 = int(cfg["data"].get("H", H))
             W0 = int(cfg["data"].get("W", W))
             if H0 * W0 == prev_flat.numel():
@@ -604,15 +648,13 @@ def predict_masks_hierarchical_from_gt_gradients(
                     prev2d = prev_flat.view(side, side).float()
                 else:
                     prev2d = torch.zeros((h_p, w_p), device=dev, dtype=torch.float32)
+            prev_mask = prev2d.bool()
 
-            if prev2d.shape != (h_p, w_p):
-                prev_resized = torch.nn.functional.interpolate(
-                    prev2d[None, None], size=(h_p, w_p), mode="nearest"
-                )[0, 0]
-            else:
-                prev_resized = prev2d
-
-            prev_mask = prev_resized.bool()
+        if prev_mask is not None:
+            if prev_mask.shape != (h_p, w_p):
+                prev_mask = torch.nn.functional.interpolate(
+                    prev_mask.float()[None, None], size=(h_p, w_p), mode="nearest"
+                )[0, 0].bool()
             keep = prev_mask & (Gparent > thr_low)
             newr = (~prev_mask) & (Gparent > thr_high)
             M = keep | newr

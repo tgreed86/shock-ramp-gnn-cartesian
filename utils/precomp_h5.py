@@ -205,6 +205,13 @@ class LazyPrecompH5(dict):
             return None
         return g[name][...]
 
+    def _read_np_static(self, name: str) -> Optional[np.ndarray]:
+        self._open()
+        g = self._f.get("static", None)
+        if g is None or name not in g:
+            return None
+        return g[name][...]
+
     def _to_torch(self, arr: np.ndarray, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         dev = _normalize_device(device)
         return torch.from_numpy(arr).to(device=dev, dtype=dtype)
@@ -253,24 +260,30 @@ class LazyPrecompH5(dict):
             if not self._has_group(t):
                 return None
 
+            def _read_group_or_static(ds_name: str) -> Optional[np.ndarray]:
+                arr = self._read_np(t, ds_name)
+                if arr is None:
+                    arr = self._read_np_static(ds_name)
+                return arr
+
             if key == "pred_centers":
-                arr = self._read_np(t, "pred_centers")
+                arr = _read_group_or_static("pred_centers")
                 return None if arr is None else self._to_torch(arr, dtype=torch.float32, device=self.device)
 
             if key == "pred_levels":
-                arr = self._read_np(t, "pred_levels")
+                arr = _read_group_or_static("pred_levels")
                 return None if arr is None else self._to_torch(arr, dtype=torch.long, device=self.device)
 
             if key == "pred_parents":
-                arr = self._read_np(t, "pred_parents")
+                arr = _read_group_or_static("pred_parents")
                 return None if arr is None else self._to_torch(arr, dtype=torch.long, device=self.device)
 
             if key == "pred_ei":
-                arr = self._read_np(t, "pred_ei")
+                arr = _read_group_or_static("pred_ei")
                 return None if arr is None else self._to_torch(arr, dtype=torch.long, device=self.device)
 
             if key == "mask_pred":
-                arr = self._read_np(t, "mask_pred_parent_flat_u8")
+                arr = _read_group_or_static("mask_pred_parent_flat_u8")
                 if arr is None:
                     return None
                 m = torch.from_numpy(arr.astype(np.uint8, copy=False)).to(self.device)
@@ -286,15 +299,15 @@ class LazyPrecompH5(dict):
 
             # --- DEC additions ---
             if key == "pred_edge_attr":
-                arr = self._read_np(t, "pred_edge_attr")
+                arr = _read_group_or_static("pred_edge_attr")
                 return None if arr is None else self._to_torch(arr, dtype=torch.float32, device=self.device)
 
             if key == "pred_cell_wh":
-                arr = self._read_np(t, "pred_cell_wh")
+                arr = _read_group_or_static("pred_cell_wh")
                 return None if arr is None else self._to_torch(arr, dtype=torch.float32, device=self.device)
 
             if key == "pred_cell_area":
-                arr = self._read_np(t, "pred_cell_area")
+                arr = _read_group_or_static("pred_cell_area")
                 return None if arr is None else self._to_torch(arr, dtype=torch.float32, device=self.device)
 
         # pred2pred maps exist for t=1..T-2 (stored in group t, mapping to t+1)
@@ -306,10 +319,14 @@ class LazyPrecompH5(dict):
 
             if key == "pred2pred_idx":
                 arr = self._read_np(t, "pred2pred_idx_to_next")
+                if arr is None:
+                    arr = self._read_np_static("pred2pred_idx_to_next")
                 return None if arr is None else self._to_torch(arr, dtype=torch.long, device=self.device)
 
             if key == "pred2pred_w":
                 arr = self._read_np(t, "pred2pred_w_to_next")
+                if arr is None:
+                    arr = self._read_np_static("pred2pred_w_to_next")
                 if arr is None:
                     return None
                 return self._to_torch(arr.astype(np.float32, copy=False), dtype=torch.float32, device=self.device)
@@ -594,6 +611,7 @@ def precomp_h5_is_usable(
                 return False
 
             meta = f["meta"]
+            static_g = f.get("static", None)
 
             # ---- T check
             stored_T = meta.attrs.get("T", None)
@@ -631,20 +649,31 @@ def precomp_h5_is_usable(
 
                 g = f[gname]
 
+                def _has_ds(ds_name: str) -> bool:
+                    if ds_name in g:
+                        return True
+                    return (static_g is not None) and (ds_name in static_g)
+
                 # minimum datasets written in FIRST PASS
-                required = [
+                required_geom = [
                     "pred_centers", "pred_levels", "pred_parents", "pred_ei",
                     "mask_pred_parent_flat_u8",
+                ]
+                required_feats = [
                     "feat_t_on_pred", "feat_tp1_on_pred",
                 ]
-                for ds in required:
+                for ds in required_geom:
+                    if not _has_ds(ds):
+                        _v(f"reject: group {gname} missing dataset '{ds}'")
+                        return False
+                for ds in required_feats:
                     if ds not in g:
                         _v(f"reject: group {gname} missing dataset '{ds}'")
                         return False
 
                 if require_dec:
                     for ds in ("pred_edge_attr", "pred_cell_wh", "pred_cell_area"):
-                        if ds not in g:
+                        if not _has_ds(ds):
                             _v(f"reject: group {gname} missing DEC dataset '{ds}'")
                             return False
                 '''
@@ -691,7 +720,9 @@ def precomp_h5_is_usable(
                 for t in range(1, stored_T - 1):
                     gname = f"t{t:05d}"
                     g = f[gname]
-                    if "pred2pred_idx_to_next" not in g or "pred2pred_w_to_next" not in g:
+                    has_idx = ("pred2pred_idx_to_next" in g) or ((static_g is not None) and ("pred2pred_idx_to_next" in static_g))
+                    has_w = ("pred2pred_w_to_next" in g) or ((static_g is not None) and ("pred2pred_w_to_next" in static_g))
+                    if (not has_idx) or (not has_w):
                         _v(f"reject: missing pred2pred maps in {gname}")
                         return False
 
@@ -710,11 +741,20 @@ def read_precomp_step_h5(path: str, t: int, *, device: torch.device, H: int, W: 
     gname = f"t{int(t):05d}"
     with h5py.File(path, "r") as f:
         g = f[gname]
-        pred_centers = torch.from_numpy(g["pred_centers"][...]).to(device)
-        pred_levels  = torch.from_numpy(g["pred_levels"][...]).to(device=device, dtype=torch.long)
-        pred_parents = torch.from_numpy(g["pred_parents"][...]).to(device=device, dtype=torch.long)
-        pred_ei      = torch.from_numpy(g["pred_ei"][...]).to(device=device, dtype=torch.long)
-        mp_u8        = g["mask_pred_parent_flat_u8"][...]
+        gs = f.get("static", None)
+
+        def _read_ds(name: str):
+            if name in g:
+                return g[name][...]
+            if gs is not None and name in gs:
+                return gs[name][...]
+            raise KeyError(f"Dataset '{name}' not found in '{gname}' or '/static'.")
+
+        pred_centers = torch.from_numpy(_read_ds("pred_centers")).to(device)
+        pred_levels  = torch.from_numpy(_read_ds("pred_levels")).to(device=device, dtype=torch.long)
+        pred_parents = torch.from_numpy(_read_ds("pred_parents")).to(device=device, dtype=torch.long)
+        pred_ei      = torch.from_numpy(_read_ds("pred_ei")).to(device=device, dtype=torch.long)
+        mp_u8        = _read_ds("mask_pred_parent_flat_u8")
         mask_pred_parent = torch.from_numpy(mp_u8.astype(np.uint8)).to(device=device).view(H, W).bool()
 
         feat_t_on_pred = torch.from_numpy(g["feat_t_on_pred"][...]).to(device) if "feat_t_on_pred" in g else None

@@ -40,6 +40,147 @@ def _cfg_hash_for_cache(cfg):
     return hashlib.md5(s.encode()).hexdigest()[:8]
 
 
+def _abs_or_none(path_like: Any) -> str | None:
+    if path_like is None:
+        return None
+    s = str(path_like).strip()
+    if s == "":
+        return None
+    return os.path.abspath(os.path.expanduser(s))
+
+
+def _jsonify(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {str(k): _jsonify(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonify(v) for v in obj]
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    if isinstance(obj, (bytes, np.bytes_)):
+        return obj.decode("utf-8", errors="replace")
+    return obj
+
+
+def _drop_comment_keys(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            ks = str(k)
+            if ks.startswith("_comment"):
+                continue
+            out[ks] = _drop_comment_keys(v)
+        return out
+    if isinstance(obj, list):
+        return [_drop_comment_keys(v) for v in obj]
+    return obj
+
+
+def _precomp_repro_json_path(h5_path: str) -> str:
+    root, _ = os.path.splitext(os.path.abspath(os.path.expanduser(str(h5_path))))
+    return f"{root}.repro.json"
+
+
+def _write_precomp_repro_json(h5_path: str, payload: Dict[str, Any]) -> str:
+    out_path = _precomp_repro_json_path(h5_path)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    tmp_path = f"{out_path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(_jsonify(payload), f, sort_keys=True, indent=2)
+        f.write("\n")
+    os.replace(tmp_path, out_path)
+    print(f"[PRECOMP] Saved reproduction config JSON: {out_path}")
+    return out_path
+
+
+def _build_precomp_repro_payload(
+    *,
+    mode: str,
+    cache_path: str,
+    cfg: dict,
+    H: int,
+    W: int,
+    dx: float,
+    dy: float,
+    T: int,
+    gt_refine_ratio: int,
+    refine_ratio: int,
+    cfg_sha1: str,
+    geometry_mode: str | None = None,
+    mesh_spec_path: str | None = None,
+    mesh_spec_sha1: str | None = None,
+    uniform_signature_sha1: str | None = None,
+) -> Dict[str, Any]:
+    data_cfg = cfg.get("data", {}) or {}
+    train_cfg = cfg.get("train", {}) or {}
+    mesh_cfg = cfg.get("mesh", {}) or {}
+    pol_cfg_raw = cfg.get("policy", {}) or {}
+    edges_cfg_raw = cfg.get("edges", {}) or {}
+    idw_cfg_raw = cfg.get("idw", {}) or {}
+    loss_cfg = cfg.get("loss", {}) or {}
+    speed_cfg = cfg.get("speed", {}) or {}
+
+    pol_cfg = _drop_comment_keys(pol_cfg_raw)
+    edges_cfg = _drop_comment_keys(edges_cfg_raw)
+
+    bbox = data_cfg.get("bbox", [0.0, 1.0, 0.0, 1.0])
+    bbox = [float(v) for v in bbox]
+
+    controls: Dict[str, Any] = {
+        "refine_ratio": int(refine_ratio),
+        "policy": pol_cfg,
+        "edges": edges_cfg,
+        "loss": {"interp_k": int(loss_cfg.get("interp_k", 8))},
+        "speed": {
+            "interp_chunk": int(speed_cfg.get("interp_chunk", 8192)),
+            "idw_on_cpu": speed_cfg.get("idw_on_cpu", None),
+        },
+    }
+    if mode == "uniform":
+        controls["idw"] = {
+            "backend": idw_cfg_raw.get("backend", "exact"),
+            "allow_fallback_to_exact": idw_cfg_raw.get("allow_fallback_to_exact", True),
+            "faiss_nlist": idw_cfg_raw.get("faiss_nlist", 256),
+            "faiss_nprobe": idw_cfg_raw.get("faiss_nprobe", 16),
+            "faiss_cache": idw_cfg_raw.get("faiss_cache", True),
+            "faiss_cache_max_entries": idw_cfg_raw.get("faiss_cache_max_entries", 4),
+            "k": idw_cfg_raw.get("k", 8),
+            "chunk": idw_cfg_raw.get("chunk", speed_cfg.get("interp_chunk", 8192)),
+        }
+    if geometry_mode is not None:
+        controls["geometry_mode"] = str(geometry_mode)
+
+    checks: Dict[str, Any] = {"cfg_sha1": str(cfg_sha1)}
+    if mesh_spec_sha1 is not None:
+        checks["mesh_spec_sha1"] = str(mesh_spec_sha1)
+    if uniform_signature_sha1 is not None:
+        checks["uniform_signature_sha1"] = str(uniform_signature_sha1)
+
+    return {
+        "schema": "physics-aware-precomp-repro-v1",
+        "mode": str(mode),
+        "output_h5_path": os.path.abspath(os.path.expanduser(str(cache_path))),
+        "input": {
+            "pt_path": _abs_or_none(data_cfg.get("pt_path", None)),
+            "starting_mesh_path": _abs_or_none(mesh_spec_path if mesh_spec_path is not None else mesh_cfg.get("starting_mesh_path", None)),
+            "H": int(H),
+            "W": int(W),
+            "dx": float(dx),
+            "dy": float(dy),
+            "bbox": bbox,
+            "T": int(T),
+            "gt_refine_ratio": int(gt_refine_ratio),
+            "source_t_start": train_cfg.get("precompute_t_start", None),
+            "source_t_end": train_cfg.get("precompute_t_end", None),
+        },
+        "controls": controls,
+        "checks": checks,
+    }
+
+
 def _get_refine_ratio(cfg: dict) -> int:
     pol = cfg.get("policy", {}) or {}
     mesh = cfg.get("mesh", {}) or {}
@@ -2039,7 +2180,11 @@ def _map_gt_on_pred_mesh_once(
     src_centers, src_feats,            # centers/features on GT mesh
     mask_src_parent, parents_src,      # (H,W) mask of active parents & parent indices for src
     pred_centers, pred_levels, pred_parents, mask_pred_parent,
-    H, W, device
+    H, W, device,
+    knn_k: int = 8,
+    knn_chunk: int = 8192,
+    knn_backend: str = "exact",
+    knn_backend_kwargs: dict | None = None,
 ):
 
     src_feats = src_feats.to(device)
@@ -2055,6 +2200,10 @@ def _map_gt_on_pred_mesh_once(
         mask_src_parent=None,
         #src_parent_feats=Xc,
         src_parent_feats=None,
+        knn_k=int(knn_k),
+        chunk=int(knn_chunk),
+        knn_backend=str(knn_backend),
+        knn_backend_kwargs=dict(knn_backend_kwargs or {}),
     )
     return feat_on_pred
 
@@ -2891,6 +3040,12 @@ def precompute_pred_mesh_and_interps_for_rollout(
         meta.attrs["geometry_mode"] = str(geometry_mode)
         meta.attrs["starting_refine_to_level"] = int(refine_to_level)
         meta.attrs["starting_refine_policy"] = str(refine_policy)
+        t_start = cfg.get("train", {}).get("precompute_t_start", None)
+        t_end = cfg.get("train", {}).get("precompute_t_end", None)
+        if t_start is not None:
+            meta.attrs["source_t_start"] = int(t_start)
+        if t_end is not None:
+            meta.attrs["source_t_end"] = int(t_end)
         meta.create_dataset("cfg_json", data=np.bytes_(json.dumps(cfg, sort_keys=True, default=str)))
 
         # iterator
@@ -3163,6 +3318,24 @@ def precompute_pred_mesh_and_interps_for_rollout(
         f.close()
 
     print(f"[PRECOMP] Saved H5 precompute to {cache_path}")
+    _write_precomp_repro_json(
+        cache_path,
+        _build_precomp_repro_payload(
+            mode="predicted",
+            cache_path=cache_path,
+            cfg=cfg,
+            H=H,
+            W=W,
+            dx=dx,
+            dy=dy,
+            T=T,
+            gt_refine_ratio=gt_refine_ratio,
+            refine_ratio=refine_ratio,
+            cfg_sha1=_cfg_sha1(cfg),
+            geometry_mode=geometry_mode,
+            mesh_spec_path=mesh_spec_path,
+        ),
+    )
 
     # plot the first predicted-step mesh (t00001). For static refinement tests, all groups are the same anyway.
     out_png = os.path.join(os.path.dirname(cache_path) or ".", "precomp_mesh_t00001.png")
@@ -3227,6 +3400,14 @@ def precompute_uniform_mesh_in_memory(
     a lazy H5 handle descriptor: {"type":"h5", "path":...}. If cache_path is None,
     it returns the in-memory dict-of-lists expected by CollateWithPrecompute.
     """
+    t_uniform_total_0 = time.perf_counter()
+    timing_uniform = {
+        "static_mesh_build_s": 0.0,
+        "static_h5_write_s": 0.0,
+        "gt_map_compute_s": 0.0,
+        "gt_map_write_s": 0.0,
+    }
+
     dev = torch.device(device)
     rr = _get_refine_ratio(cfg)
     T = len(steps)
@@ -3464,6 +3645,8 @@ def precompute_uniform_mesh_in_memory(
 
         return c, l, p
 
+    t_static_mesh_0 = time.perf_counter()
+
     # Build base wedge mesh once.
     base_c, base_l, base_p, base_ei, _base_mask_parent = _build_starting_mesh_from_spec(
         mesh_spec_path,
@@ -3546,6 +3729,7 @@ def precompute_uniform_mesh_in_memory(
         dy0=float(dy),
         refine_ratio=rr,
     ).to(torch.float32)
+    timing_uniform["static_mesh_build_s"] += float(time.perf_counter() - t_static_mesh_0)
 
     # Identity pred->pred map once (mesh is constant across all t).
     k_interp = int(cfg.get("loss", {}).get("interp_k", 8))
@@ -3563,6 +3747,56 @@ def precompute_uniform_mesh_in_memory(
     pred_l_map = pred_l_cpu.to(map_dev)
     pred_p_map = pred_p_cpu.to(map_dev)
     mask_p_map_2d = mask_p_cpu.view(H, W).to(map_dev)
+
+    # Reuse existing top-level cfg["idw"] settings for GT->pred mapping.
+    idw_cfg = cfg.get("idw", {}) or {}
+    if not isinstance(idw_cfg, dict):
+        raise ValueError("cfg['idw'] must be an object when provided.")
+
+    raw_backend = str(idw_cfg.get("backend", "exact")).strip().lower()
+    backend_aliases = {
+        "torch": "exact",
+        "cdist": "exact",
+        "exact": "exact",
+        "flat": "faiss_flat",
+        "faiss_flat": "faiss_flat",
+        "faiss": "faiss_ivf",
+        "ivf": "faiss_ivf",
+        "faiss_ivf": "faiss_ivf",
+        "ann": "faiss_ivf",
+        "approx": "faiss_ivf",
+    }
+    map_knn_backend = backend_aliases.get(raw_backend, raw_backend)
+    if map_knn_backend not in ("exact", "faiss_flat", "faiss_ivf"):
+        raise ValueError("cfg['idw']['backend'] must be one of: exact, faiss_flat, faiss_ivf.")
+
+    map_knn_backend_kwargs: Dict[str, Any] = {}
+    if map_knn_backend in ("faiss_flat", "faiss_ivf"):
+        map_knn_backend_kwargs["faiss_nlist"] = max(1, int(idw_cfg.get("faiss_nlist", 256)))
+        map_knn_backend_kwargs["faiss_nprobe"] = max(1, int(idw_cfg.get("faiss_nprobe", 16)))
+        map_knn_backend_kwargs["faiss_cache"] = bool(idw_cfg.get("faiss_cache", True))
+        map_knn_backend_kwargs["faiss_cache_max_entries"] = max(1, int(idw_cfg.get("faiss_cache_max_entries", 4)))
+
+        allow_fallback = bool(idw_cfg.get("allow_fallback_to_exact", True))
+        try:
+            import faiss  # type: ignore  # noqa: F401
+        except Exception:
+            if allow_fallback:
+                print(
+                    "[PRECOMP][UNIFORM] idw.backend requested FAISS but import failed; "
+                    "falling back to exact.",
+                    flush=True,
+                )
+                map_knn_backend = "exact"
+                map_knn_backend_kwargs = {}
+            else:
+                raise RuntimeError(
+                    "cfg['idw']['backend'] requests FAISS, but faiss import failed "
+                    "and allow_fallback_to_exact=false."
+                )
+
+    map_knn_k = max(1, int(idw_cfg.get("k", 8)))
+    map_knn_chunk = max(1, int(idw_cfg.get("chunk", speed.get("interp_chunk", 8192))))
 
     precomp: Dict[str, Any] | None = None
     h5_file = None
@@ -3598,6 +3832,7 @@ def precompute_uniform_mesh_in_memory(
             precomp["pred_cell_area"][t] = area_cpu.to(torch.float32)
     else:
         print(f"[PRECOMP][UNIFORM] Writing H5 cache: {cache_path}")
+        t_static_h5_0 = time.perf_counter()
         h5_file = h5py.File(cache_path, "w")
         meta = h5_file.create_group("meta")
         meta.attrs["H"] = int(H)
@@ -3614,8 +3849,16 @@ def precompute_uniform_mesh_in_memory(
         meta.attrs["starting_refine_policy"] = np.bytes_(str(refine_policy))
         meta.attrs["starting_mesh_path"] = np.bytes_(mesh_spec_path)
         meta.attrs["mesh_spec_sha1"] = np.bytes_(mesh_spec_sha1)
+        t_start = cfg.get("train", {}).get("precompute_t_start", None)
+        t_end = cfg.get("train", {}).get("precompute_t_end", None)
+        if t_start is not None:
+            meta.attrs["source_t_start"] = int(t_start)
+        if t_end is not None:
+            meta.attrs["source_t_end"] = int(t_end)
         meta.attrs["interp_k"] = int(interp_k_cfg)
         meta.attrs["pred_edge_attr_layout"] = np.bytes_("nx,ny,face_len,dual_len,tau")
+        meta.attrs["uniform_static_geometry"] = np.uint8(1)
+        meta.attrs["uniform_static_pred2pred"] = np.uint8(1)
         meta.create_dataset("cfg_json", data=np.bytes_(json.dumps(cfg, sort_keys=True, default=str)))
 
         idx_id_h5 = idx_id.to(torch.int32)
@@ -3623,38 +3866,33 @@ def precompute_uniform_mesh_in_memory(
         mask_flat_u8 = mask_p_cpu.to(torch.uint8).view(-1)
         area_f32 = area_cpu.to(torch.float32)
 
+        # Store static geometry only once.
+        g_static = h5_file.create_group("static")
+        _write_ds(g_static, "pred_centers", _to_np(pred_c_cpu, dtype=np.float32))
+        _write_ds(g_static, "pred_levels", _to_np(pred_l_cpu.to(torch.int16), dtype=np.int16))
+        _write_ds(g_static, "pred_parents", _to_np(pred_p_cpu.to(torch.int32), dtype=np.int32))
+        _write_ds(g_static, "pred_ei", _to_np(pred_e_cpu.to(torch.int32), dtype=np.int32))
+        _write_ds(g_static, "mask_pred_parent_flat_u8", _to_np(mask_flat_u8, dtype=np.uint8))
+        _write_ds(g_static, "pred_edge_attr", _to_np(edge_attr_cpu, dtype=np.float32))
+        _write_ds(g_static, "pred_cell_wh", _to_np(cell_wh_cpu, dtype=np.float32))
+        _write_ds(g_static, "pred_cell_area", _to_np(area_f32, dtype=np.float32))
+        _write_ds(g_static, "pred2pred_idx_to_next", _to_np(idx_id_h5, dtype=np.int32))
+        _write_ds(g_static, "pred2pred_w_to_next", _to_np(w_id_h5, dtype=np.float16))
+        g_static.attrs["pred_edge_attr_layout"] = np.bytes_("nx,ny,face_len,dual_len,tau")
+        g_static.attrs["N_pred"] = int(pred_c_cpu.shape[0])
+        g_static.attrs["E"] = int(pred_e_cpu.shape[1]) if pred_e_cpu.numel() > 0 else 0
+
+        # Keep timestep groups for per-step mapped features.
         for t in range(1, T):
             g = h5_file.create_group(f"t{int(t):05d}")
-            _write_ds(g, "pred_centers", _to_np(pred_c_cpu, dtype=np.float32))
-            _write_ds(g, "pred_levels", _to_np(pred_l_cpu.to(torch.int16), dtype=np.int16))
-            _write_ds(g, "pred_parents", _to_np(pred_p_cpu.to(torch.int32), dtype=np.int32))
-            _write_ds(g, "pred_ei", _to_np(pred_e_cpu.to(torch.int32), dtype=np.int32))
-            _write_ds(g, "mask_pred_parent_flat_u8", _to_np(mask_flat_u8, dtype=np.uint8))
-            _write_ds(g, "pred_edge_attr", _to_np(edge_attr_cpu, dtype=np.float32))
-            _write_ds(g, "pred_cell_wh", _to_np(cell_wh_cpu, dtype=np.float32))
-            _write_ds(g, "pred_cell_area", _to_np(area_f32, dtype=np.float32))
-            if t < (T - 1):
-                _write_ds(g, "pred2pred_idx_to_next", _to_np(idx_id_h5, dtype=np.int32))
-                _write_ds(g, "pred2pred_w_to_next", _to_np(w_id_h5, dtype=np.float16))
-            g.attrs["pred_edge_attr_layout"] = np.bytes_("nx,ny,face_len,dual_len,tau")
             g.attrs["N_pred"] = int(pred_c_cpu.shape[0])
             g.attrs["E"] = int(pred_e_cpu.shape[1]) if pred_e_cpu.numel() > 0 else 0
         h5_file.flush()
+        timing_uniform["static_h5_write_s"] += float(time.perf_counter() - t_static_h5_0)
 
-    # First-pass feature maps: GT(t)->pred(t+1), GT(t+1)->pred(t+1)
-    it = range(T - 1)
-    if progress:
-        try:
-            from tqdm import tqdm
-            it = tqdm(it, desc="[uniform precompute] GT->static-mesh mappings")
-        except Exception:
-            pass
-
-    for t in it:
-        dst = t + 1
-        s = steps[t]
-        s_next = steps[dst]
-
+    # Map each absolute GT timestep once, then reuse adjacent maps for (t -> t+1) pairs.
+    def _map_gt_abs_t(abs_t: int) -> torch.Tensor:
+        s = steps[int(abs_t)]
         centers_t = (s["pos"] if torch.is_tensor(s["pos"]) else torch.as_tensor(s["pos"])).to(map_dev, dtype=torch.float32)
         feat_t = (s["x"] if torch.is_tensor(s["x"]) else torch.as_tensor(s["x"])).to(map_dev, dtype=torch.float32)
         level_t = s.get("level", None)
@@ -3668,7 +3906,10 @@ def precompute_uniform_mesh_in_memory(
                 refine_ratio=gt_refine_ratio,
             )
         elif "parents" in s:
-            parents_t = (s["parents"] if torch.is_tensor(s["parents"]) else torch.as_tensor(s["parents"])).to(map_dev, dtype=torch.long)
+            parents_t = (s["parents"] if torch.is_tensor(s["parents"]) else torch.as_tensor(s["parents"])).to(
+                map_dev,
+                dtype=torch.long,
+            )
         else:
             xmin, xmax, ymin, ymax = cfg["data"]["bbox"]
             parents_t = parents_from_pos(centers_t, H, W, xmin, xmax, ymin, ymax).to(map_dev, dtype=torch.long)
@@ -3677,29 +3918,8 @@ def precompute_uniform_mesh_in_memory(
         else:
             mask_t_parent = _mask_from_parents(parents_t, H, W).to(map_dev).to(torch.bool)
 
-        centers_tp1 = (s_next["pos"] if torch.is_tensor(s_next["pos"]) else torch.as_tensor(s_next["pos"])).to(map_dev, dtype=torch.float32)
-        feat_tp1 = (s_next["x"] if torch.is_tensor(s_next["x"]) else torch.as_tensor(s_next["x"])).to(map_dev, dtype=torch.float32)
-        level_tp1 = s_next.get("level", None)
-        ij_tp1 = s_next.get("ij", None)
-        if level_tp1 is not None and ij_tp1 is not None:
-            parents_tp1 = _parents_from_level_ij(
-                level_tp1.to(map_dev),
-                ij_tp1.to(map_dev),
-                H,
-                W,
-                refine_ratio=gt_refine_ratio,
-            )
-        elif "parents" in s_next:
-            parents_tp1 = (s_next["parents"] if torch.is_tensor(s_next["parents"]) else torch.as_tensor(s_next["parents"])).to(map_dev, dtype=torch.long)
-        else:
-            xmin, xmax, ymin, ymax = cfg["data"]["bbox"]
-            parents_tp1 = parents_from_pos(centers_tp1, H, W, xmin, xmax, ymin, ymax).to(map_dev, dtype=torch.long)
-        if "mask" in s_next:
-            mask_tp1_parent = (s_next["mask"] if torch.is_tensor(s_next["mask"]) else torch.as_tensor(s_next["mask"])).to(map_dev).view(H, W).to(torch.bool)
-        else:
-            mask_tp1_parent = _mask_from_parents(parents_tp1, H, W).to(map_dev).to(torch.bool)
-
-        ft_on_pred = _map_gt_on_pred_mesh_once(
+        t_map0 = time.perf_counter()
+        mapped = _map_gt_on_pred_mesh_once(
             src_centers=centers_t,
             src_feats=feat_t,
             mask_src_parent=mask_t_parent,
@@ -3711,29 +3931,45 @@ def precompute_uniform_mesh_in_memory(
             H=H,
             W=W,
             device=map_dev,
+            knn_k=map_knn_k,
+            knn_chunk=map_knn_chunk,
+            knn_backend=map_knn_backend,
+            knn_backend_kwargs=map_knn_backend_kwargs,
         )
-        f1_on_pred = _map_gt_on_pred_mesh_once(
-            src_centers=centers_tp1,
-            src_feats=feat_tp1,
-            mask_src_parent=mask_tp1_parent,
-            parents_src=parents_tp1,
-            pred_centers=pred_c_map,
-            pred_levels=pred_l_map,
-            pred_parents=pred_p_map,
-            mask_pred_parent=mask_p_map_2d,
-            H=H,
-            W=W,
-            device=map_dev,
-        )
+        timing_uniform["gt_map_compute_s"] += float(time.perf_counter() - t_map0)
+        return mapped
+
+    print(
+        "[PRECOMP][UNIFORM] GT mapping settings:",
+        f"idw.backend={map_knn_backend}",
+        f"k={int(map_knn_k)}",
+        f"chunk={int(map_knn_chunk)}",
+        flush=True,
+    )
+
+    it = range(1, T)
+    if progress:
+        try:
+            from tqdm import tqdm
+            it = tqdm(it, desc="[uniform precompute] GT->static-mesh mappings")
+        except Exception:
+            pass
+
+    mapped_prev = _map_gt_abs_t(0)
+    for dst in it:
+        mapped_cur = _map_gt_abs_t(dst)
         if precomp is not None:
-            precomp["feat_t_on_pred"][dst] = ft_on_pred.detach().cpu().to(torch.float32)
-            precomp["feat_tp1_on_pred"][dst] = f1_on_pred.detach().cpu().to(torch.float32)
+            precomp["feat_t_on_pred"][dst] = mapped_prev.detach().cpu().to(torch.float32)
+            precomp["feat_tp1_on_pred"][dst] = mapped_cur.detach().cpu().to(torch.float32)
         else:
+            t_write0 = time.perf_counter()
             g = h5_file[f"t{int(dst):05d}"]
-            _write_ds(g, "feat_t_on_pred", _to_np(ft_on_pred.to("cpu"), dtype=np.float32))
-            _write_ds(g, "feat_tp1_on_pred", _to_np(f1_on_pred.to("cpu"), dtype=np.float32))
+            _write_ds(g, "feat_t_on_pred", _to_np(mapped_prev.to("cpu"), dtype=np.float32))
+            _write_ds(g, "feat_tp1_on_pred", _to_np(mapped_cur.to("cpu"), dtype=np.float32))
+            timing_uniform["gt_map_write_s"] += float(time.perf_counter() - t_write0)
             if (dst % 8) == 0:
                 h5_file.flush()
+        mapped_prev = mapped_cur
 
     lv_u, lv_c = torch.unique(pred_l_cpu, return_counts=True)
     lv_summary = ", ".join([f"L{int(u)}={int(c)}" for u, c in zip(lv_u.tolist(), lv_c.tolist())])
@@ -3746,12 +3982,56 @@ def precompute_uniform_mesh_in_memory(
         f"starting_refine_policy={refine_policy}",
         flush=True,
     )
+
+    total_uniform_s = float(time.perf_counter() - t_uniform_total_0)
+    tracked_uniform_s = (
+        float(timing_uniform["static_mesh_build_s"])
+        + float(timing_uniform["static_h5_write_s"])
+        + float(timing_uniform["gt_map_compute_s"])
+        + float(timing_uniform["gt_map_write_s"])
+    )
+    other_uniform_s = max(0.0, total_uniform_s - tracked_uniform_s)
+
+    def _pct(v: float) -> float:
+        return (100.0 * float(v) / total_uniform_s) if total_uniform_s > 0.0 else 0.0
+
+    print(
+        "[PRECOMP][UNIFORM][TIMING]",
+        f"total={total_uniform_s:.3f}s",
+        f"static_mesh_build={timing_uniform['static_mesh_build_s']:.3f}s ({_pct(timing_uniform['static_mesh_build_s']):.1f}%)",
+        f"static_h5_write={timing_uniform['static_h5_write_s']:.3f}s ({_pct(timing_uniform['static_h5_write_s']):.1f}%)",
+        f"gt_map_compute={timing_uniform['gt_map_compute_s']:.3f}s ({_pct(timing_uniform['gt_map_compute_s']):.1f}%)",
+        f"gt_map_write={timing_uniform['gt_map_write_s']:.3f}s ({_pct(timing_uniform['gt_map_write_s']):.1f}%)",
+        f"other={other_uniform_s:.3f}s ({_pct(other_uniform_s):.1f}%)",
+        flush=True,
+    )
+
     if h5_file is not None:
         try:
             h5_file.flush()
         finally:
             h5_file.close()
         print(f"[PRECOMP][UNIFORM] Saved H5 precompute to {cache_path}")
+        _write_precomp_repro_json(
+            cache_path,
+            _build_precomp_repro_payload(
+                mode="uniform",
+                cache_path=cache_path,
+                cfg=cfg,
+                H=H,
+                W=W,
+                dx=dx,
+                dy=dy,
+                T=T,
+                gt_refine_ratio=gt_refine_ratio,
+                refine_ratio=rr,
+                cfg_sha1=_cfg_sha1(cfg),
+                geometry_mode="starting_refine",
+                mesh_spec_path=mesh_spec_path,
+                mesh_spec_sha1=mesh_spec_sha1,
+                uniform_signature_sha1=_uniform_h5_signature(),
+            ),
+        )
         return {
             "type": "h5",
             "path": cache_path,

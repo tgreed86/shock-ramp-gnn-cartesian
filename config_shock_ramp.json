@@ -4,9 +4,9 @@
 
   "data": {
     "pt_path": "/Users/trevorreed/UVA_postdoc_stuff/gparc/data/shock_ramp/shock_ramp_amr.pt",
-    "H": 24,
-    "W": 96,
-    "L_max": 4,
+    "H": 64,
+    "W": 64,
+    "L_max": 3,
     "bbox": [0.0, 1.0, 0.0, 1.0],
     "pre_train_dir": "./precomp_cache",
     "window_size": 5,
@@ -18,18 +18,25 @@
     "use_columns": [0, 1, 2, 3],
     "names": ["density", "x_momentum", "y_momentum", "energy"],
     "normalize": true,
+    "normalization": {
+      "momentum_sigma_mode": "shared_rms",
+      "_comment_momentum_sigma_mode": "independent (per-channel std) or shared_rms (tie x/y momentum sigmas by RMS)."
+    },
     "build": {
       "use_dt_hat_fixed": false,
       "_comment_use_dt_hat_fixed": "If true, append normalized dt_hat = dt_phys/dt_ref as one extra node feature."
     }
   },
 
-  "split": { "train": 0.85, "val": 0.1, "test": 0.05 },
+  "split": { "train": 0.05, "val": 0.1, "test": 0.85 },
 
   "train": {
-    "precomp_cache_path": "./cache/L4_uniform/shock_ramp_precomp_L4_uniform_faceAdj_DEC.h5",
-    "precomp_force_recompute": true,
-    "epochs": 1,
+    "precomp_cache_path": "./cache/first_simulation/64by64-coarse/all/max_level_3/shock_ramp_precomp_pLow85_pHigh95_faceAdj.h5",
+    "precomp_force_recompute": false,
+    "precompute_t_start": null,
+    "precompute_t_end": null,
+    "_comment_precompute_t_range": "Optional inclusive raw-snapshot range [start,end] used before windowing/precompute/training. Need at least 2 snapshots (e.g., 50..51 for one transition).",
+    "epochs": 10,
     "checkpoint_every_epochs": 5,
     "validation_every_epochs": 5,
     "batch_size": 1,
@@ -56,18 +63,18 @@
     "teacher_forcing_uniform": false,
     "uniform_diag_edges": false,
     "runtime_mesh": {
-      "enabled": false,
+      "enabled": true,
       "domain_mode": "starting_mesh",
-      "_comment_domain_mode": "starting_mesh resets to starting mesh every step",
+      "_comment_domain_mode": "starting_mesh resets to starting mesh every step for runtime CNN parity with training target semantics.",
       "warm_start_from_precompute": false,
-      "update_every_steps": 2,
+      "update_every_steps": 1,
       "detach_policy_input": true,
       "reset_to_coarse_each_step": true,
       "refine_only": true,
       "max_cells_per_step": 500000,
-      "policy_backend": "gradient_fast",
+      "policy_backend": "cnn",
       "cnn": {
-        "checkpoint_path": "./runs_mesh_policy_cnn/without_parent_masks/unet_hierarchical/500ep_lr-scheduler_3-6-26/mesh_policy_cnn_last.pt",
+        "checkpoint_path": "./runs_mesh_policy_cnn/without_parent_masks/unet_hierarchical/500ep_lr-scheduler_3-28-26/mesh_policy_cnn_last.pt",
         "include_parent_mask": false,
         "include_coords": true,
         "use_saved_thresholds": true,
@@ -102,10 +109,10 @@
   },
 
   "policy": {
-    "geometry_mode": "starting_refine",
+    "geometry_mode": "gt_gradients",
     "_comment_geometry_mode": "gt_gradients or starting_refine for uniform mesh",
     "starting_refine_policy": "min_level",
-    "starting_refine_to_level": 4,
+    "starting_refine_to_level": 3,
     "refine_ratio": 2,
     "hysteresis_mode": "percentile",
     "percentile_low":  85.0,
@@ -113,14 +120,15 @@
     "percentiles_by_level": {
       "selection": "global",
       "_comment_selection": "global or per_level (or auto)",
-      "1": {"low": 100.0, "high": 100.0},
-      "2": {"low": 100.0, "high": 100.0},
-      "3": {"low": 100.0, "high": 100.0}
+      "1": {"low": 85.0, "high": 95.0},
+      "2": {"low": 85.0, "high": 95.0},
+      "3": {"low": 85.0, "high": 95.0},
+      "4": {"low": 85.0, "high": 95.0}
     },
     "combine": "l2",
     "grad_channels": [0],
     "grad_norm": "l2",
-    "max_level": 4,
+    "max_level": 3,
     "tau_low":  1.0,
     "tau_high": 1.0
   },
@@ -221,7 +229,7 @@
   },
 
   "mesh": {
-    "starting_mesh_path": "./utils/wedge_mesh_spec_96x24_L4.pt"
+    "starting_mesh_path": "./utils/wedge_mesh_spec.pt"
   },
 
   "model": {
@@ -256,10 +264,10 @@
     "parc_scale_watch": false,
     "print_norm_sanity_once": false,
     "teacher_force_ops": false,
-    "hang_watch_batches": 0,
-    "print_batch_time": false,
-    "progress_every_batches": 0,
-    "print_runtime_mesh_batch_breakdown": false
+    "hang_watch_batches": 1,
+    "print_batch_time": true,
+    "progress_every_batches": 1,
+    "print_runtime_mesh_batch_breakdown": true
   },
 
   "speed": {

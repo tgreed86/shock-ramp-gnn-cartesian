@@ -15,7 +15,16 @@ and then pulls out:
   - right boundary  (i = i_max, bottom -> top)
   - a closed CCW polygon around the outer domain
 
-Output is written to a .npz file that you can reuse for all time steps.
+Output is written to a .h5 file.
+
+Exaample command:
+    python utils/extract_dmr_boundaries.py \
+        --map_file /path/to/DMR.plot.XXXXX.2d.map.hdf5 \
+        --level level_0 \
+        --mesh-spec-out ./utils/wedge_mesh_spec_96x24_L3.pt \
+        --n0-x 96 \
+        --n0-y 24 \
+        --max-level 3
 """
 
 import argparse, os

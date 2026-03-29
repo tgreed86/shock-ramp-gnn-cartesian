@@ -689,6 +689,8 @@ def _targeted_map_to_pred(
     # idw controls
     knn_k: int = 8,
     chunk: int = 8192,
+    knn_backend: str = "exact",
+    knn_backend_kwargs: dict | None = None,
 ):
     """
     Map src_feats on src_centers -> pred_centers.
@@ -737,7 +739,15 @@ def _targeted_map_to_pred(
     if q_idx.numel() > 0:
         q_pts = pred_centers[q_idx].to(device)  # (Q,2) queries
 
-        idx_map, w_map = build_idw_map(q_pts, src_centers.to(device), k=knn_k, chunk=chunk)
+        _backend_kwargs = dict(knn_backend_kwargs or {})
+        idx_map, w_map = build_idw_map(
+            q_pts,
+            src_centers.to(device),
+            k=knn_k,
+            chunk=chunk,
+            backend=str(knn_backend),
+            **_backend_kwargs,
+        )
         vals = apply_idw_map(idx_map, w_map, src_feats.to(device))   # (Q,F)
         mapped[q_idx] = vals
 

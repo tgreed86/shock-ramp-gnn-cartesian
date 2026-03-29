@@ -109,7 +109,12 @@ from torch.utils.data import DataLoader, SequentialSampler, Subset
 
 # Project imports – must exist in your repo.
 from dataset import CellRefineWindowDataset
-from pretrain import precompute_pred_mesh_and_interps_for_rollout, CollateWithPrecompute, CollateWithDtOnly
+from pretrain import (
+    precompute_pred_mesh_and_interps_for_rollout,
+    CollateWithPrecompute,
+    CollateWithDtOnly,
+    _load_wedge_path_from_spec,
+)
 from plots import (
     compute_plot_deltas,
     _recover_parent_mask,
@@ -122,6 +127,10 @@ from train import (
     evaluate_one_epoch_multi_step,
     _get_bbox,
     _load_runtime_mesh_policy_from_cfg,
+    _runtime_mesh_domain_mode,
+    _get_runtime_starting_mesh_base,
+    _get_runtime_wedge_constraints,
+    _runtime_build_pred_mesh_from_state,
     move_precomp_to_device,
 )
 from models import ParcFeatureAdapter
@@ -2024,8 +2033,11 @@ def make_rollout_mesh_gif(
     color_by_level: bool = False,
     progress_every: int = 1,
     refine_ratio: int = 2,
+    centers_key: str = "pred_centers",
+    levels_key: str = "pred_levels",
+    mesh_label: str = "Pred",
 ):
-    """Write a mesh-only rollout GIF using per-step predicted mesh geometry."""
+    """Write a mesh-only rollout GIF from per-step mesh geometry stored in examples."""
     if not examples:
         log("[WARN] make_rollout_mesh_gif: no examples provided; nothing to do.")
         return
@@ -2039,8 +2051,8 @@ def make_rollout_mesh_gif(
 
     try:
         for step, ex in enumerate(examples):
-            centers_t = ex.get("pred_centers", None)
-            levels_t = ex.get("pred_levels", None)
+            centers_t = ex.get(str(centers_key), None)
+            levels_t = ex.get(str(levels_key), None)
             if centers_t is None or levels_t is None:
                 continue
 
@@ -2080,7 +2092,7 @@ def make_rollout_mesh_gif(
 
             t_abs = int(ex.get("t", step))
             lmax = int(levels_s.max()) if levels_s.size else 0
-            title = f"t={t_abs} | N={centers_s.shape[0]} | Lmax={lmax}"
+            title = f"{mesh_label} | t={t_abs} | N={centers_s.shape[0]} | Lmax={lmax}"
 
             frame = _render_mesh_frame(
                 centers_s,
@@ -2105,8 +2117,104 @@ def make_rollout_mesh_gif(
         writer.close()
 
     if frames_written == 0:
-        raise RuntimeError("make_rollout_mesh_gif produced no frames (missing pred_centers/pred_levels in examples).")
+        raise RuntimeError(
+            "make_rollout_mesh_gif produced no frames "
+            f"(missing '{centers_key}'/'{levels_key}' in examples)."
+        )
     log(f"[INFO] wrote {out_gif}")
+
+
+@torch.inference_mode()
+def _build_cnn_on_gt_mesh_examples(
+    *,
+    examples,
+    cfg,
+    device: torch.device,
+    runtime_mesh_policy,
+    H: int,
+    W: int,
+    dx: float,
+    dy: float,
+    progress_every: int = 1,
+):
+    """
+    Build rollout examples where mesh geometry is predicted by the runtime CNN
+    from GT state at each step (teacher-forced mesh policy input).
+    """
+    if not examples:
+        return []
+    if runtime_mesh_policy is None or str(runtime_mesh_policy.get("backend", "")).lower() != "cnn":
+        log("[WARN] CNN-on-GT mesh build skipped: runtime CNN policy is not available.")
+        return []
+
+    domain_mode = _runtime_mesh_domain_mode(cfg)
+    mesh_spec_path = cfg.get("mesh", {}).get("starting_mesh_path", None)
+    if not mesh_spec_path:
+        raise RuntimeError(
+            "CNN-on-GT mesh GIF requested, but cfg['mesh']['starting_mesh_path'] is missing."
+        )
+
+    runtime_base_mesh = None
+    runtime_wedge_path = None
+    runtime_wedge_constraints = None
+    if domain_mode == "starting_mesh":
+        runtime_base_mesh = _get_runtime_starting_mesh_base(
+            cfg=cfg,
+            H=int(H),
+            W=int(W),
+            dx=float(dx),
+            dy=float(dy),
+            device=device,
+            mesh_spec_path=str(mesh_spec_path),
+        )
+    else:
+        runtime_wedge_path = _load_wedge_path_from_spec(str(mesh_spec_path), cfg)
+        runtime_wedge_constraints = _get_runtime_wedge_constraints(
+            cfg=cfg,
+            H=int(H),
+            W=int(W),
+            device=device,
+            wedge_path=runtime_wedge_path,
+        )
+
+    out = []
+    ordered = sorted(examples, key=lambda e: int(e.get("t", 0)))
+    for step, ex in enumerate(ordered):
+        centers_t = ex.get("centers_t", None)
+        feat_t = ex.get("feat_t", ex.get("gt_t", None))
+        level_t = ex.get("level_t", None)
+        parents_t = ex.get("parents_t", None)
+        if (centers_t is None) or (feat_t is None) or (level_t is None) or (parents_t is None):
+            continue
+
+        pred_centers, pred_levels, pred_parents, _pred_ei, _mask_pred, _pred_ea = _runtime_build_pred_mesh_from_state(
+            centers_t=torch.as_tensor(centers_t, device=device, dtype=torch.float32),
+            feat_t=torch.as_tensor(feat_t, device=device, dtype=torch.float32),
+            level_t=torch.as_tensor(level_t, device=device, dtype=torch.long),
+            parents_t=torch.as_tensor(parents_t, device=device, dtype=torch.long),
+            cfg=cfg,
+            H=int(H),
+            W=int(W),
+            dx=float(dx),
+            dy=float(dy),
+            device=device,
+            wedge_path=runtime_wedge_path,
+            need_edge_attr=False,
+            runtime_mesh_policy=runtime_mesh_policy,
+            runtime_wedge_constraints=runtime_wedge_constraints,
+            runtime_base_mesh=runtime_base_mesh,
+        )
+
+        ex_out = dict(ex)
+        ex_out["pred_centers"] = pred_centers.detach().cpu()
+        ex_out["pred_levels"] = pred_levels.detach().cpu()
+        ex_out["pred_parents"] = pred_parents.detach().cpu()
+        out.append(ex_out)
+
+        if (step + 1) % max(1, int(progress_every)) == 0:
+            log(f"[MESH-GIF][CNN-GT] built {step + 1}/{len(ordered)} frames")
+
+    return out
 
 
 # ----------------- GIF creation (fast + streaming) ----------------- #
@@ -4283,6 +4391,20 @@ def main():
                     help="Disable mesh-only GIF generation for predicted rollout meshes.")
     ap.add_argument("--mesh-gif-name", type=str, default="rollout_mesh.gif",
                     help="Filename (inside out-dir) for the mesh-only GIF.")
+    ap.add_argument(
+        "--mesh-gif-gt",
+        action="store_true",
+        help=(
+            "Also write a mesh-only GIF where the runtime CNN predicts mesh from GT state inputs "
+            "at each step (teacher-forced CNN mesh policy input)."
+        ),
+    )
+    ap.add_argument(
+        "--mesh-gif-gt-name",
+        type=str,
+        default="rollout_mesh_cnn_on_gt.gif",
+        help="Filename (inside out-dir) for the optional CNN-on-GT mesh-only GIF.",
+    )
     ap.add_argument("--mesh-fps", type=float, default=None,
                     help="Mesh GIF FPS (defaults to --fps).")
     ap.add_argument("--mesh-dpi", type=int, default=None,
@@ -4775,7 +4897,48 @@ def main():
                 color_by_level=bool(args.mesh_color_by_level),
                 progress_every=int(args.progress_every),
                 refine_ratio=int(_get_refine_ratio(cfg)),
+                centers_key="pred_centers",
+                levels_key="pred_levels",
+                mesh_label="Pred",
             )
+
+        if bool(args.mesh_gif_gt):
+            mesh_gif_gt_path = os.path.join(out_dir, str(args.mesh_gif_gt_name))
+            log("[INFO] Making rollout mesh GIF (CNN predicted from GT inputs)...")
+            with Timer("build_cnn_on_gt_mesh_examples"):
+                cnn_gt_examples = _build_cnn_on_gt_mesh_examples(
+                    examples=examples,
+                    cfg=cfg,
+                    device=device,
+                    runtime_mesh_policy=runtime_mesh_policy,
+                    H=int(H),
+                    W=int(W),
+                    dx=float(dx),
+                    dy=float(dy),
+                    progress_every=int(args.progress_every),
+                )
+            if not cnn_gt_examples:
+                log("[WARN] CNN-on-GT mesh GIF skipped: no derived examples were generated.")
+            else:
+                with Timer("make_rollout_mesh_gif_gt"):
+                    make_rollout_mesh_gif(
+                        examples=cnn_gt_examples,
+                        out_gif=mesh_gif_gt_path,
+                        fps=mesh_fps,
+                        dpi=mesh_dpi,
+                        fig_w=float(args.mesh_fig_w),
+                        fig_h=float(args.mesh_fig_h),
+                        linewidth=float(args.mesh_linewidth),
+                        max_cells=int(args.mesh_max_cells),
+                        sample_strategy=str(args.mesh_sample_strategy),
+                        seed=int(args.mesh_seed),
+                        color_by_level=bool(args.mesh_color_by_level),
+                        progress_every=int(args.progress_every),
+                        refine_ratio=int(_get_refine_ratio(cfg)),
+                        centers_key="pred_centers",
+                        levels_key="pred_levels",
+                        mesh_label="CNN(GT-in)",
+                    )
 
     log(f"[INFO] Done. GIFs are in: {out_dir}")
     

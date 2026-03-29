@@ -69,8 +69,81 @@ def _get_refine_ratio(cfg: dict) -> int:
         raise ValueError(f"refine_ratio must be >=2, got {rr}")
     return rr
 
+def _resolve_momentum_sigma_mode(cfg: dict) -> str:
+    """
+    Normalization mode for momentum-channel sigma values.
+    Supported values:
+      - "independent": keep per-channel sigma as computed
+      - "shared_rms": tie mx/my to sqrt((sigma_mx^2 + sigma_my^2)/2)
+    """
+    feats_cfg = cfg.get("features", {}) or {}
+    norm_cfg = feats_cfg.get("normalization", {}) or {}
+
+    raw_mode = norm_cfg.get("momentum_sigma_mode", None)
+    if raw_mode is None:
+        # Backward-compatible convenience bools.
+        tie_flag = norm_cfg.get("tie_momentum_sigma", feats_cfg.get("tie_momentum_sigma", None))
+        if tie_flag is not None:
+            raw_mode = "shared_rms" if bool(tie_flag) else "independent"
+
+    if raw_mode is None:
+        raw_mode = "independent"
+
+    mode = str(raw_mode).strip().lower()
+    aliases = {
+        "independent": "independent",
+        "per_channel": "independent",
+        "separate": "independent",
+        "shared_rms": "shared_rms",
+        "joint_rms": "shared_rms",
+        "shared": "shared_rms",
+        "tied": "shared_rms",
+    }
+    if mode not in aliases:
+        raise ValueError(
+            "features.normalization.momentum_sigma_mode must be one of "
+            "{independent, shared_rms} (aliases: per_channel, separate, joint_rms, shared, tied). "
+            f"Got: {raw_mode!r}"
+        )
+    return aliases[mode]
+
+def _apply_momentum_sigma_mode(
+    sigma: torch.Tensor,
+    *,
+    mode: str,
+    momentum_x_idx: int,
+    momentum_y_idx: int,
+) -> torch.Tensor:
+    if mode == "independent":
+        return sigma
+    if mode != "shared_rms":
+        raise ValueError(f"Unsupported momentum sigma mode: {mode!r}")
+
+    max_idx = max(int(momentum_x_idx), int(momentum_y_idx))
+    if sigma.numel() <= max_idx:
+        raise ValueError(
+            "Cannot apply shared momentum sigma: feature dimension is too small for momentum indices "
+            f"mx={momentum_x_idx}, my={momentum_y_idx}, numel={sigma.numel()}."
+        )
+
+    out = sigma.clone()
+    sig_x = out[int(momentum_x_idx)]
+    sig_y = out[int(momentum_y_idx)]
+    # Shared momentum scale: RMS of per-axis stds so total momentum block scale stays comparable.
+    sig_shared = torch.sqrt(0.5 * (sig_x * sig_x + sig_y * sig_y)).clamp_min(1e-12)
+    out[int(momentum_x_idx)] = sig_shared
+    out[int(momentum_y_idx)] = sig_shared
+    return out
+
 @torch.no_grad()
-def _compute_norm_stats_from_loader(loader, device):
+def _compute_norm_stats_from_loader(
+    loader,
+    device,
+    *,
+    momentum_sigma_mode: str = "independent",
+    momentum_x_idx: int = 1,
+    momentum_y_idx: int = 2,
+):
     n_total = 0
     mean = None
     M2 = None
@@ -128,6 +201,12 @@ def _compute_norm_stats_from_loader(loader, device):
 
     var = M2 / (n_total - 1)
     std = torch.sqrt(var + 1e-8)
+    std = _apply_momentum_sigma_mode(
+        std,
+        mode=momentum_sigma_mode,
+        momentum_x_idx=momentum_x_idx,
+        momentum_y_idx=momentum_y_idx,
+    )
     return mean, std
 
 def save_config(run_dir: str, cfg: dict, argv=None):
@@ -2459,6 +2538,96 @@ def _cell_keys_level_ij(
     return key.to(torch.long)
 
 
+def _runtime_coarse_parent_counts(
+    *,
+    parents: torch.Tensor,
+    H: int,
+    W: int,
+) -> torch.Tensor:
+    p = torch.as_tensor(parents, dtype=torch.long).view(-1)
+    cnt = torch.zeros(int(H) * int(W), dtype=torch.float32, device=p.device)
+    if p.numel() == 0:
+        return cnt
+    p = p.clamp(0, int(H) * int(W) - 1)
+    ones = torch.ones((int(p.numel()),), dtype=torch.float32, device=p.device)
+    cnt.index_add_(0, p, ones)
+    return cnt
+
+
+def _runtime_build_coarse_rc_grid(H: int, W: int, device: torch.device | None = None) -> torch.Tensor:
+    dev = device if device is not None else torch.device("cpu")
+    rr = torch.arange(int(H), dtype=torch.float32, device=dev)
+    cc = torch.arange(int(W), dtype=torch.float32, device=dev)
+    gy, gx = torch.meshgrid(rr, cc, indexing="ij")
+    return torch.stack([gy.reshape(-1), gx.reshape(-1)], dim=1).contiguous()
+
+
+def _runtime_fill_empty_interior_coarse_nearest(
+    *,
+    coarse_chw: torch.Tensor,
+    parents: torch.Tensor,
+    H: int,
+    W: int,
+    physical_parent_mask: torch.Tensor,
+    rc_grid: torch.Tensor | None = None,
+    chunk: int = 1024,
+) -> torch.Tensor:
+    coarse = torch.as_tensor(coarse_chw, dtype=torch.float32)
+    if coarse.ndim != 3:
+        raise ValueError(f"coarse_chw must be (C,H,W), got {tuple(coarse.shape)}")
+    C, HH, WW = int(coarse.shape[0]), int(coarse.shape[1]), int(coarse.shape[2])
+    if HH != int(H) or WW != int(W):
+        raise ValueError(
+            f"coarse_chw spatial shape mismatch: got {(HH, WW)} expected {(int(H), int(W))}"
+        )
+
+    phys = torch.as_tensor(
+        physical_parent_mask,
+        dtype=torch.bool,
+        device=coarse.device,
+    ).view(-1)
+    if int(phys.numel()) != int(H) * int(W):
+        raise ValueError(
+            f"physical_parent_mask must have {int(H) * int(W)} entries, got {int(phys.numel())}"
+        )
+
+    counts = _runtime_coarse_parent_counts(parents=parents, H=int(H), W=int(W)).to(device=coarse.device)
+    fill_flat = phys & (counts <= 0.0)
+    valid_flat = phys & (counts > 0.0)
+    if (not bool(fill_flat.any())) or (not bool(valid_flat.any())):
+        return coarse
+
+    valid_idx = torch.nonzero(valid_flat, as_tuple=False).view(-1)
+    fill_idx = torch.nonzero(fill_flat, as_tuple=False).view(-1)
+    if valid_idx.numel() == 0 or fill_idx.numel() == 0:
+        return coarse
+
+    if rc_grid is None:
+        rc = _runtime_build_coarse_rc_grid(int(H), int(W), device=coarse.device)
+    else:
+        rc = torch.as_tensor(rc_grid, dtype=torch.float32, device=coarse.device)
+        if rc.ndim != 2 or int(rc.shape[1]) != 2 or int(rc.shape[0]) != int(H) * int(W):
+            raise ValueError(f"rc_grid must be (H*W,2), got {tuple(rc.shape)}")
+
+    valid_rc = rc.index_select(0, valid_idx)
+    fill_rc = rc.index_select(0, fill_idx)
+    flat = coarse.view(C, int(H) * int(W))
+    out = flat.clone()
+
+    chunk = max(1, int(chunk))
+    for s in range(0, int(fill_idx.numel()), chunk):
+        e = min(s + chunk, int(fill_idx.numel()))
+        q_idx = fill_idx[s:e]
+        q_rc = fill_rc[s:e]
+        d = q_rc[:, None, :] - valid_rc[None, :, :]
+        d2 = (d * d).sum(dim=-1)
+        nn = torch.argmin(d2, dim=1)
+        src_idx = valid_idx.index_select(0, nn)
+        out[:, q_idx] = out[:, src_idx]
+
+    return out.view(C, int(H), int(W)).contiguous()
+
+
 _RUNTIME_WEDGE_CONSTRAINTS_CACHE: Dict[str, Dict[str, Any]] = {}
 _RUNTIME_BASE_MESH_CACHE: Dict[str, Dict[str, Any]] = {}
 
@@ -2765,6 +2934,40 @@ def _runtime_parents_from_level_ij(
     return (j0 * int(W) + i0).to(torch.long)
 
 
+def _runtime_base_refine_masks_from_leaf_set(
+    *,
+    levels: torch.Tensor,
+    row: torch.Tensor,
+    col: torch.Tensor,
+    H: int,
+    W: int,
+    refine_ratio: int,
+    L_max: int,
+) -> Dict[int, torch.Tensor]:
+    rr = int(refine_ratio)
+    lv = levels.view(-1).long()
+    rv = row.view(-1).long()
+    cv = col.view(-1).long()
+    out: Dict[int, torch.Tensor] = {}
+
+    for L in range(1, int(L_max) + 1):
+        hL = int(H) * (rr ** (L - 1))
+        wL = int(W) * (rr ** (L - 1))
+        m = torch.zeros((hL, wL), dtype=torch.bool, device=lv.device)
+        sel = (lv >= int(L))
+        if bool(sel.any()):
+            scale_pow = lv[sel] - int(L - 1)
+            scale = torch.pow(
+                torch.tensor(int(rr), dtype=torch.long, device=lv.device),
+                scale_pow,
+            )
+            pr = torch.div(rv[sel], scale, rounding_mode="floor").clamp_(0, hL - 1)
+            pc = torch.div(cv[sel], scale, rounding_mode="floor").clamp_(0, wL - 1)
+            m[pr, pc] = True
+        out[L] = m.to(torch.bool)
+    return out
+
+
 def _runtime_sort_unique_leaf_ij(
     *,
     levels: torch.Tensor,
@@ -2957,6 +3160,7 @@ def _get_runtime_starting_mesh_base(
 
     dev = torch.device(device)
     rr = _get_refine_ratio(cfg)
+    Lmax = int((cfg.get("policy", {}) or {}).get("max_level", 3))
     bbox = _get_bbox(cfg)
 
     centers, levels, _parents, _ei, _mask_parent = _build_starting_mesh_from_spec(
@@ -2996,6 +3200,15 @@ def _get_runtime_starting_mesh_base(
         refine_ratio=rr,
     )
     mask_parent = _mask_from_parent_indices(parents, H, W, dev)
+    base_refine_by_level = _runtime_base_refine_masks_from_leaf_set(
+        levels=levels,
+        row=row,
+        col=col,
+        H=H,
+        W=W,
+        refine_ratio=rr,
+        L_max=Lmax,
+    )
 
     out = {
         "levels": levels,
@@ -3003,6 +3216,7 @@ def _get_runtime_starting_mesh_base(
         "col": col,
         "parents": parents,
         "parent_mask": mask_parent,
+        "base_refine_by_level": {int(k): v.to(device=dev, dtype=torch.bool) for k, v in base_refine_by_level.items()},
     }
     _RUNTIME_BASE_MESH_CACHE[key] = out
 
@@ -3465,6 +3679,7 @@ def _load_runtime_mesh_policy_from_cfg(
         xx = torch.linspace(0.0, 1.0, W, device=policy_device, dtype=torch.float32)
         gy, gx = torch.meshgrid(yy, xx, indexing="ij")
         coord_grid = torch.stack([gx, gy], dim=0).contiguous()
+    coarse_rc_grid = _runtime_build_coarse_rc_grid(H, W, device=policy_device)
 
     thr_default, thr_by_level, thr_source = _runtime_mesh_cnn_thresholds(
         cfg,
@@ -3484,6 +3699,7 @@ def _load_runtime_mesh_policy_from_cfg(
         "include_parent_mask": include_parent_mask,
         "include_coords": include_coords,
         "coord_grid": coord_grid,
+        "coarse_rc_grid": coarse_rc_grid,
         "threshold_default": float(thr_default),
         "threshold_by_level": thr_by_level,
         "checkpoint_path": ckpt_path,
@@ -3514,11 +3730,18 @@ def _runtime_predict_masks_from_cnn(
     feat_policy: torch.Tensor,
     parents_t: torch.Tensor,
     mask_t_parent: torch.Tensor,
+    centers_t: torch.Tensor,
+    level_t: torch.Tensor,
     cfg: Dict[str, Any],
     H: int,
     W: int,
     device: torch.device,
     runtime_mesh_policy: Dict[str, Any],
+    base_refine_by_level: Dict[int, torch.Tensor] | None = None,
+    parent_mapping_mode: str = "dataset",
+    fill_empty_interior: bool = False,
+    physical_parent_mask: torch.Tensor | None = None,
+    coarse_rc_grid: torch.Tensor | None = None,
 ) -> Dict[int, torch.Tensor]:
     if runtime_mesh_policy is None:
         raise RuntimeError("runtime_mesh_policy is None for CNN runtime mesh backend.")
@@ -3532,12 +3755,55 @@ def _runtime_predict_masks_from_cnn(
     thr_default = float(runtime_mesh_policy["threshold_default"])
     thr_by_level: Dict[int, float] = runtime_mesh_policy["threshold_by_level"]
 
-    coarse = coarse_aggregate_from_dynamic(feat_policy, parents_t, H, W)
+    parent_mode = str(parent_mapping_mode).strip().lower()
+    if parent_mode in ("dataset", "legacy", "from_dataset"):
+        parents_for_cnn = parents_t.to(feat_policy.device, dtype=torch.long).view(-1)
+        mask_for_cnn = mask_t_parent.to(feat_policy.device, dtype=torch.bool)
+    elif parent_mode in ("from_centers", "centers", "runtime_like", "coarse_from_centers"):
+        row_t, col_t = _cell_level_ij_from_centers(
+            centers=centers_t.to(feat_policy.device, dtype=torch.float32),
+            levels=level_t.to(feat_policy.device, dtype=torch.long).view(-1),
+            H=H,
+            W=W,
+            bbox=_get_bbox(cfg),
+            refine_ratio=rr,
+        )
+        parents_for_cnn = _runtime_parents_from_level_ij(
+            levels=level_t.to(feat_policy.device, dtype=torch.long).view(-1),
+            row=row_t,
+            col=col_t,
+            H=H,
+            W=W,
+            refine_ratio=rr,
+        ).view(-1)
+        mask_for_cnn = _mask_from_parent_indices(parents_for_cnn, H, W, feat_policy.device)
+    else:
+        raise ValueError(
+            f"Unknown runtime CNN parent_mapping_mode: {parent_mapping_mode!r}. "
+            "Expected one of: dataset, from_centers"
+        )
+
+    coarse = coarse_aggregate_from_dynamic(feat_policy, parents_for_cnn, H, W)
     coarse = coarse.view(H, W, -1).permute(2, 0, 1).contiguous()  # (F,H,W)
+    if bool(fill_empty_interior):
+        phys = (
+            torch.ones((H, W), dtype=torch.bool, device=coarse.device)
+            if physical_parent_mask is None
+            else torch.as_tensor(physical_parent_mask, dtype=torch.bool, device=coarse.device).view(H, W)
+        )
+        coarse = _runtime_fill_empty_interior_coarse_nearest(
+            coarse_chw=coarse,
+            parents=parents_for_cnn,
+            H=H,
+            W=W,
+            physical_parent_mask=phys,
+            rc_grid=coarse_rc_grid,
+            chunk=1024,
+        )
 
     channels = [coarse]
     if bool(runtime_mesh_policy.get("include_parent_mask", True)):
-        channels.append(mask_t_parent.to(coarse.device, dtype=torch.float32).unsqueeze(0))
+        channels.append(mask_for_cnn.to(coarse.device, dtype=torch.float32).unsqueeze(0))
     if bool(runtime_mesh_policy.get("include_coords", True)):
         coord_grid = runtime_mesh_policy.get("coord_grid", None)
         if coord_grid is None:
@@ -3579,8 +3845,22 @@ def _runtime_predict_masks_from_cnn(
             )
 
         if L > 1:
+            prev = masks_by_level[L - 1]
+            if (base_refine_by_level is not None) and ((L - 1) in base_refine_by_level):
+                bprev = torch.as_tensor(
+                    base_refine_by_level[L - 1],
+                    dtype=torch.bool,
+                    device=prev.device,
+                )
+                if tuple(bprev.shape) != tuple(prev.shape[-2:]):
+                    bprev = F.interpolate(
+                        bprev.float().unsqueeze(0).unsqueeze(0),
+                        size=tuple(prev.shape[-2:]),
+                        mode="nearest",
+                    )[0, 0].to(torch.bool)
+                prev = prev | bprev.unsqueeze(0)
             allow = F.interpolate(
-                masks_by_level[L - 1].float().unsqueeze(1),
+                prev.float().unsqueeze(1),
                 scale_factor=float(rr),
                 mode="nearest",
             )[:, 0].bool()
@@ -3593,6 +3873,8 @@ def _runtime_predict_masks_from_cnn(
 @torch.no_grad()
 def _runtime_predict_masks_from_fast_gradients(
     *,
+    centers_t: torch.Tensor,
+    level_t: torch.Tensor,
     feat_policy: torch.Tensor,
     parents_t: torch.Tensor,
     mask_t_parent: torch.Tensor,
@@ -3701,6 +3983,49 @@ def _runtime_predict_masks_from_fast_gradients(
     xmin, xmax, ymin, ymax = _get_bbox(cfg)
     masks_by_level: Dict[int, torch.Tensor] = {}
 
+    # Reconstruct previous refine masks per level from current runtime mesh state.
+    # prev_refine_by_level[L] lives on the parent grid for level L (H*rr^(L-1), W*rr^(L-1)).
+    prev_refine_by_level: Dict[int, torch.Tensor] = {}
+    try:
+        lv_prev = level_t.to(dev, dtype=torch.long).view(-1)
+        centers_prev = centers_t.to(dev, dtype=torch.float32)
+        if lv_prev.numel() == int(centers_prev.shape[0]) and lv_prev.numel() > 0:
+            row_prev, col_prev = _cell_level_ij_from_centers(
+                centers=centers_prev,
+                levels=lv_prev,
+                H=H,
+                W=W,
+                bbox=(xmin, xmax, ymin, ymax),
+                refine_ratio=rr,
+            )
+            for L in range(1, Lmax + 1):
+                h_p = int(H * (rr ** (L - 1)))
+                w_p = int(W * (rr ** (L - 1)))
+                prev_mask_L = torch.zeros((h_p, w_p), dtype=torch.bool, device=dev)
+
+                sel = (lv_prev >= int(L))
+                if bool(sel.any()):
+                    exp = (lv_prev[sel] - int(L - 1)).to(torch.long)
+                    max_e = int(torch.clamp(exp.max(), min=0).item())
+                    pow_tbl = torch.tensor(
+                        [rr ** i for i in range(max_e + 1)],
+                        device=dev,
+                        dtype=torch.long,
+                    )
+                    scale = pow_tbl.index_select(0, exp.clamp(0, max_e))
+                    prow = torch.div(row_prev[sel], scale, rounding_mode="floor")
+                    pcol = torch.div(col_prev[sel], scale, rounding_mode="floor")
+                    prow = prow.clamp_(0, h_p - 1)
+                    pcol = pcol.clamp_(0, w_p - 1)
+                    parent_flat = (prow * int(w_p) + pcol).view(-1).long()
+                    if parent_flat.numel() > 0:
+                        prev_mask_L.view(-1)[parent_flat] = True
+
+                prev_refine_by_level[L] = prev_mask_L
+    except Exception:
+        # Fallback below keeps old behavior when previous masks cannot be reconstructed.
+        prev_refine_by_level = {}
+
     for L in range(1, Lmax + 1):
         h_p = H * (rr ** (L - 1))
         w_p = W * (rr ** (L - 1))
@@ -3743,11 +4068,17 @@ def _runtime_predict_masks_from_fast_gradients(
             thr_low = torch.as_tensor(tau_low, device=dev, dtype=g_parent.dtype)
             thr_high = torch.as_tensor(tau_high, device=dev, dtype=g_parent.dtype)
 
-        if L == 1:
+        prev_mask = prev_refine_by_level.get(L, None)
+        if prev_mask is None and L == 1:
             prev2d = mask_t_parent.to(dev, dtype=torch.float32).view(H, W)
-            if prev2d.shape != (h_p, w_p):
-                prev2d = F.interpolate(prev2d[None, None], size=(h_p, w_p), mode="nearest")[0, 0]
             prev_mask = prev2d.bool()
+        if prev_mask is not None:
+            if prev_mask.shape != (h_p, w_p):
+                prev_mask = F.interpolate(
+                    prev_mask.float()[None, None],
+                    size=(h_p, w_p),
+                    mode="nearest",
+                )[0, 0].bool()
             keep = prev_mask & (g_parent > thr_low)
             newr = (~prev_mask) & (g_parent > thr_high)
             M = keep | newr
@@ -3797,6 +4128,8 @@ def _runtime_build_pred_mesh_from_state(
     runtime_mesh_policy: Dict[str, Any] | None = None,
     runtime_wedge_constraints: Dict[str, Any] | None = None,
     runtime_base_mesh: Dict[str, Any] | None = None,
+    cnn_parent_mapping_mode: str = "dataset",
+    cnn_fill_empty_interior: bool = False,
     timing_out: Dict[str, float] | None = None,
 ):
     """
@@ -3856,18 +4189,38 @@ def _runtime_build_pred_mesh_from_state(
     policy_backend = _runtime_mesh_backend(cfg)
     t_policy_t0 = time.perf_counter()
     if policy_backend == "cnn":
+        base_refine_by_level = None
+        if (domain_mode == "starting_mesh") and (runtime_base_mesh is not None):
+            base_refine_by_level = runtime_base_mesh.get("base_refine_by_level", None)
+        cnn_physical_parent_mask = None
+        if bool(cnn_fill_empty_interior):
+            if (domain_mode == "starting_mesh") and (runtime_base_mesh is not None):
+                cnn_physical_parent_mask = runtime_base_mesh.get("parent_mask", None)
+            elif runtime_wedge_constraints is not None:
+                parent_intersect = runtime_wedge_constraints.get("parent_intersect", {})
+                if isinstance(parent_intersect, dict):
+                    cnn_physical_parent_mask = parent_intersect.get(1, None)
         masks_pred_by_level = _runtime_predict_masks_from_cnn(
             feat_policy=feat_policy,
             parents_t=parents_t,
             mask_t_parent=mask_t_parent,
+            centers_t=centers_t,
+            level_t=level_t,
             cfg=cfg,
             H=H,
             W=W,
             device=dev,
             runtime_mesh_policy=runtime_mesh_policy,
+            base_refine_by_level=base_refine_by_level,
+            parent_mapping_mode=cnn_parent_mapping_mode,
+            fill_empty_interior=bool(cnn_fill_empty_interior),
+            physical_parent_mask=cnn_physical_parent_mask,
+            coarse_rc_grid=runtime_mesh_policy.get("coarse_rc_grid", None) if isinstance(runtime_mesh_policy, dict) else None,
         )
     elif policy_backend == "gradient_fast":
         masks_pred_by_level = _runtime_predict_masks_from_fast_gradients(
+            centers_t=centers_t,
+            level_t=level_t,
             feat_policy=feat_policy,
             parents_t=parents_t,
             mask_t_parent=mask_t_parent,
@@ -5807,6 +6160,8 @@ def train_one_epoch_multi_step(
                             runtime_mesh_policy=runtime_mesh_policy,
                             runtime_wedge_constraints=runtime_wedge_constraints,
                             runtime_base_mesh=runtime_base_mesh,
+                            cnn_parent_mapping_mode=("from_centers" if (k == 0) else "dataset"),
+                            cnn_fill_empty_interior=bool(k == 0),
                             timing_out=rebuild_timing,
                         )
                         t_rebuild_s = time.perf_counter() - t_rebuild_t0
@@ -7172,6 +7527,8 @@ def evaluate_one_epoch_multi_step(
                                 runtime_mesh_policy=runtime_mesh_policy,
                                 runtime_wedge_constraints=runtime_wedge_constraints,
                                 runtime_base_mesh=runtime_base_mesh,
+                                cnn_parent_mapping_mode=("from_centers" if (k == 0) else "dataset"),
+                                cnn_fill_empty_interior=bool(k == 0),
                             )
                             t_rebuild_s = time.perf_counter() - t_rebuild_t0
 
@@ -7771,6 +8128,8 @@ def main(config_path: str | None = None, out_dir: str | None = None):
     data_cfg = cfg.setdefault("data", {})
     policy_cfg = cfg.setdefault("policy", {})
     eval_cfg = cfg.setdefault("eval", {})
+    features_cfg = cfg.setdefault("features", {})
+    norm_cfg = features_cfg.setdefault("normalization", {})
 
     if "max_level" not in policy_cfg:
         policy_cfg["max_level"] = int(data_cfg.get("L_max", 3))
@@ -7790,6 +8149,14 @@ def main(config_path: str | None = None, out_dir: str | None = None):
         f"[CFG] effective levels: policy.max_level={lmax_policy}, data.L_max={lmax_data}, eval.fine_L={int(eval_cfg['fine_L'])}",
         flush=True,
     )
+
+    momentum_sigma_mode = _resolve_momentum_sigma_mode(cfg)
+    norm_cfg.setdefault(
+        "_comment_momentum_sigma_mode",
+        "independent (per-channel std) or shared_rms (tie x/y momentum sigmas by RMS).",
+    )
+    norm_cfg["momentum_sigma_mode"] = momentum_sigma_mode
+    print(f"[NORM-CFG] momentum_sigma_mode={momentum_sigma_mode}")
 
     idx = dec.infer_feature_indices(cfg, 4)
     print("[IDX]", idx)
@@ -8055,26 +8422,51 @@ def main(config_path: str | None = None, out_dir: str | None = None):
     K      = int(cfg["data"].get("window_size", 2))
     stride = int(cfg["data"].get("stride", 1))
 
-    min_T = None
-    max_T = None
-    #if max_T is not None:
-    #    data_list = data_list[min_T:max_T]  
-    if min_T is not None or max_T is not None:
+    # Optional raw-snapshot subset for fast precompute/debug runs.
+    # These are absolute indices into the loaded sequence and are inclusive.
+    pre_t_start = train_cfg.get("precompute_t_start", None)
+    pre_t_end = train_cfg.get("precompute_t_end", None)
+    if pre_t_start is not None or pre_t_end is not None:
         n_total = len(data_list)
-        start = 0 if min_T is None else int(min_T)
-        end   = n_total if max_T is None else int(max_T)
+        if n_total < 2:
+            raise ValueError(f"Need at least 2 raw snapshots, found {n_total}.")
 
-        # clamp to valid bounds
-        start = max(0, min(start, n_total))
-        end   = max(start, min(end, n_total))  # ensure end >= start
+        start = 0 if pre_t_start is None else int(pre_t_start)
+        end = (n_total - 1) if pre_t_end is None else int(pre_t_end)
 
-        data_list = data_list[start:end]
-
-        if len(data_list) == 0:
+        if start < 0 or end < 0:
             raise ValueError(
-                f"Selected empty time range: start={start}, end={end}, "
-                f"n_total={n_total}"
+                "train.precompute_t_start / train.precompute_t_end must be >= 0 when provided. "
+                f"Got start={start}, end={end}."
             )
+        if start >= n_total:
+            raise ValueError(
+                f"train.precompute_t_start={start} is out of range for n_total={n_total}."
+            )
+        if end >= n_total:
+            raise ValueError(
+                f"train.precompute_t_end={end} is out of range for n_total={n_total}."
+            )
+        if end < start:
+            raise ValueError(
+                f"Invalid precompute range: end ({end}) < start ({start})."
+            )
+
+        # inclusive -> Python slice end-exclusive
+        data_list = data_list[start : end + 1]
+        if len(data_list) < 2:
+            raise ValueError(
+                "Selected precompute range is too small. Need at least two snapshots "
+                f"to form one transition, got {len(data_list)} (start={start}, end={end})."
+            )
+
+        # Persist resolved values for provenance in saved config/meta.
+        train_cfg["precompute_t_start"] = int(start)
+        train_cfg["precompute_t_end"] = int(end)
+        print(
+            f"[PRECOMP-RANGE] using raw snapshots [{start}, {end}] "
+            f"(count={len(data_list)} of original {n_total})"
+        )
 
     # -------------------------------
     # NEW: build dt transitions (t -> t+1) from the raw snapshots
@@ -8258,7 +8650,13 @@ def main(config_path: str | None = None, out_dir: str | None = None):
 
     if do_norm and (mu is None or sigma is None):
         # compute from training loader on CPU/GPU (device already set)
-        mu, sigma = _compute_norm_stats_from_loader(train_loader, device)
+        mu, sigma = _compute_norm_stats_from_loader(
+            train_loader,
+            device,
+            momentum_sigma_mode=momentum_sigma_mode,
+            momentum_x_idx=int(idx["mx"]),
+            momentum_y_idx=int(idx["my"]),
+        )
         # persist into cfg so eval uses the same stats
         cfg.setdefault("features", {}).setdefault("norm_stats", {})
         cfg["features"]["norm_stats"]["mu"] = mu.tolist()
@@ -8273,6 +8671,16 @@ def main(config_path: str | None = None, out_dir: str | None = None):
     else:
         mu = sigma = None
 
+    if sigma is not None:
+        sigma = _apply_momentum_sigma_mode(
+            sigma,
+            mode=momentum_sigma_mode,
+            momentum_x_idx=int(idx["mx"]),
+            momentum_y_idx=int(idx["my"]),
+        )
+        cfg.setdefault("features", {}).setdefault("norm_stats", {})
+        cfg["features"]["norm_stats"]["sigma"] = sigma.detach().cpu().tolist()
+
     # --- ABS really means ABS check (one batch) ---
     if cfg.get("debug", {}).get("abs_means_abs_check", True):
         batch0 = next(iter(train_loader))
@@ -8286,6 +8694,14 @@ def main(config_path: str | None = None, out_dir: str | None = None):
     print("\n[NORM-STATS] computed from train_loader")
     print("  mu:", mu.detach().cpu().numpy())
     print("  sigma:", sigma.detach().cpu().numpy())
+    if momentum_sigma_mode == "shared_rms":
+        mx_i = int(idx["mx"])
+        my_i = int(idx["my"])
+        print(
+            "  shared momentum sigma:",
+            float(sigma[mx_i].detach().cpu()),
+            f"(mx idx={mx_i}, my idx={my_i})",
+        )
     print("  sigma min/max:", float(sigma.min().detach().cpu()), float(sigma.max().detach().cpu()))
     print("  any sigma<=0:", bool((sigma <= 0).any().detach().cpu()))
     print("  any nonfinite mu:", bool((~torch.isfinite(mu)).any().detach().cpu()))
