@@ -3672,6 +3672,13 @@ def _load_runtime_mesh_policy_from_cfg(
 
     include_parent_mask = bool(cnn_cfg.get("include_parent_mask", True))
     include_coords = bool(cnn_cfg.get("include_coords", True))
+    include_dt = bool(cnn_cfg.get("include_dt", False))
+    dt_channel_mode = str(cnn_cfg.get("dt_channel_mode", "dt_hat")).strip().lower()
+    if dt_channel_mode not in ("raw", "dt_hat"):
+        raise ValueError(
+            "train.runtime_mesh.cnn.dt_channel_mode must be 'raw' or 'dt_hat'. "
+            f"Got {dt_channel_mode!r}"
+        )
 
     coord_grid = None
     if include_coords:
@@ -3698,6 +3705,8 @@ def _load_runtime_mesh_policy_from_cfg(
         "refine_ratio": ckpt_rr,
         "include_parent_mask": include_parent_mask,
         "include_coords": include_coords,
+        "include_dt": include_dt,
+        "dt_channel_mode": dt_channel_mode,
         "coord_grid": coord_grid,
         "coarse_rc_grid": coarse_rc_grid,
         "threshold_default": float(thr_default),
@@ -3712,6 +3721,8 @@ def _load_runtime_mesh_policy_from_cfg(
         f"model_type={ctx['model_type']}",
         f"max_level={ctx['max_level']}",
         f"refine_ratio={ctx['refine_ratio']}",
+        f"include_dt={bool(ctx['include_dt'])}",
+        f"dt_channel_mode={ctx['dt_channel_mode']}",
         f"threshold_source={thr_source}",
         f"threshold_default={ctx['threshold_default']:.6g}",
     )
@@ -3732,6 +3743,8 @@ def _runtime_predict_masks_from_cnn(
     mask_t_parent: torch.Tensor,
     centers_t: torch.Tensor,
     level_t: torch.Tensor,
+    dt_phys: torch.Tensor | float | None,
+    dt_ref: torch.Tensor | float | None,
     cfg: Dict[str, Any],
     H: int,
     W: int,
@@ -3809,6 +3822,33 @@ def _runtime_predict_masks_from_cnn(
         if coord_grid is None:
             raise RuntimeError("CNN runtime mesh policy expects coord channels, but coord_grid is missing.")
         channels.append(coord_grid.to(coarse.device, dtype=torch.float32))
+    if bool(runtime_mesh_policy.get("include_dt", False)):
+        if dt_phys is None:
+            raise RuntimeError(
+                "CNN runtime mesh include_dt=true but dt_phys was not provided."
+            )
+        dt_phys_t = _to_scalar_dt(dt_phys, device=coarse.device, dtype=torch.float32)
+        mode = str(runtime_mesh_policy.get("dt_channel_mode", "dt_hat")).strip().lower()
+        if mode == "dt_hat":
+            if dt_ref is None:
+                raise RuntimeError(
+                    "CNN runtime mesh include_dt=true and dt_channel_mode='dt_hat' but dt_ref is missing."
+                )
+            dt_ref_t = _to_scalar_dt(dt_ref, device=coarse.device, dtype=torch.float32).clamp_min(1e-12)
+            dt_val = dt_phys_t / dt_ref_t
+        elif mode == "raw":
+            dt_val = dt_phys_t
+        else:
+            raise RuntimeError(
+                f"Unsupported runtime CNN dt_channel_mode={mode!r}. Expected 'raw' or 'dt_hat'."
+            )
+        dt_plane = torch.full(
+            (1, int(H), int(W)),
+            float(dt_val.item()),
+            dtype=torch.float32,
+            device=coarse.device,
+        )
+        channels.append(dt_plane)
 
     x_in = torch.cat(channels, dim=0).unsqueeze(0)  # (1,C,H,W)
     expected_in = int(runtime_mesh_policy.get("in_channels", -1))
@@ -4130,6 +4170,8 @@ def _runtime_build_pred_mesh_from_state(
     runtime_base_mesh: Dict[str, Any] | None = None,
     cnn_parent_mapping_mode: str = "dataset",
     cnn_fill_empty_interior: bool = False,
+    dt_phys: torch.Tensor | float | None = None,
+    dt_ref: torch.Tensor | float | None = None,
     timing_out: Dict[str, float] | None = None,
 ):
     """
@@ -4206,6 +4248,8 @@ def _runtime_build_pred_mesh_from_state(
             mask_t_parent=mask_t_parent,
             centers_t=centers_t,
             level_t=level_t,
+            dt_phys=dt_phys,
+            dt_ref=dt_ref,
             cfg=cfg,
             H=H,
             W=W,
@@ -6104,6 +6148,7 @@ def train_one_epoch_multi_step(
                 idw_chunk_tgt = -1
                 n_src_tgt = -1
                 n_dst_tgt = -1
+                dtk = _to_scalar_dt(dt_list[k], device=device, dtype=state_feat.dtype)
 
                 if (k == 0) and runtime_has_step0_precomp:
                     used_precomp_step0 = True
@@ -6162,6 +6207,8 @@ def train_one_epoch_multi_step(
                             runtime_base_mesh=runtime_base_mesh,
                             cnn_parent_mapping_mode=("from_centers" if (k == 0) else "dataset"),
                             cnn_fill_empty_interior=bool(k == 0),
+                            dt_phys=dtk,
+                            dt_ref=dt_ref_scalar,
                             timing_out=rebuild_timing,
                         )
                         t_rebuild_s = time.perf_counter() - t_rebuild_t0
@@ -6248,11 +6295,7 @@ def train_one_epoch_multi_step(
 
                 batch_rt_idw_remap_s += float(t_xin_map_s + t_xtgt_map_s)
 
-                dtk = dt_list[k]
-                if torch.is_tensor(dtk):
-                    dtk = dtk.to(device=device, dtype=x_in_abs.dtype, non_blocking=True)
-                else:
-                    dtk = torch.tensor(float(dtk), device=device, dtype=x_in_abs.dtype)
+                dtk = dtk.to(device=device, dtype=x_in_abs.dtype, non_blocking=True)
 
                 t_model_t0 = time.perf_counter()
                 if batch_dbg:
@@ -7468,6 +7511,7 @@ def evaluate_one_epoch_multi_step(
                     idw_chunk_tgt = -1
                     n_src_tgt = -1
                     n_dst_tgt = -1
+                    dtk = _to_scalar_dt(dt_list[k], device=device, dtype=state_feat.dtype)
 
                     if (k == 0) and runtime_has_step0_precomp:
                         used_precomp_step0 = True
@@ -7529,6 +7573,8 @@ def evaluate_one_epoch_multi_step(
                                 runtime_base_mesh=runtime_base_mesh,
                                 cnn_parent_mapping_mode=("from_centers" if (k == 0) else "dataset"),
                                 cnn_fill_empty_interior=bool(k == 0),
+                                dt_phys=dtk,
+                                dt_ref=dt_ref_scalar,
                             )
                             t_rebuild_s = time.perf_counter() - t_rebuild_t0
 
@@ -7608,12 +7654,7 @@ def evaluate_one_epoch_multi_step(
                         )
                         t_xtgt_map_s = time.perf_counter() - t_xtgt_t0
 
-                    dtk = dt_list[k]
-                    dtk = (
-                        dtk.to(device=device, dtype=x_in_abs.dtype)
-                        if torch.is_tensor(dtk)
-                        else torch.tensor(float(dtk), device=device, dtype=x_in_abs.dtype)
-                    )
+                    dtk = dtk.to(device=device, dtype=x_in_abs.dtype)
 
                     t_model_t0 = time.perf_counter()
                     loss_k, y_pred_abs_k = _run_step_eval(
@@ -8262,6 +8303,8 @@ def main(config_path: str | None = None, out_dir: str | None = None):
     runtime_mesh_cnn_cfg.setdefault("checkpoint_path", "")
     runtime_mesh_cnn_cfg.setdefault("include_parent_mask", True)
     runtime_mesh_cnn_cfg.setdefault("include_coords", True)
+    runtime_mesh_cnn_cfg.setdefault("include_dt", False)
+    runtime_mesh_cnn_cfg.setdefault("dt_channel_mode", "dt_hat")
     runtime_mesh_cnn_cfg.setdefault("threshold_default", 0.5)
     runtime_mesh_cnn_cfg.setdefault("threshold_by_level", {})
     runtime_mesh_cnn_cfg.setdefault("use_saved_thresholds", False)

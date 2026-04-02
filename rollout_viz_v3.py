@@ -2135,6 +2135,8 @@ def _build_cnn_on_gt_mesh_examples(
     W: int,
     dx: float,
     dy: float,
+    dt_transitions,
+    dt_ref: float | None,
     progress_every: int = 1,
 ):
     """
@@ -2187,6 +2189,22 @@ def _build_cnn_on_gt_mesh_examples(
         if (centers_t is None) or (feat_t is None) or (level_t is None) or (parents_t is None):
             continue
 
+        dt_phys = None
+        dt_ref_for_runtime = None
+        if bool(runtime_mesh_policy.get("include_dt", False)):
+            if dt_transitions is None:
+                raise RuntimeError(
+                    "CNN-on-GT mesh build requested with include_dt=true, but dt_transitions are unavailable."
+                )
+            t_src = int(ex.get("t", step))
+            if t_src < 0 or t_src >= int(len(dt_transitions)):
+                raise RuntimeError(
+                    "CNN-on-GT mesh build dt index out of range: "
+                    f"t_src={t_src}, available_dt={int(len(dt_transitions))}"
+                )
+            dt_phys = float(dt_transitions[t_src])
+            dt_ref_for_runtime = (None if dt_ref is None else float(dt_ref))
+
         pred_centers, pred_levels, pred_parents, _pred_ei, _mask_pred, _pred_ea = _runtime_build_pred_mesh_from_state(
             centers_t=torch.as_tensor(centers_t, device=device, dtype=torch.float32),
             feat_t=torch.as_tensor(feat_t, device=device, dtype=torch.float32),
@@ -2203,6 +2221,8 @@ def _build_cnn_on_gt_mesh_examples(
             runtime_mesh_policy=runtime_mesh_policy,
             runtime_wedge_constraints=runtime_wedge_constraints,
             runtime_base_mesh=runtime_base_mesh,
+            dt_phys=dt_phys,
+            dt_ref=dt_ref_for_runtime,
         )
 
         ex_out = dict(ex)
@@ -4915,6 +4935,8 @@ def main():
                     W=int(W),
                     dx=float(dx),
                     dy=float(dy),
+                    dt_transitions=dt_transitions,
+                    dt_ref=float(dt_ref),
                     progress_every=int(args.progress_every),
                 )
             if not cnn_gt_examples:
