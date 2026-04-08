@@ -24,6 +24,10 @@ class FeatureNet(nn.Module):
         conv_type: str = "sage",
         edge_dim: int | None = None,
         nnconv_hidden: int = 64,
+        use_skip: bool = False,
+        skip_type: str = "block",
+        use_layernorm: bool = False,
+        layernorm_eps: float = 1e-6,
     ):
         super().__init__()
         self.dropout = dropout
@@ -33,8 +37,23 @@ class FeatureNet(nn.Module):
                 f"Unsupported FeatureNet conv_type '{conv_type}'. Use 'sage', 'gine', or 'nnconv'."
             )
         self.edge_dim = None if edge_dim is None else int(edge_dim)
+        self.use_skip = bool(use_skip)
+        self.skip_type = str(skip_type).strip().lower()
+        if not self.use_skip:
+            self.skip_type = "none"
+        valid_skip_types = {"none", "block", "input", "both"}
+        if self.skip_type not in valid_skip_types:
+            raise ValueError(
+                f"Unsupported FeatureNet skip_type '{skip_type}'. "
+                f"Use one of {sorted(valid_skip_types)}."
+            )
+        self.use_layernorm = bool(use_layernorm)
+        self.layernorm_eps = float(layernorm_eps)
+
         dims = [in_channels] + [hidden] * (layers - 1)
         self.convs = nn.ModuleList()
+        self.block_skip_proj = nn.ModuleList()
+        self.block_norms = nn.ModuleList()
         for i in range(len(dims) - 1):
             in_ch = int(dims[i])
             out_ch = int(dims[i + 1])
@@ -58,6 +77,29 @@ class FeatureNet(nn.Module):
                     nn.Linear(int(nnconv_hidden), in_ch * out_ch),
                 )
                 self.convs.append(NNConv(in_ch, out_ch, nn=edge_net, aggr="mean"))
+
+            if self.skip_type in {"block", "both"}:
+                if in_ch == out_ch:
+                    self.block_skip_proj.append(nn.Identity())
+                else:
+                    self.block_skip_proj.append(nn.Linear(in_ch, out_ch, bias=False))
+            else:
+                self.block_skip_proj.append(nn.Identity())
+
+            if self.use_layernorm:
+                self.block_norms.append(nn.LayerNorm(out_ch, eps=self.layernorm_eps))
+            else:
+                self.block_norms.append(nn.Identity())
+
+        final_hidden = int(dims[-1]) if len(dims) > 0 else int(in_channels)
+        if self.skip_type in {"input", "both"}:
+            if int(in_channels) == final_hidden:
+                self.input_skip_proj = nn.Identity()
+            else:
+                self.input_skip_proj = nn.Linear(int(in_channels), final_hidden, bias=False)
+        else:
+            self.input_skip_proj = None
+
         self.feat_head = nn.Sequential(
             nn.Linear(hidden, hidden),
             nn.ReLU(),
@@ -88,7 +130,9 @@ class FeatureNet(nn.Module):
             print(
                 f"[HANG-DBG] FeatureNet.forward start: X={tuple(X.shape)} "
                 f"dtype={X.dtype} dev={X.device} edge_index={ei_shape} "
-                f"edge_attr={ea_shape} conv_type={self.conv_type}",
+                f"edge_attr={ea_shape} conv_type={self.conv_type} "
+                f"use_skip={self.use_skip} skip_type={self.skip_type} "
+                f"use_layernorm={self.use_layernorm}",
                 flush=True,
             )
 
@@ -101,6 +145,7 @@ class FeatureNet(nn.Module):
             edge_attr_use = edge_attr.to(device=h.device, dtype=h.dtype)
 
         for li, conv in enumerate(self.convs):
+            h_res = h
             t0 = time.perf_counter() if hang_dbg_once else None
             if hang_dbg_once:
                 print(f"[HANG-DBG] FeatureNet conv[{li}] begin", flush=True)
@@ -108,6 +153,13 @@ class FeatureNet(nn.Module):
                 h = conv(h, edge_index)
             else:
                 h = conv(h, edge_index, edge_attr_use)
+
+            if self.skip_type in {"block", "both"}:
+                h = h + self.block_skip_proj[li](h_res)
+
+            if self.use_layernorm:
+                h = self.block_norms[li](h)
+
             if hang_dbg_once:
                 print(
                     f"[HANG-DBG] FeatureNet conv[{li}] done in {time.perf_counter() - t0:.3f}s",
@@ -115,6 +167,10 @@ class FeatureNet(nn.Module):
                 )
             h = F.relu(h)
             h = F.dropout(h, p=self.dropout, training=self.training)
+
+        if self.skip_type in {"input", "both"} and self.input_skip_proj is not None:
+            h = h + self.input_skip_proj(X)
+
         y_feat = self.feat_head(h)
         y_score = self.score_head(h) if self.score_head is not None else None
         if hang_dbg_once:

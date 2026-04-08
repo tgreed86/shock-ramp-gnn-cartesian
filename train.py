@@ -4133,9 +4133,31 @@ def _runtime_predict_masks_from_fast_gradients(
             )[0, 0].bool()
             M = M & allow[:h_p, :w_p]
 
-        r_phys = float(pol.get(f"dilate_phys_L{L}", 0.0))
+        # Optional dilation halo around refine mask.
+        # Preferred config is cell-based halo:
+        #   policy.dilate_cells_L{L} = n_cells
+        # Optional convenience for finest level:
+        #   policy.dilate_cells_lmax = n_cells (applies only when L==Lmax)
+        # Backward compatible:
+        #   policy.dilate_phys_L{L} = physical radius
+        dxL_here = (xmax - xmin) / float(W * (rr ** (L - 1)))
+
+        n_cells = None
+        raw_cells = pol.get(f"dilate_cells_L{L}", None)
+        if raw_cells is None and (L == Lmax):
+            raw_cells = pol.get("dilate_cells_lmax", None)
+        if raw_cells is not None:
+            try:
+                n_cells = float(raw_cells)
+            except Exception:
+                n_cells = None
+
+        if n_cells is not None:
+            r_phys = float(max(0.0, n_cells) * dxL_here)
+        else:
+            r_phys = float(pol.get(f"dilate_phys_L{L}", 0.0))
+
         if r_phys > 0:
-            dxL_here = (xmax - xmin) / float(W * (rr ** (L - 1)))
             r_cells = max(1, int(round(r_phys / max(dxL_here, 1e-12))))
             k = 2 * r_cells + 1
             M = F.max_pool2d(
@@ -6714,6 +6736,7 @@ def evaluate_one_epoch_multi_step(
     write_budgets: bool = False,
     epoch_idx: int | None = None,
     runtime_mesh_policy: Dict[str, Any] | None = None,
+    infer_only: bool = False,
 ):
 
     model.eval()
@@ -6764,6 +6787,7 @@ def evaluate_one_epoch_multi_step(
 
     runtime_mesh_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
     runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
+    runtime_infer_only = bool(infer_only)
     runtime_update_every = int(runtime_mesh_cfg.get("update_every_steps", 1))
     runtime_mesh_backend = _runtime_mesh_backend(cfg)
     runtime_domain_mode = _runtime_mesh_domain_mode(cfg)
@@ -6775,6 +6799,12 @@ def evaluate_one_epoch_multi_step(
     runtime_wedge_path = None
     runtime_wedge_constraints = None
     runtime_base_mesh = None
+    if runtime_infer_only and (not runtime_mesh_enabled):
+        print(
+            "[RUNTIME-MESH][WARN] infer_only requested, but runtime_mesh.enabled=false; running full eval mode.",
+            flush=True,
+        )
+        runtime_infer_only = False
     if runtime_mesh_enabled:
         mesh_spec_path = cfg.get("mesh", {}).get("starting_mesh_path", None)
         if not mesh_spec_path:
@@ -6808,8 +6838,14 @@ def evaluate_one_epoch_multi_step(
             )
         print(
             f"[RUNTIME-MESH] eval loop active (backend={runtime_mesh_backend}, domain_mode={runtime_domain_mode}, "
-            f"idw_backend={runtime_idw_backend}, update_every_steps={runtime_update_every})"
+            f"idw_backend={runtime_idw_backend}, update_every_steps={runtime_update_every}, "
+            f"infer_only={int(runtime_infer_only)})"
         )
+        if runtime_infer_only:
+            print(
+                "[RUNTIME-MESH] infer_only enabled: skipping GT->pred remap and target-based eval metrics/loss.",
+                flush=True,
+            )
 
     # ---- metric accumulators (weighted by cell area) ----
     step_wsum = []
@@ -7072,11 +7108,11 @@ def evaluate_one_epoch_multi_step(
                 pred_ei,
                 pred_ea,
                 x_in_abs,
-                x_tgt_abs,
+                x_tgt_abs: torch.Tensor | None,
                 dt_phys,
             ):
                 norm_in  = _maybe_norm(x_in_abs,  mu, sigma)
-                norm_tgt = _maybe_norm(x_tgt_abs, mu, sigma)
+                norm_tgt = _maybe_norm(x_tgt_abs, mu, sigma) if x_tgt_abs is not None else None
 
                 dt_ref_t = (torch.tensor(float(dt_ref_scalar), device=device, dtype=norm_in.dtype)
                             if dt_ref_scalar is not None else None)
@@ -7434,26 +7470,40 @@ def evaluate_one_epoch_multi_step(
 
                     y_pred = _apply_rate_guardrails(y_pred, dt_hat, cfg)
 
-                    # targets / loss in fp32 for stability
+                    # Absolute prediction update in fp32 for stability.
                     with torch.autocast(device_type=device.type, enabled=False):
-                        delta_target_f32 = (norm_tgt - norm_in).to(dtype=torch.float32)
                         dt_hat_f32 = dt_hat.to(dtype=torch.float32)
-                        rate_target_f32 = delta_target_f32 / dt_hat_f32.clamp_min(1e-12)
-
                         y_pred_f32 = y_pred.to(dtype=torch.float32)
-                        center_loss = (F.huber_loss(y_pred_f32, rate_target_f32, delta=huber_delta)
-                                        if use_huber else F.mse_loss(y_pred_f32, rate_target_f32))
-
                         y_pred_abs = _maybe_denorm(
                             norm_in.to(dtype=torch.float32) + y_pred_f32 * dt_hat_f32,
                             mu, sigma
                         )
 
-                    lap_loss = (laplacian_smoothness(y_pred, pei) if lap_w > 0 else y_pred.new_zeros(()))
-                    tmp_loss = (temporal_consistency(x_in, norm_tgt) if tmp_w > 0 else y_pred.new_zeros(()))
+                    center_loss = y_pred.new_zeros(())
+                    tmp_loss = y_pred.new_zeros(())
+                    if norm_tgt is not None:
+                        with torch.autocast(device_type=device.type, enabled=False):
+                            delta_target_f32 = (norm_tgt - norm_in).to(dtype=torch.float32)
+                            dt_hat_f32 = dt_hat.to(dtype=torch.float32)
+                            rate_target_f32 = delta_target_f32 / dt_hat_f32.clamp_min(1e-12)
+                            center_loss = (
+                                F.huber_loss(y_pred_f32, rate_target_f32, delta=huber_delta)
+                                if use_huber else F.mse_loss(y_pred_f32, rate_target_f32)
+                            ).to(dtype=y_pred.dtype)
+                        if tmp_w > 0:
+                            tmp_loss = temporal_consistency(x_in, norm_tgt)
+
+                    lap_loss = y_pred.new_zeros(())
+                    if (norm_tgt is not None) and (lap_w > 0):
+                        lap_loss = laplacian_smoothness(y_pred, pei)
 
                     phy_loss = y_pred.new_zeros(())
-                    if need_phy and dec_resid_w > 0.0 and (r_phy_for_loss is not None):
+                    if (
+                        (norm_tgt is not None)
+                        and need_phy
+                        and dec_resid_w > 0.0
+                        and (r_phy_for_loss is not None)
+                    ):
                         with torch.autocast(device_type=device.type, enabled=False):
                             phy_loss = dec.physics_residual_loss_delta(
                                 y_pred_abs=y_pred_abs.float(),
@@ -7467,6 +7517,8 @@ def evaluate_one_epoch_multi_step(
                             ).to(dtype=y_pred.dtype)
 
                     loss_step = center_loss + lap_w * lap_loss + tmp_w * tmp_loss + dec_resid_w * phy_loss
+                    if norm_tgt is None:
+                        loss_step = y_pred.new_zeros(())
 
                 return loss_step, y_pred_abs
 
@@ -7541,7 +7593,11 @@ def evaluate_one_epoch_multi_step(
                             ).to(device=device, dtype=torch.float32)
 
                         x_in_abs = feat_t_on_pred_list[1].to(device=device, dtype=torch.float32)
-                        x_tgt_abs = feat_tp1_on_pred_list[1].to(device=device, dtype=torch.float32)
+                        x_tgt_abs = (
+                            None
+                            if runtime_infer_only
+                            else feat_tp1_on_pred_list[1].to(device=device, dtype=torch.float32)
+                        )
                     else:
                         step_idx = k + 1
                         do_rebuild = (k == 0) or ((step_idx % runtime_update_every) == 0)
@@ -7632,27 +7688,30 @@ def evaluate_one_epoch_multi_step(
                                 raise RuntimeError("Runtime mesh state is not initialized before a reuse step.")
                             x_in_abs = state_feat
 
-                        gt_centers_tp1 = centers_list[k + 1].to(device=device, dtype=torch.float32)
-                        gt_feat_tp1 = feat_list[k + 1].to(device=device, dtype=torch.float32)
-                        n_src_tgt = int(gt_centers_tp1.shape[0])
-                        n_dst_tgt = int(active_pred_centers.shape[0])
-                        idw_dev_tgt_t, idw_chunk_tgt = _select_idw_backend(
-                            src_n=n_src_tgt,
-                            requested_chunk=int(runtime_chunk),
-                            out_device=device,
-                        )
-                        idw_dev_tgt = idw_dev_tgt_t.type
-                        t_xtgt_t0 = time.perf_counter()
-                        x_tgt_abs = _map_gt_to_pred_mesh_once(
-                            src_centers=gt_centers_tp1,
-                            src_feats=gt_feat_tp1,
-                            pred_centers=active_pred_centers,
-                            knn_k=runtime_knn_k,
-                            chunk=runtime_chunk,
-                            knn_backend=runtime_idw_backend,
-                            knn_backend_kwargs=runtime_idw_backend_kwargs,
-                        )
-                        t_xtgt_map_s = time.perf_counter() - t_xtgt_t0
+                        if runtime_infer_only:
+                            x_tgt_abs = None
+                        else:
+                            gt_centers_tp1 = centers_list[k + 1].to(device=device, dtype=torch.float32)
+                            gt_feat_tp1 = feat_list[k + 1].to(device=device, dtype=torch.float32)
+                            n_src_tgt = int(gt_centers_tp1.shape[0])
+                            n_dst_tgt = int(active_pred_centers.shape[0])
+                            idw_dev_tgt_t, idw_chunk_tgt = _select_idw_backend(
+                                src_n=n_src_tgt,
+                                requested_chunk=int(runtime_chunk),
+                                out_device=device,
+                            )
+                            idw_dev_tgt = idw_dev_tgt_t.type
+                            t_xtgt_t0 = time.perf_counter()
+                            x_tgt_abs = _map_gt_to_pred_mesh_once(
+                                src_centers=gt_centers_tp1,
+                                src_feats=gt_feat_tp1,
+                                pred_centers=active_pred_centers,
+                                knn_k=runtime_knn_k,
+                                chunk=runtime_chunk,
+                                knn_backend=runtime_idw_backend,
+                                knn_backend_kwargs=runtime_idw_backend_kwargs,
+                            )
+                            t_xtgt_map_s = time.perf_counter() - t_xtgt_t0
 
                     dtk = dtk.to(device=device, dtype=x_in_abs.dtype)
 
@@ -7677,16 +7736,24 @@ def evaluate_one_epoch_multi_step(
                     if t_indices is not None:
                         t_absk = int(t_indices[k + 1].item()) if torch.is_tensor(t_indices) else int(t_indices[k + 1])
 
-                    _accumulate_metrics(
-                        k=k,
-                        t_abs=t_absk,
-                        pred_abs=y_pred_abs_k,
-                        gt_abs=x_tgt_abs,
-                        pred_levels=active_pred_levels,
-                    )
-
-                    step_mae = float(torch.mean(torch.abs(y_pred_abs_k.detach() - x_tgt_abs)).cpu())
+                    if x_tgt_abs is not None:
+                        _accumulate_metrics(
+                            k=k,
+                            t_abs=t_absk,
+                            pred_abs=y_pred_abs_k,
+                            gt_abs=x_tgt_abs,
+                            pred_levels=active_pred_levels,
+                        )
+                        step_mae = float(torch.mean(torch.abs(y_pred_abs_k.detach() - x_tgt_abs)).cpu())
+                    else:
+                        step_mae = float("nan")
                     mem_alloc_mb, mem_reserved_mb = _runtime_memory_snapshot_mb(device)
+                    loss_log = "" if runtime_infer_only else float(loss_k.detach().cpu())
+                    mae_log = "" if runtime_infer_only else float(step_mae)
+                    n_gt_src_log = (
+                        -1 if runtime_infer_only
+                        else (int(centers_list[k + 1].shape[0]) if torch.is_tensor(centers_list[k + 1]) else -1)
+                    )
                     _runtime_step_log_write(
                         cfg,
                         {
@@ -7703,7 +7770,7 @@ def evaluate_one_epoch_multi_step(
                             "n_state": int(x_in_abs.shape[0]) if torch.is_tensor(x_in_abs) else -1,
                             "n_pred": int(active_pred_centers.shape[0]) if torch.is_tensor(active_pred_centers) else -1,
                             "e_pred": int(active_pred_ei.shape[1]) if (torch.is_tensor(active_pred_ei) and active_pred_ei.ndim == 2) else -1,
-                            "n_gt_src": int(centers_list[k + 1].shape[0]) if torch.is_tensor(centers_list[k + 1]) else -1,
+                            "n_gt_src": n_gt_src_log,
                             "idw_dev_xin": idw_dev_xin,
                             "idw_chunk_xin": int(idw_chunk_xin),
                             "n_src_xin": int(n_src_xin),
@@ -7717,14 +7784,14 @@ def evaluate_one_epoch_multi_step(
                             "t_xtgt_map_s": float(t_xtgt_map_s),
                             "t_model_s": float(t_model_s),
                             "t_step_total_s": float(time.perf_counter() - step_wall_t0),
-                            "loss": float(loss_k.detach().cpu()),
-                            "mae": float(step_mae),
+                            "loss": loss_log,
+                            "mae": mae_log,
                             "mem_alloc_mb": float(mem_alloc_mb),
                             "mem_reserved_mb": float(mem_reserved_mb),
                         },
                     )
 
-                    if write_budgets and (t_absk is not None):
+                    if write_budgets and (t_absk is not None) and (not runtime_infer_only):
                         gt_tp1_abs = feat_list[k + 1].to(device)
                         gt_tp1_lev = level_list[k + 1].to(device)
 
@@ -7784,13 +7851,14 @@ def evaluate_one_epoch_multi_step(
                     )
 
                     if write_budgets and (t_absk is not None):
-                        _append_budget_row(
-                            t_abs=t_absk,
-                            step_k=k,
-                            kind="gt_on_pred_mesh_tp1",
-                            x_abs=x_tgt_abs,
-                            pred_levels=active_pred_levels,
-                        )
+                        if x_tgt_abs is not None:
+                            _append_budget_row(
+                                t_abs=t_absk,
+                                step_k=k,
+                                kind="gt_on_pred_mesh_tp1",
+                                x_abs=x_tgt_abs,
+                                pred_levels=active_pred_levels,
+                            )
                         _append_budget_row(
                             t_abs=t_absk,
                             step_k=k,
@@ -7800,14 +7868,15 @@ def evaluate_one_epoch_multi_step(
                         )
 
                     state_feat = _enforce_physical_state(y_pred_abs_k, cfg, rho_floor=1e-6, E_floor=1e-6)
-                    _record_step_diagnostics(
-                        pred_raw_abs=y_pred_abs_k,
-                        pred_used_abs=state_feat,
-                        gt_abs=x_tgt_abs,
-                        pred_levels=active_pred_levels,
-                        pred_centers=active_pred_centers,
-                        pred_ei=active_pred_ei,
-                    )
+                    if x_tgt_abs is not None:
+                        _record_step_diagnostics(
+                            pred_raw_abs=y_pred_abs_k,
+                            pred_used_abs=state_feat,
+                            gt_abs=x_tgt_abs,
+                            pred_levels=active_pred_levels,
+                            pred_centers=active_pred_centers,
+                            pred_ei=active_pred_ei,
+                        )
                     state_centers = active_pred_centers
                     state_levels = active_pred_levels
                     state_parents = active_pred_parents
@@ -7996,6 +8065,26 @@ def evaluate_one_epoch_multi_step(
     eps = 1e-12
     S = len(step_wsum)
     if S == 0:
+        if runtime_infer_only:
+            avg_loss = total_loss_accum / max(n_steps_total, 1)
+            stats = {
+                "num_windows": len(loader),
+                "num_steps": n_steps_total,
+                "infer_only": True,
+                **_finalize_diagnostics_accumulator(diagnostics_accum, diag_cfg),
+                "maew_by_rollout_step": [],
+                "rell2w_by_rollout_step": [],
+                "maew_feat_by_rollout_step": None,
+                "rell2w_feat_by_rollout_step": None,
+                "t_values": [],
+                "maew_by_t": None,
+                "rell2w_by_t": None,
+                "maew_feat_by_t": None,
+                "rell2w_feat_by_t": None,
+            }
+            if collect_examples:
+                stats["examples"] = examples
+            return avg_loss, stats
         raise RuntimeError("No steps accumulated; check loader/window_size.")
 
     Fdim = step_mae_num[0].numel()
@@ -8122,6 +8211,10 @@ def build_model_from_cfg(cfg, device):
         conv_type=conv_type,
         edge_dim=edge_dim,
         nnconv_hidden=nnconv_hidden,
+        use_skip=bool(model_cfg.get("use_skip", False)),
+        skip_type=str(model_cfg.get("skip_type", "block")),
+        use_layernorm=bool(model_cfg.get("use_layernorm", False)),
+        layernorm_eps=float(model_cfg.get("layernorm_eps", 1e-6)),
     ).to(device)
 
     # -------------------------

@@ -26,8 +26,10 @@ Optional speed knobs:
   --no-edges              Disable mesh edges in plots (often a big speedup).
   --colorbars shared      Use one colorbar per row instead of per-panel (speedup).
   --clim-sample 20000     Approximate percentile limits using a subsample (speedup).
-  --interp-k 4            Smaller kNN for delta interpolation (speedup).
-  --interp-chunk 4096     Chunk size for interpolation (often affects speed a lot).
+  --runtime-knn-k 4               Smaller kNN for runtime remap interpolation (faster, less robust).
+  --runtime-interp-chunk 4096     Chunk size for runtime remap interpolation.
+  --runtime-update-every-steps 2  Rebuild runtime mesh every 2 steps instead of every step.
+  --runtime-idw-backend faiss_ivf Use approximate FAISS backend for runtime remap on CUDA.
 
 Notes:
 - Uses Agg backend to avoid GUI/memory issues on macOS.
@@ -4472,6 +4474,48 @@ def main():
         default=None,
         help="Optional override for mesh.starting_mesh_path at rollout time.",
     )
+    ap.add_argument(
+        "--runtime-idw-backend",
+        type=str,
+        default=None,
+        choices=["exact", "faiss_flat", "faiss_ivf", "cdist", "flat", "faiss", "ivf", "ann", "approx"],
+        help=(
+            "Optional override for train.runtime_mesh.idw.backend used by runtime remap "
+            "(state/GT mapping on changing meshes)."
+        ),
+    )
+    ap.add_argument(
+        "--runtime-knn-k",
+        type=int,
+        default=None,
+        help=(
+            "Optional override for train.knn_k used by runtime remap interpolation. "
+            "Lower values are faster but less robust."
+        ),
+    )
+    ap.add_argument(
+        "--runtime-interp-chunk",
+        type=int,
+        default=None,
+        help="Optional override for speed.interp_chunk used by runtime remap interpolation.",
+    )
+    ap.add_argument(
+        "--runtime-update-every-steps",
+        type=int,
+        default=None,
+        help=(
+            "Optional override for train.runtime_mesh.update_every_steps in rollout evaluation. "
+            "Use >1 to rebuild runtime mesh less often for speed."
+        ),
+    )
+    ap.add_argument(
+        "--infer-only",
+        action="store_true",
+        help=(
+            "Run rollout in inference-only mode (runtime mesh path): skip GT->pred target remap and "
+            "target-based eval loss/metrics for faster timing."
+        ),
+    )
 
     # Raster controls
     ap.add_argument("--raster-mode", type=str, default="block", choices=["block", "idw"],
@@ -4482,8 +4526,28 @@ def main():
                     help="Delta scaling when unify_clims is OFF. When unify_clims is ON, we force 'gt' behavior.")
 
     ap.add_argument("--raster-bins", type=int, default=256, help="IDW grid bins (only for raster-mode=idw).")
-    ap.add_argument("--raster-k", type=int, default=8, help="IDW kNN k (only for raster-mode=idw).")
-    ap.add_argument("--raster-chunk", type=int, default=32768, help="IDW chunk (only for raster-mode=idw).")
+    ap.add_argument(
+        "--viz-raster-k",
+        "--raster-k",
+        dest="viz_raster_k",
+        type=int,
+        default=8,
+        help=(
+            "Visualization raster IDW kNN k (only for raster-mode=idw). "
+            "Deprecated alias: --raster-k."
+        ),
+    )
+    ap.add_argument(
+        "--viz-raster-chunk",
+        "--raster-chunk",
+        dest="viz_raster_chunk",
+        type=int,
+        default=32768,
+        help=(
+            "Visualization raster IDW chunk (only for raster-mode=idw). "
+            "Deprecated alias: --raster-chunk."
+        ),
+    )
     ap.add_argument(
         "--degree-diag-steps",
         type=str,
@@ -4498,6 +4562,16 @@ def main():
 
 
     args = ap.parse_args()
+    if args.runtime_knn_k is not None and int(args.runtime_knn_k) <= 0:
+        raise ValueError("--runtime-knn-k must be > 0.")
+    if args.runtime_interp_chunk is not None and int(args.runtime_interp_chunk) <= 0:
+        raise ValueError("--runtime-interp-chunk must be > 0.")
+    if args.runtime_update_every_steps is not None and int(args.runtime_update_every_steps) <= 0:
+        raise ValueError("--runtime-update-every-steps must be >= 1.")
+    if int(args.viz_raster_k) <= 0:
+        raise ValueError("--viz-raster-k/--raster-k must be > 0.")
+    if int(args.viz_raster_chunk) <= 0:
+        raise ValueError("--viz-raster-chunk/--raster-chunk must be > 0.")
 
     # ----- Load checkpoint -----
     log(f"[INFO] Loading checkpoint from {args.checkpoint}")
@@ -4552,6 +4626,31 @@ def main():
             "[RUNTIME-MESH] overriding mesh.starting_mesh_path with "
             f"--runtime-mesh-spec-path={args.runtime_mesh_spec_path}"
         )
+    if args.runtime_idw_backend is not None:
+        cfg.setdefault("train", {}).setdefault("runtime_mesh", {}).setdefault("idw", {})[
+            "backend"
+        ] = str(args.runtime_idw_backend)
+        log(
+            "[RUNTIME-MESH] overriding train.runtime_mesh.idw.backend with "
+            f"--runtime-idw-backend={args.runtime_idw_backend}"
+        )
+    if args.runtime_knn_k is not None:
+        cfg.setdefault("train", {})["knn_k"] = int(args.runtime_knn_k)
+        log(f"[RUNTIME-MESH] overriding train.knn_k with --runtime-knn-k={int(args.runtime_knn_k)}")
+    if args.runtime_interp_chunk is not None:
+        cfg.setdefault("speed", {})["interp_chunk"] = int(args.runtime_interp_chunk)
+        log(
+            "[RUNTIME-MESH] overriding speed.interp_chunk with "
+            f"--runtime-interp-chunk={int(args.runtime_interp_chunk)}"
+        )
+    if args.runtime_update_every_steps is not None:
+        cfg.setdefault("train", {}).setdefault("runtime_mesh", {})["update_every_steps"] = int(
+            args.runtime_update_every_steps
+        )
+        log(
+            "[RUNTIME-MESH] overriding train.runtime_mesh.update_every_steps with "
+            f"--runtime-update-every-steps={int(args.runtime_update_every_steps)}"
+        )
 
     # Model device
     device_str = args.device if (args.device is not None) else cfg.get("device", "cpu")
@@ -4602,19 +4701,40 @@ def main():
     if runtime_backend in ("cnn_policy",):
         runtime_backend = "cnn"
 
-    # For rollout with CNN or gradient_fast runtime mesh, always rebuild every step.
+    # For rollout with CNN or gradient_fast runtime mesh, default to rebuild every step.
+    # CLI can explicitly override update_every_steps for faster inference experiments.
     if runtime_mesh_enabled and runtime_backend in ("cnn", "gradient_fast"):
         rt_cfg_mut = cfg.setdefault("train", {}).setdefault("runtime_mesh", {})
         prev_update_every = int(rt_cfg_mut.get("update_every_steps", 1))
         prev_warm_start = bool(rt_cfg_mut.get("warm_start_from_precompute", True))
-        rt_cfg_mut["update_every_steps"] = 1
+        if args.runtime_update_every_steps is None:
+            rt_cfg_mut["update_every_steps"] = 1
+            update_note = "forcing update_every_steps=1"
+        else:
+            rt_cfg_mut["update_every_steps"] = int(args.runtime_update_every_steps)
+            update_note = (
+                "keeping CLI override "
+                f"update_every_steps={int(args.runtime_update_every_steps)}"
+            )
         rt_cfg_mut["warm_start_from_precompute"] = False
-        if (prev_update_every != 1) or prev_warm_start:
+        curr_update_every = int(rt_cfg_mut.get("update_every_steps", 1))
+        if (prev_update_every != curr_update_every) or prev_warm_start:
             log(
-                f"[RUNTIME-MESH] {runtime_backend} rollout override: forcing update_every_steps=1 "
-                "and warm_start_from_precompute=false (rebuild every step)."
+                f"[RUNTIME-MESH] {runtime_backend} rollout override: {update_note} "
+                "and warm_start_from_precompute=false."
             )
         runtime_mesh_cfg = rt_cfg_mut
+
+    if runtime_mesh_enabled:
+        runtime_idw_cfg = runtime_mesh_cfg.get("idw", {}) or {}
+        eff_runtime_knn_k = int(cfg.get("train", {}).get("knn_k", cfg.get("loss", {}).get("interp_k", 8)))
+        eff_runtime_chunk = int(cfg.get("speed", {}).get("interp_chunk", 8192))
+        log(
+            "[RUNTIME-MESH] remap controls: "
+            f"idw_backend={str(runtime_idw_cfg.get('backend', 'exact')).lower()}, "
+            f"knn_k={eff_runtime_knn_k}, interp_chunk={eff_runtime_chunk}, "
+            f"update_every_steps={int(runtime_mesh_cfg.get('update_every_steps', 1))}"
+        )
 
     runtime_warm_start_precomp = bool(runtime_mesh_cfg.get("warm_start_from_precompute", True))
     use_precomp_collate = (not runtime_mesh_enabled) or runtime_warm_start_precomp
@@ -4795,6 +4915,8 @@ def main():
 
     # ----- Evaluate only this rollout window -----
     log(f"[INFO] Running multi-step evaluation for ONE window at start_t={start_t} (horizon={horizon})...")
+    if bool(args.infer_only):
+        log("[INFO] rollout_viz infer-only enabled.")
     with Timer("evaluate_one_epoch_multi_step"):
         test_loss, test_stats = evaluate_one_epoch_multi_step(
             model,
@@ -4810,6 +4932,7 @@ def main():
             budget_csv_path=budget_csv_path, 
             write_budgets=True,
             runtime_mesh_policy=runtime_mesh_policy,
+            infer_only=bool(args.infer_only),
         )
     log(f"[TEST] loss={test_loss:.4e}")
 
@@ -4838,8 +4961,8 @@ def main():
             examples,
             feat_names=feat_names,
             bbox=bbox,
-            knn_k=int(args.raster_k),
-            chunk=int(args.raster_chunk),
+            knn_k=int(args.viz_raster_k),
+            chunk=int(args.viz_raster_chunk),
             n_probe=int(args.debug_fast_checks_n),
         )
 
@@ -4886,8 +5009,8 @@ def main():
                 dpi=int(args.dpi),
                 raster_mode=str(args.raster_mode),
                 raster_bins=int(args.raster_bins),
-                raster_k=int(args.raster_k),
-                raster_chunk=int(args.raster_chunk),
+                raster_k=int(args.viz_raster_k),
+                raster_chunk=int(args.viz_raster_chunk),
                 raster_lmax=(int(args.raster_lmax) if args.raster_lmax is not None else None),
                 delta_scale=str(args.delta_scale),
                 progress_every=int(args.progress_every),
@@ -4964,16 +5087,19 @@ def main():
 
     log(f"[INFO] Done. GIFs are in: {out_dir}")
     
-    # Plot metrics (RelL2w all-features + MAEw 2x2)
-    plot_rollout_metrics_maew_rell2w(
-        test_stats,
-        feature_names=feat_names,
-        start_t=start_t,
-        save_dir=out_dir,          # optional; remove if you don't want saving yet
-        prefix=f"metrics_t{start_t}_H{horizon}",
-        dpi=150,
-        show=False,
-    )
+    # Plot metrics (RelL2w all-features + MAEw 2x2) when available.
+    if not bool(test_stats.get("infer_only", False)):
+        plot_rollout_metrics_maew_rell2w(
+            test_stats,
+            feature_names=feat_names,
+            start_t=start_t,
+            save_dir=out_dir,          # optional; remove if you don't want saving yet
+            prefix=f"metrics_t{start_t}_H{horizon}",
+            dpi=150,
+            show=False,
+        )
+    else:
+        log("[INFO] infer-only rollout: skipping metric plots that require GT-mapped targets.")
 
     if degree_diag_steps is not None:
         if len(degree_diag_steps) == 0:
@@ -4986,8 +5112,8 @@ def main():
                     examples=examples,
                     step_indices=degree_diag_steps,
                     out_dir=diag_out_dir,
-                    knn_k=int(args.raster_k),
-                    chunk=int(args.raster_chunk),
+                    knn_k=int(args.viz_raster_k),
+                    chunk=int(args.viz_raster_chunk),
                     dpi=max(120, int(args.dpi)),
                     log_fn=log,
                 )

@@ -2969,6 +2969,7 @@ def precompute_pred_mesh_and_interps_for_rollout(
     geometry_mode = str(mesh_policy.get("geometry_mode", "gt_gradients")).lower()
     refine_to_level = int(mesh_policy.get("starting_refine_to_level", 0))
     refine_policy = str(mesh_policy.get("starting_refine_policy", "min_level")).lower()
+    hysteresis_prev_source = str(mesh_policy.get("hysteresis_prev_source", "gt")).strip().lower()
 
     # In starting_refine mode, build ONE static pred mesh now
     static_pred = None
@@ -3025,6 +3026,17 @@ def precompute_pred_mesh_and_interps_for_rollout(
     else:
         raise ValueError(f"Unknown cfg['policy']['geometry_mode'] = '{geometry_mode}'")
 
+    use_predicted_prev_for_hysteresis = (
+        static_pred is None
+        and geometry_mode in ("gt_gradients", "gradients", "gradient_policy")
+        and hysteresis_prev_source in ("predicted", "pred", "previous_pred", "previous_predicted")
+    )
+    if use_predicted_prev_for_hysteresis:
+        print(
+            "[PRECOMP] Hysteresis previous-state source: predicted mesh (temporal smoothing enabled).",
+            flush=True,
+        )
+
     # ----------------- open HDF5 (overwrite) -----------------
     f = h5py.File(cache_path, "w")
     try:
@@ -3058,6 +3070,10 @@ def precompute_pred_mesh_and_interps_for_rollout(
                 pass
 
         # ---------- FIRST PASS: meshes + GT→pred(t+1) ----------
+        prev_pred_level_hyst = None
+        prev_pred_ij_hyst = None
+        prev_pred_parents_hyst = None
+        prev_pred_mask_parent_hyst = None
         for t in it:
             dst = t + 1
 
@@ -3088,6 +3104,10 @@ def precompute_pred_mesh_and_interps_for_rollout(
                 mask_t_parent = s["mask"].to(dev).view(H, W)
             else:
                 mask_t_parent = _mask_from_parents(parents_t, H, W)
+
+            level_t_gt = level_t.to(dev) if level_t is not None else None
+            ij_t_gt = ij_t.to(dev) if ij_t is not None else None
+            ei_t_gt = ei_t.to(dev) if (ei_t is not None and torch.is_tensor(ei_t)) else None
 
             # pull GT(t+1)
             s_next = steps[dst]
@@ -3130,18 +3150,47 @@ def precompute_pred_mesh_and_interps_for_rollout(
                 ex_compat = {
                     "centers_t": centers_t,
                     "center_feat_t": feat_t,
-                    "level_t": level_t.to(dev) if level_t is not None else None,
-                    "ij_t": ij_t.to(dev) if ij_t is not None else None,
+                    "level_t": level_t_gt,
+                    "ij_t": ij_t_gt,
                     "gt_refine_ratio": int(gt_refine_ratio),
                     "dyn_parents": parents_t,
                     "mask_t": mask_t_parent.view(-1),
-                    "ei_t": ei_t.to(dev) if (ei_t is not None and torch.is_tensor(ei_t)) else None,
+                    "ei_t": ei_t_gt,
                     "t": s.get("t", torch.tensor(t)),
                 }
+                if use_predicted_prev_for_hysteresis and (prev_pred_level_hyst is not None) and (prev_pred_ij_hyst is not None):
+                    # Keep gradients tied to GT(t), but source hysteresis from
+                    # previous predicted mesh occupancy.
+                    ex_compat["prev_level_t"] = prev_pred_level_hyst
+                    ex_compat["prev_ij_t"] = prev_pred_ij_hyst
+                    ex_compat["prev_dyn_parents"] = prev_pred_parents_hyst
+                    ex_compat["prev_mask_t"] = prev_pred_mask_parent_hyst.view(-1)
 
                 pred_c_rect, pred_l_rect, pred_p_rect, pred_e_rect, _mask_p_rect = _build_pred_mesh_from_gt_gradients(
                     ex_compat, cfg, H, W, dx, dy, dev
                 )
+
+                # Save current predicted rectangular mesh as hysteresis state for
+                # the next timestep when temporal stabilization is enabled.
+                if use_predicted_prev_for_hysteresis:
+                    row_prev, col_prev = _cell_level_ij_from_centers(
+                        centers=pred_c_rect.to(dev),
+                        levels=pred_l_rect.to(dev),
+                        H=H,
+                        W=W,
+                        bbox=tuple(cfg["data"]["bbox"]),
+                        refine_ratio=int(refine_ratio),
+                    )
+                    prev_pred_level_hyst = pred_l_rect.to(dev, dtype=torch.long).view(-1).detach()
+                    prev_pred_ij_hyst = torch.stack([row_prev, col_prev], dim=1).to(dev, dtype=torch.long).detach()
+                    prev_pred_parents_hyst = _parents_from_level_ij(
+                        prev_pred_level_hyst,
+                        prev_pred_ij_hyst,
+                        H,
+                        W,
+                        refine_ratio=int(refine_ratio),
+                    ).detach()
+                    prev_pred_mask_parent_hyst = _mask_from_parents(prev_pred_parents_hyst, H, W).view(H, W).detach()
 
                 pred_c_dev, pred_l_dev, pred_p_dev, pred_e_dev, mask_p_dev = _clip_pred_mesh_to_wedge(
                     pred_c_rect,

@@ -550,8 +550,13 @@ def predict_masks_hierarchical_from_gt_gradients(
     # Reconstruct previous refine masks per level from current mesh state.
     # prev_refine_by_level[L] lives on the parent grid for level L (shape H*rr^(L-1), W*rr^(L-1)).
     prev_refine_by_level: Dict[int, torch.Tensor] = {}
-    level_t_raw = batch.get("level_t", None)
-    ij_t_raw = batch.get("ij_t", None)
+    # Hysteresis previous-state source:
+    # - default uses current mesh state keys (level_t/ij_t)
+    # - optional override keys (prev_level_t/prev_ij_t) allow callers to
+    #   stabilize refinement with a different previous mesh state while still
+    #   composing gradients from GT(t).
+    level_t_raw = batch.get("prev_level_t", batch.get("level_t", None))
+    ij_t_raw = batch.get("prev_ij_t", batch.get("ij_t", None))
     if level_t_raw is not None and ij_t_raw is not None:
         try:
             lv_prev = torch.as_tensor(level_t_raw, device=dev).view(-1).long()
@@ -636,8 +641,13 @@ def predict_masks_hierarchical_from_gt_gradients(
         prev_mask = prev_refine_by_level.get(L, None)
 
         # Backward-compatible fallback for L1 when richer previous level state is unavailable.
-        if prev_mask is None and L == 1 and ("mask_t" in batch):
-            prev_flat = batch["mask_t"].to(dev)
+        if prev_mask is None and L == 1:
+            prev_flat_raw = batch.get("prev_mask_t", batch.get("mask_t", None))
+            if prev_flat_raw is None:
+                prev_flat = None
+            else:
+                prev_flat = torch.as_tensor(prev_flat_raw, device=dev)
+        if prev_mask is None and L == 1 and prev_flat is not None:
             H0 = int(cfg["data"].get("H", H))
             W0 = int(cfg["data"].get("W", W))
             if H0 * W0 == prev_flat.numel():
@@ -668,10 +678,32 @@ def predict_masks_hierarchical_from_gt_gradients(
             h, w = Gparent.shape
             M = M & allow[:h, :w]
 
-        # Optional: constant-physical-width dilation
-        r_phys = float(cfg.get("policy", {}).get(f"dilate_phys_L{L}", 0.0))
+        # Optional: dilation halo around refine mask.
+        # Preferred config is cell-based halo:
+        #   policy.dilate_cells_L{L} = n_cells
+        # Optional convenience for finest level:
+        #   policy.dilate_cells_lmax = n_cells (applies only when L==maxL)
+        # Backward compatible:
+        #   policy.dilate_phys_L{L} = physical radius
+        pol_cfg = cfg.get("policy", {}) or {}
+        dxL_here = (xmax - xmin) / float(W * (rr ** (L - 1)))
+
+        n_cells = None
+        raw_cells = pol_cfg.get(f"dilate_cells_L{L}", None)
+        if raw_cells is None and (L == maxL):
+            raw_cells = pol_cfg.get("dilate_cells_lmax", None)
+        if raw_cells is not None:
+            try:
+                n_cells = float(raw_cells)
+            except Exception:
+                n_cells = None
+
+        if n_cells is not None:
+            r_phys = float(max(0.0, n_cells) * dxL_here)
+        else:
+            r_phys = float(pol_cfg.get(f"dilate_phys_L{L}", 0.0))
+
         if r_phys > 0:
-            dxL_here = (xmax - xmin) / (W * (rr ** (L - 1)))
             r_cells = max(1, int(round(r_phys / dxL_here)))
             k = 2 * r_cells + 1
             M = torch.nn.functional.max_pool2d(

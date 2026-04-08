@@ -6,17 +6,79 @@
     "pt_path": "/Users/trevorreed/UVA_postdoc_stuff/gparc/data/shock_ramp/shock_ramp_amr.pt",
     "H": 64,
     "W": 64,
-    "L_max": 3,
-    "bbox": [0.0, 1.0, 0.0, 1.0],
-    "pre_train_dir": "./precomp_cache",
+    "L_max": 4,
+    "bbox": [
+      0.0,
+      1.0,
+      0.0,
+      1.0
+    ],
     "window_size": 5,
     "stride": 1,
     "num_workers": 0
   },
 
+  "mesh": {
+    "starting_mesh_path": "./utils/wedge_mesh_spec_64x64_L4.pt"
+  },
+
+  "policy": {
+    "geometry_mode": "gt_gradients",
+    "_comment_geometry_mode": "gt_gradients or starting_refine for uniform mesh",
+    "starting_refine_policy": "min_level",
+    "starting_refine_to_level": 4,
+    "refine_ratio": 2,
+    "dilate_cells_lmax": 3.0,
+    "hysteresis_mode": "percentile",
+    "hysteresis_prev_source": "predicted",
+    "_comment_hysteresis_prev_source": "predicted or gt",
+    "percentile_low": 85.0,
+    "percentile_high": 95.0,
+    "percentiles_by_level": {
+      "selection": "per_level",
+      "_comment_selection": "global or per_level (or auto)",
+      "1": {
+        "low": 84.0,
+        "high": 93.0
+      },
+      "2": {
+        "low": 89.0,
+        "high": 95.0
+      },
+      "3": {
+        "low": 93.0,
+        "high": 96.0
+      },
+      "4": {
+        "low": 96.0,
+        "high": 97.0
+      }
+    },
+    "combine": "l2",
+    "grad_channels": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "max_level": 4,
+    "tau_low": 1.0,
+    "tau_high": 1.0
+  },
+
   "features": {
-    "use_columns": [0, 1, 2, 3],
-    "names": ["density", "x_momentum", "y_momentum", "energy"],
+    "use_columns": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "names": [
+      "density",
+      "x_momentum",
+      "y_momentum",
+      "energy"
+    ],
     "normalize": true,
     "normalization": {
       "momentum_sigma_mode": "shared_rms",
@@ -28,42 +90,96 @@
     }
   },
 
-  "split": { "train": 0.05, "val": 0.1, "test": 0.85 },
+  "model": {
+    "name": "FeatureNet",
+    "hidden": 128,
+    "layers": 3,
+    "dropout": 0.1,
+    "predict_type": "rate",
+    "_comment_predict_type": "absolute, delta, or rate"
+  },
+
+  "loss": {
+    "use_huber": false,
+    "huber_delta": 0.05,
+    "interp_type": "standard",
+    "interp_k": 8,
+    "laplacian_weight": 0.0,
+    "temporal_weight": 0.0,
+    "dec": true,
+    "parc": true,
+    "parc_detach_inputs": true,
+    "physics_backend": "dec",
+    "_comment_physics_backend": "dec (default) or mls (moving least squares)",
+
+    "mls_ops_device": "cpu",
+    "mls_use_2hop_extension": false,
+    "mls_use_neighbor_damping": true,
+    "mls_damping_alpha": 0.5,
+    "mls_poly_order": 2,
+    "mls_min_neighbors": 6,
+    "mls_cache_by_geometry": false,
+
+    "parc_include_diff": true,
+    "diff_channels": [
+      "density",
+      "energy"
+    ],
+    "diff_weight": 1.0,
+
+    "parc_include_adv": true,
+    "advection_type": "euler",
+    "euler_flux_scheme": "rusanov",
+    "advection_reconstruction": "first_order",
+    "_comment_advection_reconstruction": "first_order (default) or muscl (second order)",
+    "muscl_limiter": "minmod",
+    "_comment_muscl_limiter": "minmod, mc, or vanleer (used when advection_reconstruction=muscl)",
+    "gamma": 1.4,
+    "p_floor": 0.0,
+    "adv_channels": [
+      "density",
+      "x_momentum",
+      "y_momentum",
+      "energy"
+    ],
+    "adv_weight": 1.0,
+    "adv_all_steps": true,
+
+    "nu": 0.0001,
+    "blend_weight": 0.0,
+    "residual_weight": 0.0,
+
+    "rho_floor": 1e-6,
+    "u_clip": 1000.0,
+
+    "parc_use_adapter": false,
+    "parc_feat_norm": false,
+    "parc_feat_clip_pre": 0.0,
+    "parc_feat_clip_post": 0.0,
+    "parc_feat_norm_momentum": 0.02,
+    "parc_gate_init": -3.0,
+    "parc_gate_per_channel": false,
+
+    "ops_term_clip": 0.0,
+    "state_rho_max": 0.0,
+    "state_E_max": 0.0,
+    "state_m_max": 0.0,
+    "ops_rho_max": 0.0,
+    "ops_E_max": 0.0,
+    "ops_m_max": 0.0
+  },
 
   "train": {
-    "precomp_cache_path": "./cache/first_simulation/64by64-coarse/all/max_level_3/shock_ramp_precomp_pLow85_pHigh95_faceAdj.h5",
-    "precomp_force_recompute": false,
+    "precomp_cache_path": "./cache/first_simulation/64by64-coarse/all/max_level_4/3-cell-halo/shock_ramp_precomp_per-level-weights_3-cell-halo_faceAdj.h5",
+    "precomp_force_recompute": true,
     "precompute_t_start": null,
     "precompute_t_end": null,
     "_comment_precompute_t_range": "Optional inclusive raw-snapshot range [start,end] used before windowing/precompute/training. Need at least 2 snapshots (e.g., 50..51 for one transition).",
-    "epochs": 10,
-    "checkpoint_every_epochs": 5,
-    "validation_every_epochs": 5,
-    "batch_size": 1,
-    "lr": 0.0001,
-    "weight_decay": 0.0,
-    "grad_clip": 0.5,
-    "rate_clip_norm": 50.0,
-    "delta_clip_norm": 5.0,
-    "interp_type": "standard", 
-    "_comment_interp_type": "overlay or knn",
-    "overlay_fill": "value",  
-    "_comment_interp_type": "value or none",
-    "overlay_fill_value": 0.0,
-    "knn_k": 8,
+
     "mesh_mode": "predicted",
     "_comment_mesh_mode": "predicted or uniform",
-    "save_dir": "./runs_mesh_first",
-    "multi_step_K": 2,
-    "uniform_H": 256,
-    "uniform_W": 256,
-    "time_integrator": "euler",
-    "rk4_start_epoch": 10,
-    "rk4_ramp_epochs": 5,
-    "teacher_forcing_uniform": false,
-    "uniform_diag_edges": false,
     "runtime_mesh": {
-      "enabled": true,
+      "enabled": false,
       "domain_mode": "starting_mesh",
       "_comment_domain_mode": "starting_mesh resets to starting mesh every step for runtime CNN parity with training target semantics.",
       "warm_start_from_precompute": false,
@@ -88,14 +204,33 @@
         "enabled": true,
         "path": "./runs_mesh_first/runtime_step_log.csv",
         "append": false
+      },
+      "idw": {
+        "backend": "faiss_ivf",
+        "faiss_nlist": 256,
+        "faiss_nprobe": 16,
+        "allow_fallback_to_exact": false
       }
-    }
-  },
+    },
 
-  "edges": {
-    "method": "face",
-    "_comment_method": "face (for face-adjacency) or knn",
-    "knn_k": 8
+    "epochs": 1,
+    "checkpoint_every_epochs": 5,
+    "validation_every_epochs": 5,
+    "batch_size": 1,
+    "lr": 0.0001,
+    "weight_decay": 0.0,
+    "grad_clip": 0.5,
+    "rate_clip_norm": 50.0,
+    "delta_clip_norm": 5.0,
+    "interp_type": "standard",
+    "_comment_interp_type": "standard or knn",
+    "knn_k": 8,
+    "time_integrator": "euler",
+    "rk4_start_epoch": 10,
+    "rk4_ramp_epochs": 5,
+    "uniform_H": 256,
+    "uniform_W": 256,
+    "save_dir": "./runs_mesh_first"
   },
 
   "scheduler": {
@@ -106,98 +241,32 @@
     "threshold": 0.001,
     "threshold_mode": "rel",
     "cooldown": 0,
-    "min_lr": 0.000001,
+    "min_lr": 1e-06,
     "verbose": true
   },
 
-  "policy": {
-    "geometry_mode": "gt_gradients",
-    "_comment_geometry_mode": "gt_gradients or starting_refine for uniform mesh",
-    "starting_refine_policy": "min_level",
-    "starting_refine_to_level": 3,
-    "refine_ratio": 2,
-    "hysteresis_mode": "percentile",
-    "percentile_low":  85.0,
-    "percentile_high": 95.0,
-    "percentiles_by_level": {
-      "selection": "global",
-      "_comment_selection": "global or per_level (or auto)",
-      "1": {"low": 85.0, "high": 95.0},
-      "2": {"low": 85.0, "high": 95.0},
-      "3": {"low": 85.0, "high": 95.0},
-      "4": {"low": 85.0, "high": 95.0}
-    },
-    "combine": "l2",
-    "grad_channels": [0],
-    "grad_norm": "l2",
-    "max_level": 3,
-    "tau_low":  1.0,
-    "tau_high": 1.0
+  "split": {
+    "train": 0.05,
+    "val": 0.1,
+    "test": 0.85
   },
 
-  "loss": {
-    "use_huber": false,
-    "huber_delta": 0.05,
-    "interp_type": "standard",
-    "interp_k": 8,
-    "primary_weight": 1.0,
-    "laplacian_weight": 0.0,
-    "temporal_weight": 0.0,
-    "dec": true,
-    "parc": true,
-    "parc_detach_inputs": true,
-    "physics_backend": "dec",
-    "_comment_physics_backend": "dec (default) or mls (moving least squares)",
+  "edges": {
+    "method": "face",
+    "_comment_method": "face (for face-adjacency) or knn",
+    "knn_k": 8
+  },
 
-    "mls_ops_device": "cpu",
-    "mls_use_2hop_extension": false,
-    "mls_use_neighbor_damping": true,
-    "mls_damping_alpha": 0.5,
-    "mls_poly_order": 2,
-    "mls_min_neighbors": 6,
-    "mls_cache_by_geometry": false,
-    "mls_scale_by_dt": false,
-    
-    "parc_include_diff": true,
-    "diff_channels": ["density", "energy"],
-    "diff_weight": 1.0,
+  "idw": {
+    "backend": "exact",
+    "_comment_backend": "exact or faiss_ivf",
+    "faiss_nlist": 512,
+    "faiss_nprobe": 32,
+    "allow_fallback_to_exact": true
+  },
 
-    "parc_include_adv": true,
-    "advection_type": "euler",
-    "euler_flux_scheme": "rusanov",
-    "advection_reconstruction": "first_order",
-    "_comment_advection_reconstruction": "first_order (default) or muscl (second order)",
-    "muscl_limiter": "minmod",
-    "_comment_muscl_limiter": "minmod, mc, or vanleer (used when advection_reconstruction=muscl)",
-    "gamma": 1.4,
-    "p_floor": 0.0,
-    "adv_channels": ["density", "x_momentum", "y_momentum", "energy"],
-    "adv_weight": 1.0,
-    "adv_all_steps": true,
-  
-    "nu": 0.0001,
-
-    "blend_weight": 0.0,
-    "residual_weight": 0.0,
-
-    "rho_floor": 1e-6,
-    "u_clip": 1000.0,
-
-    "parc_use_adapter": false,
-    "parc_feat_norm": false,
-    "parc_feat_clip_pre": 0.0,
-    "parc_feat_clip_post": 0.0,
-    "parc_feat_norm_momentum": 0.02,
-    "parc_gate_init": -3.0,
-    "parc_gate_per_channel": false,
-
-    "ops_term_clip": 0.0,
-    "state_rho_max": 0.0,
-    "state_E_max": 0.0,
-    "state_m_max": 0.0,
-    "ops_rho_max": 0.0,
-    "ops_E_max": 0.0,
-    "ops_m_max": 0.0
+  "speed": {
+    "interp_chunk": 4096
   },
 
   "diagnostics": {
@@ -224,36 +293,15 @@
     }
   },
 
-  "eval": {
-    "checkpoint": "./runs_mesh_first/best.pt",
-    "qual_pdf": "./qual_rollout.pdf",
-    "show_mesh": true
-  },
-
-  "mesh": {
-    "starting_mesh_path": "./utils/wedge_mesh_spec.pt"
-  },
-
-  "model": {
-    "name": "FeatureNet",
-    "hidden": 128,
-    "layers": 3,
-    "dropout": 0.1,
-    "predict_type": "rate",
-    "_comment_predict_type": "absolute, delta, or rate"
-  },
-
   "debug": {
     "plot_gradients": false,
-    "profile": false,
-    "plot_precomp_max_cells":  "250_000",
+    "plot_precomp_max_cells": "250_000",
     "plot_precomp_linewidth": 0.05,
     "print_dec_checks": false,
     "print_loss_components": false,
     "nan_watch": false,
     "nan_first_only": false,
     "dbg_dec_ops": false,
-    "budget_watch": true,
     "run_stepA": false,
     "stepA_k": 0,
     "stepA_star": false,
@@ -270,16 +318,5 @@
     "print_batch_time": true,
     "progress_every_batches": 1,
     "print_runtime_mesh_batch_breakdown": true
-  },
-
-  "speed": {
-    "interp_chunk": 4096
-  },
-  "idw": {
-    "backend": "exact",
-    "_comment_backend": "exact or faiss_ivf",
-    "faiss_nlist": 512,
-    "faiss_nprobe": 32,
-    "allow_fallback_to_exact": true
   }
 }
