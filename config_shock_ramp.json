@@ -93,10 +93,22 @@
   "model": {
     "name": "FeatureNet",
     "hidden": 128,
-    "layers": 3,
+    "layers": 4,
     "dropout": 0.1,
     "predict_type": "rate",
-    "_comment_predict_type": "absolute, delta, or rate"
+    "_comment_predict_type": "absolute, delta, or rate",
+    "use_skip": true,
+    "skip_type": "block",
+    "use_layernorm": true,
+    "layernorm_eps": 1e-6,
+    "use_attention": false,
+    "attention": {
+      "replace_last_layer": true,
+      "heads": 4,
+      "dropout": 0.0,
+      "use_edge_attr": true,
+      "edge_dim": 5
+    }
   },
 
   "loss": {
@@ -170,8 +182,8 @@
   },
 
   "train": {
-    "precomp_cache_path": "./cache/first_simulation/64by64-coarse/all/max_level_4/3-cell-halo/shock_ramp_precomp_per-level-weights_3-cell-halo_faceAdj.h5",
-    "precomp_force_recompute": true,
+    "precomp_cache_path": "./cache/first_simulation/64by64-coarse/all/max_level_4/3-cell-halo/shock_ramp_precomp_64x64_L4_per-level-weights_3-cell-halo_faceAdj.h5",
+    "precomp_force_recompute": false,
     "precompute_t_start": null,
     "precompute_t_end": null,
     "_comment_precompute_t_range": "Optional inclusive raw-snapshot range [start,end] used before windowing/precompute/training. Need at least 2 snapshots (e.g., 50..51 for one transition).",

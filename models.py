@@ -2,10 +2,101 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import time
+import math
 from torch_geometric.nn import GATConv, GraphUNet
 from torch_geometric.nn import SAGEConv, GINEConv, NNConv
+from torch_geometric.utils import softmax as pyg_softmax
+try:
+    from torch_geometric.utils import scatter as pyg_scatter
+except Exception:
+    from torch_scatter import scatter as pyg_scatter
 import inspect
 from typing import Any, Dict
+
+
+class LocalEdgeAttention(nn.Module):
+    """
+    Local (edge-index constrained) multi-head attention with optional edge-feature bias.
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        *,
+        heads: int = 4,
+        dropout: float = 0.0,
+        edge_dim: int | None = 5,
+        use_edge_attr: bool = True,
+        concat: bool = False,
+    ):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.heads = int(heads)
+        self.dropout = float(dropout)
+        self.concat = bool(concat)
+        self.use_edge_attr = bool(use_edge_attr)
+
+        if self.heads <= 0:
+            raise ValueError(f"LocalEdgeAttention heads must be > 0, got {heads}.")
+        if self.out_channels <= 0:
+            raise ValueError(f"LocalEdgeAttention out_channels must be > 0, got {out_channels}.")
+
+        hdim = self.heads * self.out_channels
+        self.q_proj = nn.Linear(self.in_channels, hdim, bias=False)
+        self.k_proj = nn.Linear(self.in_channels, hdim, bias=False)
+        self.v_proj = nn.Linear(self.in_channels, hdim, bias=False)
+
+        if self.use_edge_attr:
+            if edge_dim is None:
+                # Infer at first forward if caller does not want to hard-code edge dim.
+                self.edge_proj = nn.LazyLinear(self.heads, bias=False)
+            else:
+                self.edge_proj = nn.Linear(int(edge_dim), self.heads, bias=False)
+        else:
+            self.edge_proj = None
+
+        out_in = hdim if self.concat else self.out_channels
+        self.out_proj = nn.Linear(out_in, self.out_channels, bias=True)
+        self.score_scale = 1.0 / math.sqrt(float(self.out_channels))
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor | None = None) -> torch.Tensor:
+        if x.ndim != 2:
+            raise ValueError(f"LocalEdgeAttention expects x with shape [N,F], got {tuple(x.shape)}.")
+        if edge_index.ndim != 2 or edge_index.size(0) != 2:
+            raise ValueError(
+                f"LocalEdgeAttention expects edge_index with shape [2,E], got {tuple(edge_index.shape)}."
+            )
+
+        n_nodes = int(x.size(0))
+        src = edge_index[0].long()
+        dst = edge_index[1].long()
+
+        q = self.q_proj(x).view(n_nodes, self.heads, self.out_channels)
+        k = self.k_proj(x).view(n_nodes, self.heads, self.out_channels)
+        v = self.v_proj(x).view(n_nodes, self.heads, self.out_channels)
+
+        score = (q[dst] * k[src]).sum(dim=-1) * self.score_scale
+
+        if self.use_edge_attr:
+            if edge_attr is None:
+                raise RuntimeError(
+                    "LocalEdgeAttention is configured with use_edge_attr=True but edge_attr is None."
+                )
+            e = edge_attr.to(device=x.device, dtype=x.dtype)
+            score = score + self.edge_proj(e)
+
+        alpha = pyg_softmax(score, dst, num_nodes=n_nodes)
+        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+
+        msg = v[src] * alpha.unsqueeze(-1)  # [E,H,D]
+        out = pyg_scatter(msg, dst, dim=0, dim_size=n_nodes, reduce="sum")  # [N,H,D]
+
+        if self.concat:
+            out = out.reshape(n_nodes, self.heads * self.out_channels)
+        else:
+            out = out.mean(dim=1)
+        return self.out_proj(out)
 
 
 class FeatureNet(nn.Module):
@@ -28,6 +119,12 @@ class FeatureNet(nn.Module):
         skip_type: str = "block",
         use_layernorm: bool = False,
         layernorm_eps: float = 1e-6,
+        use_attention: bool = False,
+        attention_heads: int = 4,
+        attention_dropout: float = 0.0,
+        attention_edge_dim: int | None = 5,
+        attention_use_edge_attr: bool = True,
+        attention_replace_last: bool = True,
     ):
         super().__init__()
         self.dropout = dropout
@@ -49,34 +146,61 @@ class FeatureNet(nn.Module):
             )
         self.use_layernorm = bool(use_layernorm)
         self.layernorm_eps = float(layernorm_eps)
+        self.use_attention = bool(use_attention)
+        self.attention_heads = int(attention_heads)
+        self.attention_dropout = float(attention_dropout)
+        self.attention_edge_dim = attention_edge_dim
+        self.attention_use_edge_attr = bool(attention_use_edge_attr)
+        self.attention_replace_last = bool(attention_replace_last)
 
         dims = [in_channels] + [hidden] * (layers - 1)
         self.convs = nn.ModuleList()
+        self.layer_types = []
         self.block_skip_proj = nn.ModuleList()
         self.block_norms = nn.ModuleList()
         for i in range(len(dims) - 1):
             in_ch = int(dims[i])
             out_ch = int(dims[i + 1])
-            if self.conv_type == "sage":
-                self.convs.append(SAGEConv(in_ch, out_ch))
-            elif self.conv_type == "gine":
-                if self.edge_dim is None:
-                    raise ValueError("FeatureNet conv_type='gine' requires edge_dim in config.")
-                mlp = nn.Sequential(
-                    nn.Linear(in_ch, out_ch),
-                    nn.ReLU(),
-                    nn.Linear(out_ch, out_ch),
+            replace_this_layer = (
+                self.use_attention
+                and self.attention_replace_last
+                and (i == (len(dims) - 2))
+            )
+            if replace_this_layer:
+                self.convs.append(
+                    LocalEdgeAttention(
+                        in_channels=in_ch,
+                        out_channels=out_ch,
+                        heads=self.attention_heads,
+                        dropout=self.attention_dropout,
+                        edge_dim=self.attention_edge_dim,
+                        use_edge_attr=self.attention_use_edge_attr,
+                        concat=False,
+                    )
                 )
-                self.convs.append(GINEConv(mlp, edge_dim=self.edge_dim))
-            else:  # nnconv
-                if self.edge_dim is None:
-                    raise ValueError("FeatureNet conv_type='nnconv' requires edge_dim in config.")
-                edge_net = nn.Sequential(
-                    nn.Linear(self.edge_dim, int(nnconv_hidden)),
-                    nn.ReLU(),
-                    nn.Linear(int(nnconv_hidden), in_ch * out_ch),
-                )
-                self.convs.append(NNConv(in_ch, out_ch, nn=edge_net, aggr="mean"))
+                self.layer_types.append("attention")
+            else:
+                if self.conv_type == "sage":
+                    self.convs.append(SAGEConv(in_ch, out_ch))
+                elif self.conv_type == "gine":
+                    if self.edge_dim is None:
+                        raise ValueError("FeatureNet conv_type='gine' requires edge_dim in config.")
+                    mlp = nn.Sequential(
+                        nn.Linear(in_ch, out_ch),
+                        nn.ReLU(),
+                        nn.Linear(out_ch, out_ch),
+                    )
+                    self.convs.append(GINEConv(mlp, edge_dim=self.edge_dim))
+                else:  # nnconv
+                    if self.edge_dim is None:
+                        raise ValueError("FeatureNet conv_type='nnconv' requires edge_dim in config.")
+                    edge_net = nn.Sequential(
+                        nn.Linear(self.edge_dim, int(nnconv_hidden)),
+                        nn.ReLU(),
+                        nn.Linear(int(nnconv_hidden), in_ch * out_ch),
+                    )
+                    self.convs.append(NNConv(in_ch, out_ch, nn=edge_net, aggr="mean"))
+                self.layer_types.append("conv")
 
             if self.skip_type in {"block", "both"}:
                 if in_ch == out_ch:
@@ -132,15 +256,22 @@ class FeatureNet(nn.Module):
                 f"dtype={X.dtype} dev={X.device} edge_index={ei_shape} "
                 f"edge_attr={ea_shape} conv_type={self.conv_type} "
                 f"use_skip={self.use_skip} skip_type={self.skip_type} "
-                f"use_layernorm={self.use_layernorm}",
+                f"use_layernorm={self.use_layernorm} "
+                f"use_attention={self.use_attention} "
+                f"attention_replace_last={self.attention_replace_last} "
+                f"attention_heads={self.attention_heads}",
                 flush=True,
             )
 
         edge_attr_use = None
-        if self.conv_type != "sage":
+        need_edge_attr_base = (self.conv_type != "sage")
+        need_edge_attr_attn = bool(self.use_attention and self.attention_use_edge_attr)
+        if need_edge_attr_base or need_edge_attr_attn:
             if edge_attr is None:
                 raise RuntimeError(
-                    f"FeatureNet conv_type='{self.conv_type}' requires edge_attr, but got None."
+                    "FeatureNet requires edge_attr for this configuration "
+                    f"(conv_type={self.conv_type}, use_attention={self.use_attention}, "
+                    f"attention_use_edge_attr={self.attention_use_edge_attr}) but got None."
                 )
             edge_attr_use = edge_attr.to(device=h.device, dtype=h.dtype)
 
@@ -149,10 +280,13 @@ class FeatureNet(nn.Module):
             t0 = time.perf_counter() if hang_dbg_once else None
             if hang_dbg_once:
                 print(f"[HANG-DBG] FeatureNet conv[{li}] begin", flush=True)
-            if self.conv_type == "sage":
-                h = conv(h, edge_index)
+            if self.layer_types[li] == "attention":
+                h = conv(h, edge_index, edge_attr=edge_attr_use)
             else:
-                h = conv(h, edge_index, edge_attr_use)
+                if self.conv_type == "sage":
+                    h = conv(h, edge_index)
+                else:
+                    h = conv(h, edge_index, edge_attr_use)
 
             if self.skip_type in {"block", "both"}:
                 h = h + self.block_skip_proj[li](h_res)

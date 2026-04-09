@@ -8200,6 +8200,21 @@ def build_model_from_cfg(cfg, device):
     conv_type = str(model_cfg.get("conv_type", "sage")).strip().lower()
     edge_dim = int(model_cfg.get("edge_dim", 5)) if conv_type in ("gine", "nnconv") else None
     nnconv_hidden = int(model_cfg.get("nnconv_hidden", model_cfg.get("hidden", 128)))
+    att_cfg = model_cfg.get("attention", {}) or {}
+    use_attention = bool(model_cfg.get("use_attention", att_cfg.get("enabled", False)))
+    attention_heads = int(model_cfg.get("attention_heads", att_cfg.get("heads", 4)))
+    attention_dropout = float(model_cfg.get("attention_dropout", att_cfg.get("dropout", 0.0)))
+    attention_replace_last = bool(
+        model_cfg.get("attention_replace_last", att_cfg.get("replace_last_layer", True))
+    )
+    attention_use_edge_attr = bool(
+        model_cfg.get("attention_use_edge_attr", att_cfg.get("use_edge_attr", True))
+    )
+    attention_edge_dim = model_cfg.get(
+        "attention_edge_dim",
+        att_cfg.get("edge_dim", model_cfg.get("edge_dim", 5)),
+    )
+    attention_edge_dim = None if attention_edge_dim is None else int(attention_edge_dim)
 
     model = FeatureNet(
         in_channels=in_ch,
@@ -8215,6 +8230,12 @@ def build_model_from_cfg(cfg, device):
         skip_type=str(model_cfg.get("skip_type", "block")),
         use_layernorm=bool(model_cfg.get("use_layernorm", False)),
         layernorm_eps=float(model_cfg.get("layernorm_eps", 1e-6)),
+        use_attention=use_attention,
+        attention_heads=attention_heads,
+        attention_dropout=attention_dropout,
+        attention_edge_dim=attention_edge_dim,
+        attention_use_edge_attr=attention_use_edge_attr,
+        attention_replace_last=attention_replace_last,
     ).to(device)
 
     # -------------------------
@@ -8243,7 +8264,11 @@ def build_model_from_cfg(cfg, device):
 
 # ------------------------------ Main ------------------------------
 
-def main(config_path: str | None = None, out_dir: str | None = None):
+def main(
+    config_path: str | None = None,
+    out_dir: str | None = None,
+    resume_from: str | None = None,
+):
     # -------- load & normalize config --------
     if config_path is None:
         config_path = os.path.join(os.path.dirname(__file__), "config_feature_first.json")
@@ -8552,6 +8577,56 @@ def main(config_path: str | None = None, out_dir: str | None = None):
             #verbose=bool(sch_cfg.get("verbose", True)),
         )
 
+    resume_ckpt = None
+    resume_epoch = 0
+    resume_norm_stats = None
+    resume_active = False
+    resume_path = None
+    if resume_from is not None and str(resume_from).strip() != "":
+        resume_active = True
+        resume_raw = str(resume_from).strip()
+        if resume_raw.lower() in ("auto", "last"):
+            resume_path = os.path.join(cfg["train"]["save_dir"], "last_model.pt")
+        else:
+            resume_path = os.path.abspath(os.path.expanduser(resume_raw))
+        if not os.path.exists(resume_path):
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+
+        print(f"[RESUME] Loading checkpoint: {resume_path}")
+        resume_ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        if isinstance(resume_ckpt, dict) and ("model" in resume_ckpt):
+            model.load_state_dict(resume_ckpt["model"], strict=True)
+            resume_epoch = int(resume_ckpt.get("epoch", 0))
+
+            opt_state = resume_ckpt.get("optimizer", None)
+            if isinstance(opt_state, dict):
+                try:
+                    opt.load_state_dict(opt_state)
+                    print("[RESUME] Restored optimizer state.")
+                except Exception as e:
+                    print(f"[RESUME][WARN] Could not restore optimizer state: {e!r}")
+
+            sch_state = resume_ckpt.get("scheduler", None)
+            if (scheduler is not None) and isinstance(sch_state, dict):
+                try:
+                    scheduler.load_state_dict(sch_state)
+                    print("[RESUME] Restored scheduler state.")
+                except Exception as e:
+                    print(f"[RESUME][WARN] Could not restore scheduler state: {e!r}")
+
+            ns = resume_ckpt.get("norm_stats", None)
+            if isinstance(ns, dict):
+                resume_norm_stats = ns
+            print(f"[RESUME] Loaded model at epoch={resume_epoch}.")
+        elif isinstance(resume_ckpt, dict):
+            # fallback: plain state_dict checkpoint
+            model.load_state_dict(resume_ckpt, strict=True)
+            print("[RESUME][WARN] Checkpoint has no training-state payload; restored model weights only.")
+        else:
+            raise RuntimeError(
+                f"Unsupported resume checkpoint payload type: {type(resume_ckpt)}"
+            )
+
     # Load the raw list[Data] and let the dataset preprocess ONCE in memory:
     #raw_series = torch.load(raw_path, map_location="cpu")  # list of Data (one per timestep)
 
@@ -8783,6 +8858,24 @@ def main(config_path: str | None = None, out_dir: str | None = None):
     do_norm = bool(feats_cfg.get("normalize", True))
     #mu, sigma = _as_mu_sigma(cfg, device)
     mu = sigma = None
+    if do_norm and isinstance(resume_norm_stats, dict):
+        mu_raw = resume_norm_stats.get("mu", None)
+        sigma_raw = resume_norm_stats.get("sigma", None)
+        if (mu_raw is not None) and (sigma_raw is not None):
+            try:
+                mu = torch.as_tensor(mu_raw, dtype=torch.float32, device=device).view(-1)
+                sigma = torch.as_tensor(sigma_raw, dtype=torch.float32, device=device).view(-1)
+                if mu.numel() != sigma.numel():
+                    raise ValueError(
+                        f"mu/sigma length mismatch ({mu.numel()} vs {sigma.numel()})"
+                    )
+                print(f"[RESUME] Reusing normalization stats from checkpoint (F={mu.numel()}).")
+            except Exception as e:
+                print(
+                    "[RESUME][WARN] Could not use checkpoint norm_stats; will recompute from train loader: "
+                    f"{e!r}"
+                )
+                mu = sigma = None
 
     if do_norm and (mu is None or sigma is None):
         # compute from training loader on CPU/GPU (device already set)
@@ -8885,6 +8978,28 @@ def main(config_path: str | None = None, out_dir: str | None = None):
     diag_log_fields = _diagnostics_csv_fields(diag_cfg_main)
     log_fields = ["epoch", "split", "loss", "mae", *diag_log_fields]
 
+    def _best_val_from_existing_log(path: str) -> float | None:
+        if not os.path.exists(path):
+            return None
+        best = None
+        try:
+            with open(path, "r", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if str(row.get("split", "")).strip().lower() != "val":
+                        continue
+                    raw = row.get("loss", None)
+                    if raw in (None, ""):
+                        continue
+                    v = float(raw)
+                    if not np.isfinite(v):
+                        continue
+                    best = v if (best is None or v < best) else best
+        except Exception as e:
+            print(f"[RESUME][WARN] Could not parse existing log for best val: {e!r}")
+            return None
+        return best
+
     def _log_row(
         *,
         epoch: int,
@@ -8907,9 +9022,18 @@ def main(config_path: str | None = None, out_dir: str | None = None):
                     row[key] = float(stats[key])
         return row
 
-    with open(log_csv, "w", newline="") as f:
+    log_exists = os.path.exists(log_csv)
+    if resume_active and log_exists:
+        log_mode = "a"
+        write_header = (os.path.getsize(log_csv) == 0)
+        print(f"[RESUME] Appending logs to existing file: {log_csv}")
+    else:
+        log_mode = "w"
+        write_header = True
+    with open(log_csv, log_mode, newline="") as f:
         writer = csv.DictWriter(f, fieldnames=log_fields)
-        writer.writeheader()
+        if write_header:
+            writer.writeheader()
 
     print("[INFO] Starting training...")
     total_epochs = int(cfg["train"]["epochs"])
@@ -8918,9 +9042,27 @@ def main(config_path: str | None = None, out_dir: str | None = None):
         raise ValueError("train.validation_every_epochs must be >= 1.")
     print(f"[INFO] Validation cadence: every {val_every} epoch(s) + final epoch.")
 
-    best_val = float("inf")
+    start_epoch = int(resume_epoch) + 1 if resume_active else 1
+    if start_epoch < 1:
+        start_epoch = 1
+    if start_epoch > total_epochs:
+        print(
+            f"[RESUME][WARN] start_epoch={start_epoch} is beyond total_epochs={total_epochs}. "
+            "Skipping training loop and running final evaluation only."
+        )
+    if resume_active:
+        prior_best = _best_val_from_existing_log(log_csv)
+        best_val = float(prior_best) if prior_best is not None else float("inf")
+        if prior_best is not None:
+            print(f"[RESUME] Continuing with best prior val loss={best_val:.6f}.")
+        else:
+            print("[RESUME] No prior val history found; best-model tracking restarts from +inf.")
+    else:
+        best_val = float("inf")
+
     TR, VL = [], []
-    for epoch in range(1, total_epochs + 1):
+    last_completed_epoch = int(resume_epoch) if resume_active else 0
+    for epoch in range(start_epoch, total_epochs + 1):
         t0 = time.time()
         #batch = next(iter(train_loader))
 
@@ -9001,16 +9143,22 @@ def main(config_path: str | None = None, out_dir: str | None = None):
         if do_periodic_ckpt:
             torch.save(_build_last_checkpoint_payload(epoch), last_ckpt_path)
             print(f"[INFO] Saved last checkpoint at epoch {epoch:03d}: {last_ckpt_path}")
+        last_completed_epoch = int(epoch)
 
     # Always write final last-model checkpoint when training loop completes.
-    torch.save(_build_last_checkpoint_payload(total_epochs), last_ckpt_path)
-    print(f"[INFO] Saved final last checkpoint at epoch {total_epochs:03d}: {last_ckpt_path}")
-
-    plot_loss_curves(
-        os.path.join(save_dir, "loss_curves.png"),
-        list(range(1, len(TR) + 1)),
-        TR, VL
+    torch.save(_build_last_checkpoint_payload(last_completed_epoch), last_ckpt_path)
+    print(
+        f"[INFO] Saved final last checkpoint at epoch {last_completed_epoch:03d}: {last_ckpt_path}"
     )
+
+    if len(TR) > 0:
+        plot_loss_curves(
+            os.path.join(save_dir, "loss_curves.png"),
+            list(range(start_epoch, start_epoch + len(TR))),
+            TR, VL
+        )
+    else:
+        print("[INFO] No training epochs were run in this invocation; skipping loss curve plot update.")
 
     # -------- final test evaluation --------
     print("test_loader length:", len(test_loader))
@@ -9055,6 +9203,15 @@ if __name__ == "__main__":
         default=None,
         help="Override cfg['train']['save_dir'] for this run.",
     )
+    ap.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help=(
+            "Optional checkpoint path to resume training state from (expects last_model.pt payload). "
+            "Use 'auto' to load <train.save_dir>/last_model.pt."
+        ),
+    )
     args = ap.parse_args()
     print("Running main...", flush=True)
-    main(args.config, args.out_dir)
+    main(args.config, args.out_dir, args.resume_from)

@@ -63,6 +63,8 @@ Example command for CNN policy rollout:
         --runtime-mesh-cnn-ckpt ./runs_mesh_policy_cnn/without_parent_masks/unet_hierarchical/500ep_lr-scheduler_3-6-26/mesh_policy_cnn_best.pt \
         --runtime-mesh-spec-path utils/wedge_mesh_spec.pt
 
+    NOTE: May need to use --runtime-idw-backend exact if faiss_ivf or faiss_flat used during training
+
 ============ OTHER OPTIONS ============
 To make to 2 x 1 plot (showing just pred(t+1) and GT(t+1) without deltas), add:
         --truth-mode
