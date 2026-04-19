@@ -6,7 +6,7 @@
     "pt_path": "/Users/trevorreed/UVA_postdoc_stuff/gparc/data/shock_ramp/shock_ramp_amr.pt",
     "H": 64,
     "W": 64,
-    "L_max": 4,
+    "L_max": 3,
     "bbox": [
       0.0,
       1.0,
@@ -19,14 +19,14 @@
   },
 
   "mesh": {
-    "starting_mesh_path": "./utils/wedge_mesh_spec_64x64_L4.pt"
+    "starting_mesh_path": "./utils/wedge_mesh_spec.pt"
   },
 
   "policy": {
-    "geometry_mode": "gt_gradients",
+    "geometry_mode": "starting_refine",
     "_comment_geometry_mode": "gt_gradients or starting_refine for uniform mesh",
     "starting_refine_policy": "min_level",
-    "starting_refine_to_level": 4,
+    "starting_refine_to_level": 3,
     "refine_ratio": 2,
     "dilate_cells_lmax": 3.0,
     "hysteresis_mode": "percentile",
@@ -35,7 +35,7 @@
     "percentile_low": 85.0,
     "percentile_high": 95.0,
     "percentiles_by_level": {
-      "selection": "per_level",
+      "selection": "global",
       "_comment_selection": "global or per_level (or auto)",
       "1": {
         "low": 84.0,
@@ -61,7 +61,7 @@
       2,
       3
     ],
-    "max_level": 4,
+    "max_level": 3,
     "tau_low": 1.0,
     "tau_high": 1.0
   },
@@ -81,7 +81,7 @@
     ],
     "normalize": true,
     "normalization": {
-      "momentum_sigma_mode": "shared_rms",
+      "momentum_sigma_mode": "independent",
       "_comment_momentum_sigma_mode": "independent (per-channel std) or shared_rms (tie x/y momentum sigmas by RMS)."
     },
     "build": {
@@ -101,7 +101,7 @@
     "skip_type": "block",
     "use_layernorm": true,
     "layernorm_eps": 1e-6,
-    "use_attention": false,
+    "use_attention": true,
     "attention": {
       "replace_last_layer": true,
       "heads": 4,
@@ -182,8 +182,8 @@
   },
 
   "train": {
-    "precomp_cache_path": "./cache/first_simulation/64by64-coarse/all/max_level_4/3-cell-halo/shock_ramp_precomp_64x64_L4_per-level-weights_3-cell-halo_faceAdj.h5",
-    "precomp_force_recompute": false,
+    "precomp_cache_path": "./cache/L3_uniform/64by64-coarse/shock_ramp_precomp_L3_uniform_faceAdj_DEC.h5",
+    "precomp_force_recompute": true,
     "precompute_t_start": null,
     "precompute_t_end": null,
     "_comment_precompute_t_range": "Optional inclusive raw-snapshot range [start,end] used before windowing/precompute/training. Need at least 2 snapshots (e.g., 50..51 for one transition).",
@@ -191,8 +191,8 @@
     "mesh_mode": "predicted",
     "_comment_mesh_mode": "predicted or uniform",
     "runtime_mesh": {
-      "enabled": false,
-      "domain_mode": "starting_mesh",
+      "enabled": true,
+      "domain_mode": "wedge_lookup",
       "_comment_domain_mode": "starting_mesh resets to starting mesh every step for runtime CNN parity with training target semantics.",
       "warm_start_from_precompute": false,
       "update_every_steps": 1,
@@ -200,9 +200,9 @@
       "reset_to_coarse_each_step": true,
       "refine_only": true,
       "max_cells_per_step": 500000,
-      "policy_backend": "cnn",
+      "policy_backend": "gradient",
       "cnn": {
-        "checkpoint_path": "./runs_mesh_policy_cnn/without_parent_masks/unet_hierarchical/500ep_lr-scheduler_predict-next-ts_3-29-26/mesh_policy_cnn_last.pt",
+        "checkpoint_path": "./runs_mesh_policy_cnn/without_parent_masks/unet_hierarchical/max_level_3/500ep_lr-scheduler_predict-next-ts_3-29-26/mesh_policy_cnn_last.pt",
         "include_parent_mask": false,
         "include_coords": true,
         "include_dt": true,
@@ -217,11 +217,29 @@
         "path": "./runs_mesh_first/runtime_step_log.csv",
         "append": false
       },
+      "mesh_plot": {
+        "enabled": false,
+        "out_dir": "./runs_mesh_first/runtime_mesh_plots",
+        "split": "train",
+        "_comment_split": "train, eval, or both",
+        "every_rebuilds": 1,
+        "max_plots": 20,
+        "dpi": 180,
+        "line_width": 0.2,
+        "show_wedge": true
+      },
       "idw": {
-        "backend": "faiss_ivf",
+        "backend": "exact",
         "faiss_nlist": 256,
         "faiss_nprobe": 16,
         "allow_fallback_to_exact": false
+      },
+      "multires_gt_lookup": {
+      "enabled": true,
+      "directory": "./cache/first_simulation/64by64-coarse/uniform_mesh/",
+      "level_files": {},
+      "fallback_to_idw": true,
+      "max_cached_feature_steps": 16
       }
     },
 
@@ -240,9 +258,29 @@
     "time_integrator": "euler",
     "rk4_start_epoch": 10,
     "rk4_ramp_epochs": 5,
-    "uniform_H": 256,
-    "uniform_W": 256,
-    "save_dir": "./runs_mesh_first"
+    "save_dir": "./runs_mesh_first/"
+  },
+
+  "chunk": {
+    "enabled": false,
+    "num_chunks": 16,
+    "halo_hops": 2,
+    "partition_mode": "parent_grid",
+    "activity_threshold": 0.0,
+    "builder": {
+      "sidecar_path": "./cache/first_simulation/64by64-coarse/all/max_level_3/shock_ramp_precomp_pLow85_pHigh95_faceAdj_DEC_chunks.h5",
+      "_comment_sidecar_path": "If empty, writes <precomp_cache_path>_chunks.h5.",
+      "overwrite": false,
+      "progress": true,
+      "compute_activity": true,
+      "activity_feature_idx": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "max_timesteps": null
+    }
   },
 
   "scheduler": {
@@ -258,9 +296,9 @@
   },
 
   "split": {
-    "train": 0.05,
+    "train": 0.85,
     "val": 0.1,
-    "test": 0.85
+    "test": 0.05
   },
 
   "edges": {
@@ -326,6 +364,12 @@
     "parc_scale_watch": false,
     "print_norm_sanity_once": false,
     "teacher_force_ops": false,
+    "print_chunk_stats": false,
+    "_comment_print_chunk_stats": "When true and chunk.enabled=true, print per-step chunk coverage and size stats.",
+    "chunk_stats_every_steps": 2,
+    "_comment_chunk_stats_every_steps": "Only print chunk stats every N rollout steps (per window).",
+    "chunk_stats_include_rk4": false,
+    "_comment_chunk_stats_include_rk4": "When true, include RK4 internal stage forwards in chunk stats logging.",
     "hang_watch_batches": 1,
     "print_batch_time": true,
     "progress_every_batches": 1,

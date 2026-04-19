@@ -2581,6 +2581,7 @@ def precompute_pred_mesh_and_interps_for_rollout(
     progress: bool = True,
     cache_path: str | None = None,
     force_recompute: bool = False,
+    require_existing_cache_when_not_forced: bool = False,
 ):
     """
     Streaming precompute to ONE HDF5 file (no in-memory accumulation).
@@ -2906,14 +2907,21 @@ def precompute_pred_mesh_and_interps_for_rollout(
     loss_cfg = cfg.get("loss", {}) or {}
     want_mls = (str(loss_cfg.get("physics_backend", "")).lower() == "mls")
 
-    if (not force_recompute) and precomp_h5_is_usable(
-            cache_path, cfg,
-            expected_steps=T, H=H, W=W,
+    cache_usable = False
+    if not force_recompute:
+        cache_usable = precomp_h5_is_usable(
+            cache_path,
+            cfg,
+            expected_steps=T,
+            H=H,
+            W=W,
             require_dec=True,
             require_pred2pred=True,
-            require_mls=want_mls,     # <--- ADD
-            verbose=True
-        ):
+            require_mls=want_mls,
+            verbose=True,
+        )
+
+    if cache_usable:
         print(f"[PRECOMP] Using existing H5 cache: {cache_path}")
 
         if cfg.get("debug", {}).get("print_dec_checks", False):
@@ -2945,6 +2953,17 @@ def precompute_pred_mesh_and_interps_for_rollout(
             "dy": float(dy),
             "bbox": cfg["data"]["bbox"],
         }
+
+    if (not force_recompute) and bool(require_existing_cache_when_not_forced):
+        if not os.path.exists(cache_path):
+            reason = "cache file does not exist"
+        else:
+            reason = "cache exists but failed compatibility/consistency checks"
+        raise RuntimeError(
+            "precomp_force_recompute=false requires an existing valid precompute cache, "
+            f"but '{cache_path}' was rejected ({reason}). "
+            "Set train.precomp_force_recompute=true to rebuild the cache."
+        )
 
     print("[PRECOMP] No valid cache found; computing precomputed meshes + interps...")
 
@@ -3441,6 +3460,7 @@ def precompute_uniform_mesh_in_memory(
     progress: bool = True,
     cache_path: str | None = None,
     force_recompute: bool = False,
+    require_existing_cache_when_not_forced: bool = False,
 ) -> Dict[str, Any]:
     """
     Build one static (uniform-mode) predicted mesh and reuse it for all timesteps.
@@ -3613,7 +3633,11 @@ def precompute_uniform_mesh_in_memory(
             print(f"[PRECOMP][UNIFORM] reject cache: unreadable meta/signature ({e})")
             return False
 
-    if cache_path is not None and (not force_recompute) and _uniform_h5_usable(cache_path):
+    cache_usable = False
+    if (cache_path is not None) and (not force_recompute):
+        cache_usable = _uniform_h5_usable(cache_path)
+
+    if cache_usable:
         print(f"[PRECOMP][UNIFORM] Using existing H5 cache: {cache_path}")
         return {
             "type": "h5",
@@ -3625,6 +3649,19 @@ def precompute_uniform_mesh_in_memory(
             "dy": float(dy),
             "bbox": cfg["data"]["bbox"],
         }
+
+    if (not force_recompute) and bool(require_existing_cache_when_not_forced):
+        if cache_path is None:
+            reason = "cache_path was not provided"
+        elif not os.path.exists(cache_path):
+            reason = "cache file does not exist"
+        else:
+            reason = "cache exists but failed compatibility/consistency checks"
+        raise RuntimeError(
+            "precomp_force_recompute=false requires an existing valid uniform precompute cache, "
+            f"but '{cache_path}' was rejected ({reason}). "
+            "Set train.precomp_force_recompute=true to rebuild the cache."
+        )
 
     def _refine_cells_one_level(
         centers: torch.Tensor,

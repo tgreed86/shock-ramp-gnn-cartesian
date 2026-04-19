@@ -20,7 +20,8 @@ Also produces qualitative PDFs of feature fields per sample using
 from __future__ import annotations
 print("[train.py] module import started", flush=True)
 from typing import Dict, Any, List, Tuple, Optional, Sequence
-import os, io, json, time, zipfile, random, sys, csv, datetime, hashlib
+from collections import OrderedDict
+import os, io, json, time, zipfile, random, sys, csv, datetime, hashlib, re
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler, Subset
@@ -52,9 +53,15 @@ from pretrain import (
 )
 
 from utils.precomp_h5 import LazyPrecompH5
+from utils.chunk_sidecar import ChunkSidecarH5, derive_sidecar_path
 import utils.dec_ops as dec
 #from utils.mls import SolveGradientsLST, SolveWeightLST2d, apply_laplacian
 import utils.mls as mls
+
+try:
+    import h5py
+except Exception:
+    h5py = None
 
 
 
@@ -1220,6 +1227,142 @@ def _coarse_grad_mag(field_coarse: torch.Tensor, H: int, W: int, dx: float, dy: 
     return g
 
 
+def _canonical_gradient_norm_mode(raw: str) -> str:
+    s = str(raw).strip().lower()
+    if s in ("none", "off", "false", "0", ""):
+        return "none"
+    if s in ("log1p", "log", "log1p_only"):
+        return "log1p"
+    if s in ("zscore", "standardize", "standardise", "std"):
+        return "zscore"
+    if s in ("log1p_zscore", "log1p-zscore", "log+zscore", "log_zscore"):
+        return "log1p_zscore"
+    raise ValueError(
+        f"Unknown runtime CNN gradient_norm_mode: {raw!r}. "
+        "Expected one of: auto, none, log1p, zscore, log1p_zscore"
+    )
+
+
+def _canonical_feature_norm_mode(raw: str) -> str:
+    s = str(raw).strip().lower()
+    if s in ("none", "off", "false", "0", ""):
+        return "none"
+    if s in ("zscore", "standardize", "standardise", "std"):
+        return "zscore"
+    raise ValueError(
+        f"Unknown runtime CNN feature_norm_mode: {raw!r}. "
+        "Expected one of: auto, none, zscore"
+    )
+
+
+def _feature_norm_requires_stats(mode: str) -> bool:
+    return _canonical_feature_norm_mode(mode) in ("zscore",)
+
+
+def _parse_feature_norm_stats(
+    raw,
+    *,
+    n_channels: int | None = None,
+) -> Dict[str, List[float]] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    if "mean" not in raw or "std" not in raw:
+        return None
+    mean_raw = raw["mean"]
+    std_raw = raw["std"]
+    if not isinstance(mean_raw, (list, tuple)) or not isinstance(std_raw, (list, tuple)):
+        return None
+    if len(mean_raw) != len(std_raw):
+        return None
+    if n_channels is not None and len(mean_raw) != int(n_channels):
+        return None
+    mean_out: List[float] = []
+    std_out: List[float] = []
+    for m, s in zip(mean_raw, std_raw):
+        mf = float(m)
+        sf = float(s)
+        if (not math.isfinite(mf)) or (not math.isfinite(sf)):
+            return None
+        mean_out.append(mf)
+        std_out.append(max(sf, 1e-8))
+    return {"mean": mean_out, "std": std_out}
+
+
+def _apply_feature_norm_chw(
+    x_chw: torch.Tensor,
+    *,
+    mode: str,
+    stats: Dict[str, List[float]] | None,
+    require_stats: bool,
+) -> torch.Tensor:
+    m = _canonical_feature_norm_mode(mode)
+    x = torch.as_tensor(x_chw, dtype=torch.float32)
+    if m != "zscore":
+        return x.contiguous()
+
+    parsed = _parse_feature_norm_stats(stats, n_channels=int(x.shape[0]))
+    if parsed is None:
+        if require_stats:
+            raise RuntimeError(
+                "runtime CNN feature_norm_mode='zscore' requires feature_norm_stats "
+                f"with per-channel mean/std (n_channels={int(x.shape[0])})."
+            )
+        return x.contiguous()
+
+    mean_t = torch.as_tensor(parsed["mean"], dtype=torch.float32, device=x.device).view(-1, 1, 1)
+    std_t = torch.as_tensor(parsed["std"], dtype=torch.float32, device=x.device).view(-1, 1, 1)
+    return ((x - mean_t) / std_t).contiguous()
+
+
+def _gradient_norm_requires_stats(mode: str) -> bool:
+    return _canonical_gradient_norm_mode(mode) in ("zscore", "log1p_zscore")
+
+
+def _parse_gradient_norm_stats(raw) -> Dict[str, Dict[str, float]] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    out: Dict[str, Dict[str, float]] = {}
+    for key in ("rho", "E"):
+        node = raw.get(key, None)
+        if not isinstance(node, dict):
+            return None
+        if "mean" not in node or "std" not in node:
+            return None
+        mean_v = float(node["mean"])
+        std_v = float(node["std"])
+        if (not math.isfinite(mean_v)) or (not math.isfinite(std_v)):
+            return None
+        out[key] = {"mean": float(mean_v), "std": float(max(std_v, 1e-8))}
+    return out
+
+
+def _apply_gradient_norm_flat(
+    g_flat: torch.Tensor,
+    *,
+    mode: str,
+    mean: float | None,
+    std: float | None,
+    require_stats: bool,
+) -> torch.Tensor:
+    m = _canonical_gradient_norm_mode(mode)
+    x = torch.as_tensor(g_flat, dtype=torch.float32)
+    if m in ("log1p", "log1p_zscore"):
+        x = torch.log1p(x.clamp_min(0.0))
+    if m in ("zscore", "log1p_zscore"):
+        if mean is None or std is None:
+            if require_stats:
+                raise RuntimeError(
+                    f"runtime CNN gradient_norm_mode={m!r} requires stats, but none were provided."
+                )
+            return x
+        x = (x - float(mean)) / max(float(std), 1e-8)
+    return x
+
+
 def _resolve_channel_indices(cfg: Dict[str,Any]) -> List[int]:
     chmap = cfg.get("channels", {})
     names = cfg.get("policy", {}).get("refine_channels") or cfg.get("features", {}).get("supervised")
@@ -1785,6 +1928,193 @@ def _runtime_step_log_write_summary(csv_path: str, summary_path: str) -> None:
                     f"  {m}: n={n} mean={mean:.6g} min={vmin:.6g} max={vmax:.6g} p95={p95:.6g}\n"
                 )
             f.write("\n")
+
+
+def _runtime_mesh_plot_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    rt_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
+    plot_cfg = rt_cfg.get("mesh_plot", {}) or {}
+    out_default = os.path.join(cfg.get("train", {}).get("save_dir", "."), "runtime_mesh_plots")
+    split_raw = str(plot_cfg.get("split", "train")).strip().lower()
+    if split_raw in ("all",):
+        split_raw = "both"
+    if split_raw not in ("train", "eval", "both"):
+        raise ValueError(
+            "train.runtime_mesh.mesh_plot.split must be one of {train, eval, both}. "
+            f"Got: {split_raw!r}"
+        )
+    every_rebuilds = int(plot_cfg.get("every_rebuilds", 1))
+    if every_rebuilds < 1:
+        raise ValueError("train.runtime_mesh.mesh_plot.every_rebuilds must be >= 1.")
+    max_plots = int(plot_cfg.get("max_plots", 20))
+    if max_plots < 0:
+        raise ValueError("train.runtime_mesh.mesh_plot.max_plots must be >= 0.")
+    dpi = int(plot_cfg.get("dpi", 180))
+    if dpi < 32:
+        raise ValueError("train.runtime_mesh.mesh_plot.dpi must be >= 32.")
+    line_width = float(plot_cfg.get("line_width", 0.2))
+    if line_width <= 0.0:
+        raise ValueError("train.runtime_mesh.mesh_plot.line_width must be > 0.")
+    return {
+        "enabled": bool(plot_cfg.get("enabled", False)),
+        "out_dir": os.path.abspath(os.path.expanduser(str(plot_cfg.get("out_dir", out_default)))),
+        "split": split_raw,
+        "every_rebuilds": every_rebuilds,
+        "max_plots": max_plots,
+        "dpi": dpi,
+        "line_width": line_width,
+        "show_wedge": bool(plot_cfg.get("show_wedge", True)),
+    }
+
+
+def _runtime_mesh_plot_wants_split(settings: Dict[str, Any], split: str) -> bool:
+    target = str(settings.get("split", "train")).strip().lower()
+    s = str(split).strip().lower()
+    if target == "both":
+        return s in ("train", "eval")
+    return s == target
+
+
+def _save_runtime_pred_mesh_plot(
+    *,
+    out_path: str,
+    pred_centers: torch.Tensor,
+    pred_levels: torch.Tensor,
+    H: int,
+    W: int,
+    bbox: Tuple[float, float, float, float],
+    refine_ratio: int,
+    title: str,
+    wedge_path=None,
+    show_wedge: bool = True,
+    dpi: int = 180,
+    line_width: float = 0.2,
+) -> None:
+    # Local import to avoid forcing matplotlib on non-plot runs.
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+
+    centers = pred_centers.detach().to("cpu", dtype=torch.float32).numpy()
+    levels = pred_levels.detach().view(-1).to("cpu", dtype=torch.int64).numpy()
+    if centers.ndim != 2 or centers.shape[1] != 2:
+        raise RuntimeError(f"pred_centers must be (N,2), got {centers.shape}")
+    if levels.ndim != 1 or levels.shape[0] != centers.shape[0]:
+        raise RuntimeError(f"pred_levels must be (N,), got levels={levels.shape} for centers={centers.shape}")
+    if centers.shape[0] == 0:
+        raise RuntimeError("Cannot plot empty predicted mesh.")
+
+    xmin, xmax, ymin, ymax = [float(v) for v in bbox]
+    rr = int(refine_ratio)
+    if rr < 2:
+        raise ValueError(f"refine_ratio must be >=2, got {rr}")
+    dx0 = (xmax - xmin) / float(W)
+    dy0 = (ymax - ymin) / float(H)
+
+    scale = np.power(float(rr), levels.astype(np.float32))
+    hx = (dx0 / scale) * 0.5
+    hy = (dy0 / scale) * 0.5
+    x = centers[:, 0]
+    y = centers[:, 1]
+    x0 = x - hx
+    x1 = x + hx
+    y0 = y - hy
+    y1 = y + hy
+
+    n = centers.shape[0]
+    segs = np.empty((n * 4, 2, 2), dtype=np.float32)
+    segs[0::4, 0, 0] = x0; segs[0::4, 0, 1] = y0
+    segs[0::4, 1, 0] = x1; segs[0::4, 1, 1] = y0
+    segs[1::4, 0, 0] = x0; segs[1::4, 0, 1] = y1
+    segs[1::4, 1, 0] = x1; segs[1::4, 1, 1] = y1
+    segs[2::4, 0, 0] = x0; segs[2::4, 0, 1] = y0
+    segs[2::4, 1, 0] = x0; segs[2::4, 1, 1] = y1
+    segs[3::4, 0, 0] = x1; segs[3::4, 0, 1] = y0
+    segs[3::4, 1, 0] = x1; segs[3::4, 1, 1] = y1
+
+    parent = os.path.dirname(out_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(11.0, 6.5), dpi=int(dpi))
+    lc = LineCollection(segs, linewidths=float(line_width), colors="k", alpha=0.92)
+    ax.add_collection(lc)
+    if show_wedge and (wedge_path is not None) and hasattr(wedge_path, "vertices"):
+        vv = np.asarray(wedge_path.vertices, dtype=np.float32)
+        if vv.ndim == 2 and vv.shape[1] == 2 and vv.shape[0] >= 2:
+            ax.plot(vv[:, 0], vv[:, 1], color="tab:red", linewidth=1.2, alpha=0.95)
+    ax.set_xlim(float(xmin), float(xmax))
+    ax.set_ylim(float(ymin), float(ymax))
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title(str(title))
+    fig.savefig(out_path, dpi=int(dpi), bbox_inches="tight")
+    plt.close(fig)
+
+
+def _runtime_mesh_plot_maybe_save(
+    *,
+    settings: Dict[str, Any],
+    state: Dict[str, int],
+    split: str,
+    epoch_idx: int | None,
+    batch_idx: int,
+    step_k: int,
+    t_abs: int,
+    pred_centers: torch.Tensor,
+    pred_levels: torch.Tensor,
+    H: int,
+    W: int,
+    bbox: Tuple[float, float, float, float],
+    refine_ratio: int,
+    wedge_path=None,
+) -> None:
+    state["rebuilds"] = int(state.get("rebuilds", 0)) + 1
+    if not bool(settings.get("enabled", False)):
+        return
+    if not _runtime_mesh_plot_wants_split(settings, split):
+        return
+    every = int(settings.get("every_rebuilds", 1))
+    rebuild_idx = int(state["rebuilds"])
+    if ((rebuild_idx - 1) % every) != 0:
+        return
+    max_plots = int(settings.get("max_plots", 20))
+    saved_so_far = int(state.get("saved", 0))
+    if (max_plots > 0) and (saved_so_far >= max_plots):
+        return
+
+    uniq, cnt = torch.unique(pred_levels.detach().to("cpu", dtype=torch.long), return_counts=True)
+    lv_summary = ", ".join([f"L{int(u)}={int(c)}" for u, c in zip(uniq.tolist(), cnt.tolist())])
+    ep_str = f"{int(epoch_idx):04d}" if epoch_idx is not None else "na"
+    file_name = (
+        f"{str(split).lower()}_ep{ep_str}_b{int(batch_idx):05d}_k{int(step_k):03d}"
+        f"_t{int(t_abs):05d}_rb{int(rebuild_idx):05d}.png"
+    )
+    out_dir = str(settings.get("out_dir", "."))
+    out_path = os.path.join(out_dir, file_name)
+    title = (
+        f"runtime mesh | split={str(split).lower()} ep={ep_str} "
+        f"batch={int(batch_idx)} step={int(step_k)} t={int(t_abs)} "
+        f"N={int(pred_levels.numel())} ({lv_summary})"
+    )
+    _save_runtime_pred_mesh_plot(
+        out_path=out_path,
+        pred_centers=pred_centers,
+        pred_levels=pred_levels,
+        H=H,
+        W=W,
+        bbox=bbox,
+        refine_ratio=refine_ratio,
+        title=title,
+        wedge_path=wedge_path,
+        show_wedge=bool(settings.get("show_wedge", True)),
+        dpi=int(settings.get("dpi", 180)),
+        line_width=float(settings.get("line_width", 0.2)),
+    )
+    state["saved"] = saved_so_far + 1
+    print(
+        f"[RUNTIME-MESH][PLOT] saved {out_path}",
+        flush=True,
+    )
 
 
 def _resolve_diagnostics_cfg(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -2477,6 +2807,7 @@ def _cell_level_ij_from_centers(
     W: int,
     bbox: Tuple[float, float, float, float],
     refine_ratio: int,
+    index_mode: str = "round",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Recover integer (row, col) indices of each cell on its own level grid from centers.
@@ -2497,12 +2828,21 @@ def _cell_level_ij_from_centers(
     xs = max(float(xmax - xmin), 1e-12)
     ys = max(float(ymax - ymin), 1e-12)
 
-    # Inverse of center formula x = xmin + (i + 0.5) * xs / WW (same for y/HH).
-    col_f = ((centers[:, 0].to(torch.float32) - xmin) * ww_l / xs) - 0.5
-    row_f = ((centers[:, 1].to(torch.float32) - ymin) * hh_l / ys) - 0.5
-
-    col = torch.round(col_f).to(torch.long)
-    row = torch.round(row_f).to(torch.long)
+    mode = str(index_mode).strip().lower()
+    if mode == "round":
+        # Inverse of center formula x = xmin + (i + 0.5) * xs / WW (same for y/HH).
+        col_f = ((centers[:, 0].to(torch.float32) - xmin) * ww_l / xs) - 0.5
+        row_f = ((centers[:, 1].to(torch.float32) - ymin) * hh_l / ys) - 0.5
+        col = torch.round(col_f).to(torch.long)
+        row = torch.round(row_f).to(torch.long)
+    elif mode == "floor":
+        # More robust to tiny center jitters around half-cell offsets.
+        col_f = ((centers[:, 0].to(torch.float32) - xmin) * ww_l / xs)
+        row_f = ((centers[:, 1].to(torch.float32) - ymin) * hh_l / ys)
+        col = torch.floor(col_f).to(torch.long)
+        row = torch.floor(row_f).to(torch.long)
+    else:
+        raise ValueError(f"Unsupported index_mode={index_mode!r}; expected 'round' or 'floor'.")
 
     ww_i = ww_l.to(torch.long)
     hh_i = hh_l.to(torch.long)
@@ -2536,6 +2876,485 @@ def _cell_keys_level_ij(
 
     key = ((lv * int(h_max)) + row.view(-1).long()) * int(w_max) + col.view(-1).long()
     return key.to(torch.long)
+
+
+def _runtime_multires_lookup_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    rt_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
+    raw = rt_cfg.get("multires_gt_lookup", {})
+    if isinstance(raw, bool):
+        raw = {"enabled": bool(raw)}
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("train.runtime_mesh.multires_gt_lookup must be a bool or JSON object.")
+
+    out = dict(raw)
+    out.setdefault("enabled", False)
+    out.setdefault("directory", "")
+    out.setdefault("level_files", {})
+    out.setdefault("fallback_to_idw", True)
+    out.setdefault("max_cached_feature_steps", 16)
+    return out
+
+
+def _resolve_runtime_multires_level_files(multires_cfg: Dict[str, Any]) -> Dict[int, str]:
+    level_files: Dict[int, str] = {}
+
+    raw_map = multires_cfg.get("level_files", {}) or {}
+    if raw_map and (not isinstance(raw_map, dict)):
+        raise ValueError("train.runtime_mesh.multires_gt_lookup.level_files must be a JSON object.")
+    for k, v in raw_map.items():
+        if v is None:
+            continue
+        p = str(v).strip()
+        if p == "":
+            continue
+        lvl = int(k)
+        level_files[lvl] = os.path.abspath(os.path.expanduser(p))
+
+    dir_raw = str(multires_cfg.get("directory", "") or "").strip()
+    if dir_raw != "":
+        dir_abs = os.path.abspath(os.path.expanduser(dir_raw))
+        if not os.path.isdir(dir_abs):
+            raise FileNotFoundError(
+                "train.runtime_mesh.multires_gt_lookup.directory does not exist: "
+                f"{dir_abs}"
+            )
+        patt = re.compile(r"_L(\d+)_uniform_refine\.h5$")
+        for fn in sorted(os.listdir(dir_abs)):
+            m = patt.search(fn)
+            if m is None:
+                continue
+            lvl = int(m.group(1))
+            level_files.setdefault(lvl, os.path.join(dir_abs, fn))
+
+    for lvl, path in sorted(level_files.items()):
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                "Multi-resolution lookup file for level "
+                f"{lvl} was not found: {path}"
+            )
+
+    return dict(sorted(level_files.items()))
+
+
+class _RuntimeMultiResGtLookup:
+    """
+    H5-backed GT lookup on runtime meshes using precomputed uniform-mesh caches.
+
+    The lookup key is (level, row, col), where row/col are reconstructed from centers.
+    """
+    def __init__(
+        self,
+        *,
+        level_files: Dict[int, str],
+        H: int,
+        W: int,
+        bbox: Tuple[float, float, float, float],
+        refine_ratio: int,
+        max_level: int,
+        max_cached_feature_steps: int = 16,
+    ):
+        if h5py is None:
+            raise ImportError(
+                "Multi-resolution GT lookup requires h5py, but import failed."
+            )
+        if not level_files:
+            raise ValueError("Runtime multi-resolution lookup was enabled, but no level files were provided.")
+
+        self.H = int(H)
+        self.W = int(W)
+        self.bbox = tuple(float(v) for v in bbox)
+        self.refine_ratio = int(refine_ratio)
+        self.max_level = int(max(0, max_level))
+        self._key_h = int(self.H * (self.refine_ratio ** self.max_level))
+        self._key_w = int(self.W * (self.refine_ratio ** self.max_level))
+
+        self._h5_by_file_level: Dict[int, Any] = {}
+        self._file_level_index: Dict[int, Dict[int, Dict[str, np.ndarray]]] = {}
+        self._source_file_for_level: Dict[int, int] = {}
+        self._feature_cache: "OrderedDict[Tuple[int, int, str], torch.Tensor]" = OrderedDict()
+        self._max_cached_feature_steps = max(1, int(max_cached_feature_steps))
+        self.level_files = dict(sorted((int(k), str(v)) for k, v in level_files.items()))
+
+        for file_level, path in self.level_files.items():
+            f = h5py.File(path, "r")
+            self._h5_by_file_level[file_level] = f
+            g_static = self._select_static_group(f)
+            if g_static is None:
+                raise RuntimeError(f"H5 file has no /static or /tXXXXX groups: {path}")
+            if ("pred_centers" not in g_static) or ("pred_levels" not in g_static):
+                raise RuntimeError(
+                    f"H5 file is missing static geometry datasets in {path} "
+                    "(need pred_centers and pred_levels)."
+                )
+            centers = np.asarray(g_static["pred_centers"][...], dtype=np.float32)
+            levels = np.asarray(g_static["pred_levels"][...], dtype=np.int64)
+            self._file_level_index[file_level] = self._build_level_index(centers, levels)
+
+        for lv in range(self.max_level + 1):
+            src_file = None
+            if (lv in self._file_level_index) and (lv in self._file_level_index[lv]):
+                src_file = lv
+            else:
+                for file_level in sorted(self._file_level_index.keys()):
+                    if lv in self._file_level_index[file_level]:
+                        src_file = file_level
+                        break
+            if src_file is not None:
+                self._source_file_for_level[lv] = src_file
+
+    @staticmethod
+    def _select_static_group(f: Any):
+        if "static" in f:
+            return f["static"]
+        if "t00001" in f:
+            return f["t00001"]
+        t_groups = sorted([k for k in f.keys() if str(k).startswith("t")])
+        if not t_groups:
+            return None
+        return f[t_groups[0]]
+
+    def close(self):
+        for f in self._h5_by_file_level.values():
+            try:
+                f.close()
+            except Exception:
+                pass
+        self._h5_by_file_level.clear()
+        self._feature_cache.clear()
+
+    def _make_keys(self, levels: torch.Tensor, row: torch.Tensor, col: torch.Tensor) -> torch.Tensor:
+        lv = levels.view(-1).long()
+        rr = row.view(-1).long()
+        cc = col.view(-1).long()
+        return ((lv * int(self._key_h)) + rr) * int(self._key_w) + cc
+
+    def _build_level_index(self, centers: np.ndarray, levels: np.ndarray) -> Dict[int, Dict[str, np.ndarray]]:
+        centers_t = torch.from_numpy(centers.astype(np.float32, copy=False))
+        levels_t = torch.from_numpy(levels.astype(np.int64, copy=False))
+        row_t, col_t = _cell_level_ij_from_centers(
+            centers=centers_t,
+            levels=levels_t,
+            H=self.H,
+            W=self.W,
+            bbox=self.bbox,
+            refine_ratio=self.refine_ratio,
+            index_mode="floor",
+        )
+        keys = self._make_keys(levels_t, row_t, col_t).cpu().numpy().astype(np.int64, copy=False)
+        idx_all = np.arange(keys.shape[0], dtype=np.int64)
+
+        out: Dict[int, Dict[str, np.ndarray]] = {}
+        for lv in np.unique(levels.astype(np.int64, copy=False)):
+            lv_i = int(lv)
+            mask = (levels == lv_i)
+            k_l = keys[mask]
+            i_l = idx_all[mask]
+            order = np.argsort(k_l)
+            out[lv_i] = {
+                "keys_sorted": k_l[order],
+                "idx_sorted": i_l[order],
+            }
+        return out
+
+    def _cache_get(self, key: Tuple[int, int, str]) -> Optional[torch.Tensor]:
+        v = self._feature_cache.get(key, None)
+        if v is not None:
+            self._feature_cache.move_to_end(key)
+        return v
+
+    def _cache_put(self, key: Tuple[int, int, str], value: torch.Tensor):
+        self._feature_cache[key] = value
+        self._feature_cache.move_to_end(key)
+        while len(self._feature_cache) > self._max_cached_feature_steps:
+            self._feature_cache.popitem(last=False)
+
+    def _read_feature(self, *, file_level: int, t_dst: int, dataset_name: str) -> torch.Tensor:
+        ck = (int(file_level), int(t_dst), str(dataset_name))
+        cached = self._cache_get(ck)
+        if cached is not None:
+            return cached
+
+        f = self._h5_by_file_level[int(file_level)]
+        gname = f"t{int(t_dst):05d}"
+        if gname not in f:
+            raise KeyError(f"Missing timestep group '{gname}' in file-level {file_level}.")
+        g = f[gname]
+        if dataset_name not in g:
+            raise KeyError(
+                f"Missing dataset '{dataset_name}' in group '{gname}' "
+                f"(file-level {file_level})."
+            )
+        arr = np.asarray(g[dataset_name][...], dtype=np.float32)
+        ten = torch.from_numpy(arr)
+        self._cache_put(ck, ten)
+        return ten
+
+    @torch.no_grad()
+    def lookup(
+        self,
+        *,
+        t_dst: int,
+        dataset_name: str,
+        pred_centers: torch.Tensor,
+        pred_levels: torch.Tensor,
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor, Dict[str, Any]]:
+        lv_t = pred_levels.view(-1).long()
+        N = int(lv_t.numel())
+        matched_cpu = torch.zeros((N,), dtype=torch.bool, device="cpu")
+        stats: Dict[str, Any] = {
+            "requested": N,
+            "matched": 0,
+            "missing": N,
+            "by_level": {},
+        }
+        if N == 0:
+            return None, matched_cpu.to(device=pred_centers.device), stats
+
+        row_t, col_t = _cell_level_ij_from_centers(
+            centers=pred_centers,
+            levels=lv_t,
+            H=self.H,
+            W=self.W,
+            bbox=self.bbox,
+            refine_ratio=self.refine_ratio,
+            index_mode="floor",
+        )
+        key_np = self._make_keys(lv_t, row_t, col_t).detach().cpu().numpy().astype(np.int64, copy=False)
+        lvl_np = lv_t.detach().cpu().numpy().astype(np.int64, copy=False)
+
+        out_cpu: Optional[torch.Tensor] = None
+        for lv in sorted(np.unique(lvl_np).tolist()):
+            lv_i = int(lv)
+            dst_pos = np.nonzero(lvl_np == lv_i)[0]
+            if dst_pos.size == 0:
+                continue
+
+            src_file_level = self._source_file_for_level.get(lv_i, None)
+            if src_file_level is None:
+                stats["by_level"][lv_i] = {
+                    "requested": int(dst_pos.size),
+                    "matched": 0,
+                    "source_file_level": None,
+                }
+                continue
+
+            src_level_map = self._file_level_index.get(src_file_level, {}).get(lv_i, None)
+            if src_level_map is None:
+                stats["by_level"][lv_i] = {
+                    "requested": int(dst_pos.size),
+                    "matched": 0,
+                    "source_file_level": int(src_file_level),
+                }
+                continue
+
+            keys_sorted = src_level_map["keys_sorted"]
+            idx_sorted = src_level_map["idx_sorted"]
+            q_keys = key_np[dst_pos]
+            pos = np.searchsorted(keys_sorted, q_keys, side="left")
+
+            valid = pos < keys_sorted.shape[0]
+            if np.any(valid):
+                eq = np.zeros_like(valid, dtype=np.bool_)
+                eq[valid] = (keys_sorted[pos[valid]] == q_keys[valid])
+                valid = eq
+
+            n_match = int(np.count_nonzero(valid))
+            stats["by_level"][lv_i] = {
+                "requested": int(dst_pos.size),
+                "matched": n_match,
+                "source_file_level": int(src_file_level),
+            }
+            if n_match <= 0:
+                continue
+
+            feat_cpu = self._read_feature(
+                file_level=src_file_level,
+                t_dst=int(t_dst),
+                dataset_name=str(dataset_name),
+            )
+            if out_cpu is None:
+                out_cpu = torch.empty(
+                    (N, int(feat_cpu.shape[1])),
+                    dtype=torch.float32,
+                    device="cpu",
+                )
+
+            src_idx_np = idx_sorted[pos[valid]].astype(np.int64, copy=False)
+            dst_idx_np = dst_pos[valid].astype(np.int64, copy=False)
+
+            src_idx_t = torch.from_numpy(src_idx_np).to(dtype=torch.long)
+            vals = feat_cpu.index_select(0, src_idx_t)
+            dst_idx_t = torch.from_numpy(dst_idx_np).to(dtype=torch.long)
+            out_cpu.index_copy_(0, dst_idx_t, vals.to(dtype=torch.float32, device="cpu"))
+            matched_cpu[dst_idx_t] = True
+
+        matched_n = int(matched_cpu.sum().item())
+        stats["matched"] = matched_n
+        stats["missing"] = int(N - matched_n)
+        out = (
+            None
+            if out_cpu is None
+            else out_cpu.to(device=pred_centers.device, dtype=torch.float32)
+        )
+        matched = matched_cpu.to(device=pred_centers.device)
+        return out, matched, stats
+
+
+@torch.no_grad()
+def _map_gt_to_pred_mesh_subset(
+    *,
+    src_centers: torch.Tensor,
+    src_feats: torch.Tensor,
+    pred_centers: torch.Tensor,
+    query_idx: torch.Tensor,
+    knn_k: int = 8,
+    chunk: int = 8192,
+    knn_backend: str = "exact",
+    knn_backend_kwargs: Dict[str, Any] | None = None,
+) -> Tuple[torch.Tensor, str, int]:
+    q_idx = query_idx.view(-1).long()
+    if q_idx.numel() == 0:
+        empty = torch.empty(
+            (0, int(src_feats.shape[1])),
+            dtype=torch.float32,
+            device=pred_centers.device,
+        )
+        return empty, "", -1
+
+    out_dev = pred_centers.device
+    idw_dev, idw_chunk = _select_idw_backend(
+        src_n=int(src_centers.shape[0]),
+        requested_chunk=int(chunk),
+        out_device=out_dev,
+    )
+
+    src_c = src_centers.to(idw_dev, dtype=torch.float32)
+    src_f = src_feats.to(idw_dev, dtype=torch.float32)
+    dst_c = pred_centers.index_select(0, q_idx.to(device=pred_centers.device)).to(idw_dev, dtype=torch.float32)
+
+    backend_kwargs = dict(knn_backend_kwargs or {})
+    idx_map, w_map = build_idw_map(
+        dst_c,
+        src_c,
+        k=int(knn_k),
+        chunk=int(idw_chunk),
+        backend=knn_backend,
+        **backend_kwargs,
+    )
+    mapped = apply_idw_map(idx_map, w_map, src_f)
+    return mapped.to(out_dev), str(idw_dev.type), int(idw_chunk)
+
+
+@torch.no_grad()
+def _lookup_gt_on_pred_mesh_multires(
+    *,
+    lookup: _RuntimeMultiResGtLookup,
+    t_dst: int,
+    dataset_name: str,
+    pred_centers: torch.Tensor,
+    pred_levels: torch.Tensor,
+    fallback_src_centers: torch.Tensor,
+    fallback_src_feats: torch.Tensor,
+    knn_k: int,
+    chunk: int,
+    knn_backend: str,
+    knn_backend_kwargs: Dict[str, Any] | None,
+    allow_fallback_to_idw: bool,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    out: Optional[torch.Tensor] = None
+    matched = torch.zeros((pred_levels.view(-1).numel(),), dtype=torch.bool, device=pred_centers.device)
+    info: Dict[str, Any] = {
+        "requested": int(pred_levels.view(-1).numel()),
+        "matched_lookup": 0,
+        "missing_lookup": int(pred_levels.view(-1).numel()),
+        "fallback_used": False,
+        "fallback_idw_dev": "lookup",
+        "fallback_idw_chunk": -1,
+    }
+
+    try:
+        out, matched, st = lookup.lookup(
+            t_dst=int(t_dst),
+            dataset_name=str(dataset_name),
+            pred_centers=pred_centers,
+            pred_levels=pred_levels,
+        )
+        info.update(st)
+        info["matched_lookup"] = int(st.get("matched", 0))
+        info["missing_lookup"] = int(st.get("missing", 0))
+    except Exception as e:
+        info["lookup_error"] = repr(e)
+        if not allow_fallback_to_idw:
+            raise
+
+    missing_idx = (~matched).nonzero(as_tuple=False).view(-1)
+    if missing_idx.numel() > 0:
+        if not allow_fallback_to_idw:
+            req_n = int(pred_levels.view(-1).numel())
+            miss_n = int(missing_idx.numel())
+            miss_pct = (100.0 * float(miss_n) / max(float(req_n), 1.0))
+            by_level = info.get("by_level", {})
+            by_level_str = ""
+            if isinstance(by_level, dict) and by_level:
+                parts = []
+                for lv in sorted(by_level.keys()):
+                    rec = by_level.get(lv, {}) or {}
+                    parts.append(
+                        f"L{int(lv)}:{int(rec.get('matched', 0))}/{int(rec.get('requested', 0))}"
+                    )
+                by_level_str = " | by_level=" + ",".join(parts)
+            raise RuntimeError(
+                "Multi-resolution lookup missed cells and fallback_to_idw=false. "
+                f"dataset={dataset_name} t_dst={int(t_dst)} missing={miss_n}/{req_n} ({miss_pct:.2f}%)."
+                f"{by_level_str} "
+                "This indicates runtime mesh geometry is not an exact subset of cached uniform meshes."
+            )
+        mapped_fallback, fb_dev, fb_chunk = _map_gt_to_pred_mesh_subset(
+            src_centers=fallback_src_centers,
+            src_feats=fallback_src_feats,
+            pred_centers=pred_centers,
+            query_idx=missing_idx,
+            knn_k=int(knn_k),
+            chunk=int(chunk),
+            knn_backend=str(knn_backend),
+            knn_backend_kwargs=knn_backend_kwargs,
+        )
+        if out is None:
+            out_dev = pred_centers.device
+            out = torch.empty(
+                (int(pred_centers.shape[0]), int(mapped_fallback.shape[1])),
+                dtype=torch.float32,
+                device=("cpu" if out_dev.type == "mps" else out_dev),
+            )
+        if out.device.type == "mps":
+            out_cpu = out.to("cpu", dtype=torch.float32)
+            out_cpu.index_copy_(
+                0,
+                missing_idx.to(device="cpu", dtype=torch.long),
+                mapped_fallback.to(device="cpu", dtype=torch.float32),
+            )
+            out = out_cpu.to(device=pred_centers.device, dtype=torch.float32)
+        else:
+            out.index_copy_(
+                0,
+                missing_idx.to(device=out.device, dtype=torch.long),
+                mapped_fallback.to(device=out.device, dtype=torch.float32),
+            )
+        info["fallback_used"] = True
+        info["fallback_idw_dev"] = str(fb_dev)
+        info["fallback_idw_chunk"] = int(fb_chunk)
+
+    if out is None:
+        raise RuntimeError(
+            "Multi-resolution lookup produced no output and fallback did not run."
+        )
+    if out.device != pred_centers.device:
+        out = out.to(device=pred_centers.device, dtype=torch.float32)
+    info["matched_total"] = int(pred_centers.shape[0] - int((~matched).sum().item()))
+    info["missing_total"] = int((~matched).sum().item())
+    return out, info
 
 
 def _runtime_coarse_parent_counts(
@@ -3670,9 +4489,76 @@ def _load_runtime_mesh_policy_from_cfg(
             f"Runtime mesh CNN max_level mismatch: checkpoint={ckpt_Lmax}, cfg={cfg_Lmax}"
         )
 
+    tm = (ckpt.get("train_meta", {}) or {}) if isinstance(ckpt, dict) else {}
+
     include_parent_mask = bool(cnn_cfg.get("include_parent_mask", True))
     include_coords = bool(cnn_cfg.get("include_coords", True))
     include_dt = bool(cnn_cfg.get("include_dt", False))
+    include_gradients = bool(
+        cnn_cfg.get(
+            "include_gradients",
+            tm.get("include_gradient_channels", tm.get("include_gradients", False)),
+        )
+    )
+    n_feature_channels_meta = tm.get("n_feature_channels", None)
+    if n_feature_channels_meta is not None:
+        n_feature_channels_meta = int(n_feature_channels_meta)
+
+    gradient_feature_indices = None
+    raw_grad_idx = cnn_cfg.get("gradient_feature_indices", None)
+    if raw_grad_idx is None:
+        raw_grad_idx = tm.get("gradient_feature_indices", None)
+    if isinstance(raw_grad_idx, dict):
+        rho_raw = raw_grad_idx.get("rho", None)
+        e_raw = raw_grad_idx.get("E", None)
+        gradient_feature_indices = {
+            "rho": (None if rho_raw is None else int(rho_raw)),
+            "E": (None if e_raw is None else int(e_raw)),
+        }
+    if bool(include_gradients):
+        if not isinstance(gradient_feature_indices, dict):
+            raise RuntimeError(
+                "Runtime CNN include_gradients=true but gradient feature indices were not found. "
+                "Set train.runtime_mesh.cnn.gradient_feature_indices={'rho':i,'E':j} or "
+                "use a checkpoint that stores train_meta.gradient_feature_indices."
+            )
+        if gradient_feature_indices.get("rho", None) is None or gradient_feature_indices.get("E", None) is None:
+            raise RuntimeError(
+                "Runtime CNN include_gradients=true but gradient_feature_indices is missing "
+                f"rho/E entries: {gradient_feature_indices}"
+            )
+
+    raw_feature_norm_mode = str(cnn_cfg.get("feature_norm_mode", "auto")).strip().lower()
+    if raw_feature_norm_mode == "auto":
+        raw_feature_norm_mode = str(tm.get("feature_norm_mode", "none"))
+    feature_norm_mode = _canonical_feature_norm_mode(raw_feature_norm_mode)
+    feature_norm_stats = _parse_feature_norm_stats(
+        cnn_cfg.get("feature_norm_stats", None),
+        n_channels=n_feature_channels_meta,
+    )
+    if feature_norm_stats is None:
+        feature_norm_stats = _parse_feature_norm_stats(
+            tm.get("feature_norm_stats", None),
+            n_channels=n_feature_channels_meta,
+        )
+    if _feature_norm_requires_stats(feature_norm_mode) and (feature_norm_stats is None):
+        raise RuntimeError(
+            "Runtime CNN feature_norm_mode requires stats, but no valid feature_norm_stats "
+            "were found in config or checkpoint train_meta."
+        )
+
+    raw_grad_norm_mode = str(cnn_cfg.get("gradient_norm_mode", "auto")).strip().lower()
+    if raw_grad_norm_mode == "auto":
+        raw_grad_norm_mode = str(tm.get("gradient_norm_mode", "none"))
+    gradient_norm_mode = _canonical_gradient_norm_mode(raw_grad_norm_mode)
+    gradient_norm_stats = _parse_gradient_norm_stats(cnn_cfg.get("gradient_norm_stats", None))
+    if gradient_norm_stats is None:
+        gradient_norm_stats = _parse_gradient_norm_stats(tm.get("gradient_norm_stats", None))
+    if bool(include_gradients) and _gradient_norm_requires_stats(gradient_norm_mode) and (gradient_norm_stats is None):
+        raise RuntimeError(
+            "Runtime CNN include_gradients=true with gradient_norm_mode requiring stats, "
+            "but no valid gradient_norm_stats were found in config or checkpoint train_meta."
+        )
     dt_channel_mode = str(cnn_cfg.get("dt_channel_mode", "dt_hat")).strip().lower()
     if dt_channel_mode not in ("raw", "dt_hat"):
         raise ValueError(
@@ -3706,6 +4592,12 @@ def _load_runtime_mesh_policy_from_cfg(
         "include_parent_mask": include_parent_mask,
         "include_coords": include_coords,
         "include_dt": include_dt,
+        "include_gradients": include_gradients,
+        "feature_norm_mode": feature_norm_mode,
+        "feature_norm_stats": feature_norm_stats,
+        "gradient_feature_indices": gradient_feature_indices,
+        "gradient_norm_mode": gradient_norm_mode,
+        "gradient_norm_stats": gradient_norm_stats,
         "dt_channel_mode": dt_channel_mode,
         "coord_grid": coord_grid,
         "coarse_rc_grid": coarse_rc_grid,
@@ -3721,11 +4613,50 @@ def _load_runtime_mesh_policy_from_cfg(
         f"model_type={ctx['model_type']}",
         f"max_level={ctx['max_level']}",
         f"refine_ratio={ctx['refine_ratio']}",
+        f"include_gradients={bool(ctx['include_gradients'])}",
+        f"feature_norm_mode={ctx['feature_norm_mode']}",
+        f"gradient_norm_mode={ctx['gradient_norm_mode']}",
         f"include_dt={bool(ctx['include_dt'])}",
         f"dt_channel_mode={ctx['dt_channel_mode']}",
         f"threshold_source={thr_source}",
         f"threshold_default={ctx['threshold_default']:.6g}",
     )
+    if feature_norm_stats is not None:
+        print(
+            "[RUNTIME-MESH] CNN feature normalization stats:",
+            {
+                "n_channels": int(len(feature_norm_stats["mean"])),
+                "mean_min": float(min(feature_norm_stats["mean"])),
+                "mean_max": float(max(feature_norm_stats["mean"])),
+                "std_min": float(min(feature_norm_stats["std"])),
+                "std_max": float(max(feature_norm_stats["std"])),
+            },
+            flush=True,
+        )
+    if bool(include_gradients):
+        print(
+            "[RUNTIME-MESH] CNN gradient channels:",
+            {
+                "rho": int(gradient_feature_indices["rho"]),
+                "E": int(gradient_feature_indices["E"]),
+            },
+            flush=True,
+        )
+        if gradient_norm_stats is not None:
+            print(
+                "[RUNTIME-MESH] CNN gradient normalization stats:",
+                {
+                    "rho": {
+                        "mean": float(gradient_norm_stats["rho"]["mean"]),
+                        "std": float(gradient_norm_stats["rho"]["std"]),
+                    },
+                    "E": {
+                        "mean": float(gradient_norm_stats["E"]["mean"]),
+                        "std": float(gradient_norm_stats["E"]["std"]),
+                    },
+                },
+                flush=True,
+            )
     if len(thr_by_level) > 0:
         print(
             "[RUNTIME-MESH] CNN threshold_by_level:",
@@ -3814,7 +4745,81 @@ def _runtime_predict_masks_from_cnn(
             chunk=1024,
         )
 
+    coarse_raw = coarse
+    feature_norm_mode = str(runtime_mesh_policy.get("feature_norm_mode", "none"))
+    feature_norm_stats = _parse_feature_norm_stats(
+        runtime_mesh_policy.get("feature_norm_stats", None),
+        n_channels=int(coarse_raw.shape[0]),
+    )
+    coarse = _apply_feature_norm_chw(
+        coarse_raw,
+        mode=feature_norm_mode,
+        stats=feature_norm_stats,
+        require_stats=True,
+    )
+
     channels = [coarse]
+    if bool(runtime_mesh_policy.get("include_gradients", False)):
+        gidx = runtime_mesh_policy.get("gradient_feature_indices", None)
+        if not isinstance(gidx, dict):
+            raise RuntimeError(
+                "Runtime CNN include_gradients=true but gradient_feature_indices is missing."
+            )
+        rho_raw = gidx.get("rho", None)
+        e_raw = gidx.get("E", None)
+        if rho_raw is None or e_raw is None:
+            raise RuntimeError(
+                "Runtime CNN include_gradients=true but gradient_feature_indices must contain "
+                f"'rho' and 'E'. Got {gidx}"
+            )
+        rho_idx = int(rho_raw)
+        e_idx = int(e_raw)
+        Fdim = int(coarse_raw.shape[0])
+        if not (0 <= rho_idx < Fdim) or not (0 <= e_idx < Fdim):
+            raise RuntimeError(
+                "Runtime CNN include_gradients=true but rho/E feature indices are out of bounds: "
+                f"rho={rho_idx}, E={e_idx}, F={Fdim}"
+            )
+        xmin, xmax, ymin, ymax = [float(v) for v in _get_bbox(cfg)]
+        dx = max((xmax - xmin) / max(float(W), 1.0), 1e-12)
+        dy = max((ymax - ymin) / max(float(H), 1.0), 1e-12)
+        grad_norm_mode = str(runtime_mesh_policy.get("gradient_norm_mode", "none"))
+        grad_norm_stats = _parse_gradient_norm_stats(
+            runtime_mesh_policy.get("gradient_norm_stats", None)
+        )
+        rho_stats = (None if grad_norm_stats is None else grad_norm_stats.get("rho", None))
+        E_stats = (None if grad_norm_stats is None else grad_norm_stats.get("E", None))
+        g_rho_flat = _coarse_grad_mag(
+            coarse_raw[rho_idx].reshape(-1),
+            H,
+            W,
+            dx,
+            dy,
+            p=1.0,
+        )
+        g_E_flat = _coarse_grad_mag(
+            coarse_raw[e_idx].reshape(-1),
+            H,
+            W,
+            dx,
+            dy,
+            p=1.0,
+        )
+        g_rho = _apply_gradient_norm_flat(
+            g_rho_flat,
+            mode=grad_norm_mode,
+            mean=(None if rho_stats is None else float(rho_stats["mean"])),
+            std=(None if rho_stats is None else float(rho_stats["std"])),
+            require_stats=True,
+        ).view(H, W).unsqueeze(0)
+        g_E = _apply_gradient_norm_flat(
+            g_E_flat,
+            mode=grad_norm_mode,
+            mean=(None if E_stats is None else float(E_stats["mean"])),
+            std=(None if E_stats is None else float(E_stats["std"])),
+            require_stats=True,
+        ).view(H, W).unsqueeze(0)
+        channels.extend([g_rho, g_E])
     if bool(runtime_mesh_policy.get("include_parent_mask", True)):
         channels.append(mask_for_cnn.to(coarse.device, dtype=torch.float32).unsqueeze(0))
     if bool(runtime_mesh_policy.get("include_coords", True)):
@@ -3855,7 +4860,7 @@ def _runtime_predict_masks_from_cnn(
     if expected_in > 0 and int(x_in.shape[1]) != expected_in:
         raise RuntimeError(
             f"CNN runtime mesh input channel mismatch: built={int(x_in.shape[1])}, expected={expected_in}. "
-            "Check runtime_mesh.cnn.include_parent_mask/include_coords and feature channel setup."
+            "Check runtime_mesh.cnn.include_parent_mask/include_coords/include_gradients and feature channel setup."
         )
 
     logits_raw = model(x_in.to(pdev, dtype=torch.float32, non_blocking=True))
@@ -4753,6 +5758,7 @@ def train_one_epoch_multi_step(
     sigma=None,
     epoch_idx: int | None = None,
     runtime_mesh_policy: Dict[str, Any] | None = None,
+    chunk_sidecar: ChunkSidecarH5 | None = None,
 ):
     """
     STRICT multi-step mesh-first training with:
@@ -4923,6 +5929,10 @@ def train_one_epoch_multi_step(
 
     runtime_mesh_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
     runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
+    runtime_multires_cfg = _runtime_multires_lookup_cfg(cfg)
+    runtime_multires_enabled = bool(runtime_mesh_enabled and runtime_multires_cfg.get("enabled", False))
+    runtime_multires_fallback_to_idw = bool(runtime_multires_cfg.get("fallback_to_idw", True))
+    runtime_multires_lookup: Optional[_RuntimeMultiResGtLookup] = None
     runtime_update_every = int(runtime_mesh_cfg.get("update_every_steps", 1))
     runtime_mesh_backend = _runtime_mesh_backend(cfg)
     runtime_domain_mode = _runtime_mesh_domain_mode(cfg)
@@ -4931,6 +5941,9 @@ def train_one_epoch_multi_step(
     runtime_bbox = _get_bbox(cfg)
     runtime_refine_ratio = _get_refine_ratio(cfg)
     runtime_need_edge_attr = bool(need_phy and (not use_mls))
+    runtime_mesh_plot_settings = _runtime_mesh_plot_settings(cfg)
+    runtime_mesh_plot_state = {"rebuilds": 0, "saved": 0}
+    runtime_mesh_plot_wedge_path = None
     runtime_wedge_path = None
     runtime_wedge_constraints = None
     runtime_base_mesh = None
@@ -4965,10 +5978,465 @@ def train_one_epoch_multi_step(
             raise RuntimeError(
                 "Runtime mesh backend is 'cnn' but runtime_mesh_policy was not loaded."
             )
+        if runtime_multires_enabled:
+            level_files = _resolve_runtime_multires_level_files(runtime_multires_cfg)
+            if not level_files:
+                raise RuntimeError(
+                    "Runtime multires GT lookup is enabled, but no level files were resolved. "
+                    "Set train.runtime_mesh.multires_gt_lookup.level_files "
+                    "or train.runtime_mesh.multires_gt_lookup.directory."
+                )
+            max_level_policy = int(cfg.get("policy", {}).get("max_level", max(level_files.keys())))
+            runtime_multires_lookup = _RuntimeMultiResGtLookup(
+                level_files=level_files,
+                H=H,
+                W=W,
+                bbox=runtime_bbox,
+                refine_ratio=runtime_refine_ratio,
+                max_level=max_level_policy,
+                max_cached_feature_steps=int(runtime_multires_cfg.get("max_cached_feature_steps", 16)),
+            )
         print(
             f"[RUNTIME-MESH] train loop active (backend={runtime_mesh_backend}, domain_mode={runtime_domain_mode}, "
             f"idw_backend={runtime_idw_backend}, update_every_steps={runtime_update_every})"
         )
+        if bool(runtime_mesh_plot_settings.get("enabled", False)):
+            print(
+                "[RUNTIME-MESH][PLOT] enabled: "
+                f"out_dir={runtime_mesh_plot_settings.get('out_dir')} "
+                f"split={runtime_mesh_plot_settings.get('split')} "
+                f"every_rebuilds={int(runtime_mesh_plot_settings.get('every_rebuilds', 1))} "
+                f"max_plots={int(runtime_mesh_plot_settings.get('max_plots', 0))}",
+                flush=True,
+            )
+        if runtime_multires_enabled:
+            levels_sorted = sorted(runtime_multires_lookup.level_files.keys()) if runtime_multires_lookup is not None else []
+            print(
+                f"[RUNTIME-MESH][MULTIRES] GT lookup enabled: levels={levels_sorted}, "
+                f"fallback_to_idw={int(runtime_multires_fallback_to_idw)}",
+                flush=True,
+            )
+        runtime_mesh_plot_wedge_path = runtime_wedge_path
+        if (
+            bool(runtime_mesh_plot_settings.get("enabled", False))
+            and bool(runtime_mesh_plot_settings.get("show_wedge", True))
+            and (runtime_mesh_plot_wedge_path is None)
+        ):
+            try:
+                runtime_mesh_plot_wedge_path = _load_wedge_path_from_spec(str(mesh_spec_path), cfg)
+            except Exception as e:
+                print(
+                    f"[RUNTIME-MESH][PLOT][WARN] Could not load wedge path for overlay: {e!r}",
+                    flush=True,
+                )
+
+    chunk_cfg = cfg.get("chunk", {}) or {}
+    chunk_enabled = bool(chunk_cfg.get("enabled", False))
+    chunk_num_chunks = max(1, int(chunk_cfg.get("num_chunks", 16)))
+    chunk_halo_hops = max(0, int(chunk_cfg.get("halo_hops", 2)))
+    chunk_partition_mode = str(chunk_cfg.get("partition_mode", "parent_grid")).strip().lower()
+    if chunk_enabled and chunk_partition_mode != "parent_grid":
+        raise ValueError(
+            f"Unsupported chunk.partition_mode='{chunk_partition_mode}'. "
+            "Only 'parent_grid' is currently implemented in train loop chunking."
+        )
+    if chunk_enabled and (chunk_num_chunks > int(H * W)):
+        raise ValueError(
+            f"chunk.num_chunks={chunk_num_chunks} exceeds H*W={int(H*W)} coarse parent cells."
+        )
+
+    chunk_sidecar_ok = bool(chunk_enabled and (chunk_sidecar is not None))
+    chunk_warned_missing_sidecar = False
+    chunk_warned_sidecar_step_miss = False
+    chunk_warned_edge_attr_rebuild = False
+    chunk_warned_coverage_gap = False
+    chunk_debug_cfg = cfg.get("debug", {}) or {}
+    chunk_stats_enabled = bool(chunk_debug_cfg.get("print_chunk_stats", False))
+    chunk_stats_every_steps_raw = int(chunk_debug_cfg.get("chunk_stats_every_steps", 1))
+    chunk_stats_every_steps = max(1, int(chunk_stats_every_steps_raw))
+    chunk_stats_include_rk4 = bool(chunk_debug_cfg.get("chunk_stats_include_rk4", False))
+
+    def _factor_chunk_grid(num_chunks: int, H: int, W: int) -> tuple[int, int]:
+        target_aspect = float(W) / max(float(H), 1.0)
+        best_rows, best_cols = 1, int(num_chunks)
+        best_score = float("inf")
+        for rows in range(1, int(math.sqrt(num_chunks)) + 1):
+            if num_chunks % rows != 0:
+                continue
+            cols = num_chunks // rows
+            for r, c in ((rows, cols), (cols, rows)):
+                aspect = float(c) / max(float(r), 1.0)
+                score = abs(math.log(max(aspect, 1e-12)) - math.log(max(target_aspect, 1e-12)))
+                if score < best_score:
+                    best_score = score
+                    best_rows, best_cols = int(r), int(c)
+        return best_rows, best_cols
+
+    def _chunk_tile_bounds(num_chunks: int, H: int, W: int) -> list[tuple[int, int, int, int, int]]:
+        rows, cols = _factor_chunk_grid(num_chunks, H, W)
+        y_edges = np.linspace(0, H, rows + 1, dtype=np.int64)
+        x_edges = np.linspace(0, W, cols + 1, dtype=np.int64)
+        out: list[tuple[int, int, int, int, int]] = []
+        cid = 0
+        for ry in range(rows):
+            y0, y1 = int(y_edges[ry]), int(y_edges[ry + 1])
+            for cx in range(cols):
+                x0, x1 = int(x_edges[cx]), int(x_edges[cx + 1])
+                out.append((cid, y0, y1, x0, x1))
+                cid += 1
+        return out
+
+    chunk_tile_spec = _chunk_tile_bounds(chunk_num_chunks, H, W)
+
+    def _expand_halo_mask_np(core_mask: np.ndarray, edge_index_np: np.ndarray, hops: int) -> np.ndarray:
+        if hops <= 0 or core_mask.size == 0:
+            return core_mask.copy()
+        if edge_index_np.size == 0:
+            return core_mask.copy()
+
+        src = edge_index_np[0]
+        dst = edge_index_np[1]
+        full_mask = core_mask.copy()
+        frontier = core_mask.copy()
+        for _ in range(int(hops)):
+            nbr = np.zeros_like(full_mask, dtype=bool)
+            if frontier.any():
+                nbr[dst[frontier[src]]] = True
+                nbr[src[frontier[dst]]] = True
+            nbr &= ~full_mask
+            if not nbr.any():
+                break
+            full_mask |= nbr
+            frontier = nbr
+        return full_mask
+
+    def _build_local_edges_np(
+        edge_index_np: np.ndarray,
+        full_mask: np.ndarray,
+        full_idx: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if edge_index_np.size == 0 or full_idx.size == 0:
+            return np.zeros((2, 0), dtype=np.int64), np.zeros((0,), dtype=np.int64)
+
+        src = edge_index_np[0]
+        dst = edge_index_np[1]
+        keep = full_mask[src] & full_mask[dst]
+        if not np.any(keep):
+            return np.zeros((2, 0), dtype=np.int64), np.zeros((0,), dtype=np.int64)
+
+        lut = np.full((full_mask.size,), fill_value=-1, dtype=np.int64)
+        lut[full_idx] = np.arange(full_idx.size, dtype=np.int64)
+        src_l = lut[src[keep]]
+        dst_l = lut[dst[keep]]
+        edge_local = np.stack([src_l, dst_l], axis=0).astype(np.int64, copy=False)
+        edge_ids = np.nonzero(keep)[0].astype(np.int64, copy=False)
+        return edge_local, edge_ids
+
+    def _edge_id_lut_from_global_ei(pei_np: np.ndarray) -> dict[tuple[int, int], int]:
+        lut: dict[tuple[int, int], int] = {}
+        if pei_np.size == 0:
+            return lut
+        src = pei_np[0]
+        dst = pei_np[1]
+        for eid in range(int(pei_np.shape[1])):
+            lut[(int(src[eid]), int(dst[eid]))] = int(eid)
+        return lut
+
+    def _reindex_core_first(
+        full_idx: np.ndarray,
+        core_mask_local_u8: np.ndarray,
+        edge_index_local: np.ndarray,
+        edge_ids_local: np.ndarray | None,
+    ) -> tuple[np.ndarray, int, np.ndarray, np.ndarray | None]:
+        core_mask = np.asarray(core_mask_local_u8, dtype=np.uint8).reshape(-1) > 0
+        if core_mask.size != full_idx.size:
+            raise RuntimeError(
+                f"Invalid core_mask_local_u8 size ({core_mask.size}) for full_idx size ({full_idx.size})."
+            )
+        core_local = np.nonzero(core_mask)[0].astype(np.int64, copy=False)
+        core_count = int(core_local.size)
+        if core_count == 0 or full_idx.size == 0:
+            return full_idx, core_count, edge_index_local, edge_ids_local
+
+        if np.array_equal(core_local, np.arange(core_count, dtype=np.int64)):
+            return full_idx, core_count, edge_index_local, edge_ids_local
+
+        noncore_local = np.nonzero(~core_mask)[0].astype(np.int64, copy=False)
+        order = np.concatenate([core_local, noncore_local], axis=0)
+        inv = np.empty_like(order)
+        inv[order] = np.arange(order.size, dtype=np.int64)
+        full_idx_new = full_idx[order]
+        if edge_index_local.size > 0:
+            edge_index_local = inv[edge_index_local]
+        return full_idx_new, core_count, edge_index_local, edge_ids_local
+
+    def _convert_chunk_specs_np(
+        specs_np: list[dict[str, Any]],
+        pei_np_for_rebuild: np.ndarray,
+    ) -> list[dict[str, Any]]:
+        nonlocal chunk_warned_edge_attr_rebuild
+        out: list[dict[str, Any]] = []
+        edge_lut = None
+
+        for spec in specs_np:
+            full_idx = np.asarray(spec.get("full_idx", []), dtype=np.int64).reshape(-1)
+            if full_idx.size == 0:
+                continue
+
+            ei_local = np.asarray(spec.get("edge_index_local", np.zeros((2, 0))), dtype=np.int64)
+            if ei_local.ndim != 2:
+                ei_local = np.zeros((2, 0), dtype=np.int64)
+            if ei_local.shape[0] != 2 and ei_local.shape[1] == 2:
+                ei_local = ei_local.T
+            if ei_local.shape[0] != 2:
+                ei_local = np.zeros((2, 0), dtype=np.int64)
+
+            edge_ids_local = spec.get("edge_ids_local", None)
+            if edge_ids_local is None:
+                edge_ids_np = None
+            else:
+                edge_ids_np = np.asarray(edge_ids_local, dtype=np.int64).reshape(-1)
+
+            core_mask_u8 = spec.get("core_mask_local_u8", None)
+            if core_mask_u8 is None:
+                core_count = int(np.asarray(spec.get("core_idx", []), dtype=np.int64).reshape(-1).size)
+                if core_count > full_idx.size:
+                    core_count = int(full_idx.size)
+                core_mask_u8 = np.zeros((full_idx.size,), dtype=np.uint8)
+                core_mask_u8[:core_count] = 1
+
+            full_idx, core_count, ei_local, edge_ids_np = _reindex_core_first(
+                full_idx=full_idx,
+                core_mask_local_u8=np.asarray(core_mask_u8, dtype=np.uint8).reshape(-1),
+                edge_index_local=ei_local,
+                edge_ids_local=edge_ids_np,
+            )
+            if core_count <= 0:
+                continue
+
+            # Backward compatibility: older sidecars may lack edge_ids_local.
+            if (edge_ids_np is None) and (ei_local.size > 0):
+                if edge_lut is None:
+                    edge_lut = _edge_id_lut_from_global_ei(pei_np_for_rebuild)
+                src_g = full_idx[ei_local[0]]
+                dst_g = full_idx[ei_local[1]]
+                ids = np.empty((src_g.size,), dtype=np.int64)
+                missing = False
+                for i in range(int(src_g.size)):
+                    key = (int(src_g[i]), int(dst_g[i]))
+                    eid = edge_lut.get(key, -1)
+                    ids[i] = int(eid)
+                    if eid < 0:
+                        missing = True
+                if missing:
+                    raise RuntimeError(
+                        "Could not reconstruct local edge_ids from sidecar for edge_attr slicing. "
+                        "Please rebuild sidecar with current builder."
+                    )
+                edge_ids_np = ids
+                if not chunk_warned_edge_attr_rebuild:
+                    print(
+                        "[CHUNK][WARN] sidecar is missing edge_ids_local; reconstructed from global edge_index. "
+                        "Rebuild sidecar once to avoid this overhead.",
+                        flush=True,
+                    )
+                    chunk_warned_edge_attr_rebuild = True
+
+            out.append(
+                {
+                    "full_idx": torch.from_numpy(full_idx.astype(np.int64, copy=False)),
+                    "edge_index_local": torch.from_numpy(ei_local.astype(np.int64, copy=False)),
+                    "edge_ids_local": (
+                        None
+                        if edge_ids_np is None
+                        else torch.from_numpy(edge_ids_np.astype(np.int64, copy=False))
+                    ),
+                    "core_count": int(core_count),
+                    "is_active": bool(spec.get("is_active", True)),
+                    "activity_score": float(spec.get("activity_score", float("nan"))),
+                }
+            )
+        return out
+
+    def _build_chunk_specs_on_the_fly(pred_parents: torch.Tensor, pred_ei: torch.Tensor) -> list[dict[str, Any]]:
+        parents_np = pred_parents.detach().to("cpu").long().view(-1).numpy().astype(np.int64, copy=False)
+        pei_np = pred_ei.detach().to("cpu").long().numpy().astype(np.int64, copy=False)
+        if pei_np.ndim != 2:
+            raise RuntimeError(f"chunking expects pred_ei ndim=2, got {pei_np.ndim}")
+        if pei_np.shape[0] != 2 and pei_np.shape[1] == 2:
+            pei_np = pei_np.T
+        if pei_np.shape[0] != 2:
+            raise RuntimeError(f"chunking expects pred_ei shape (2,E), got {tuple(pei_np.shape)}")
+
+        N = int(parents_np.size)
+        out_np: list[dict[str, Any]] = []
+        for _cid, y0, y1, x0, x1 in chunk_tile_spec:
+            row = parents_np // int(W)
+            col = parents_np % int(W)
+            core_mask = (row >= int(y0)) & (row < int(y1)) & (col >= int(x0)) & (col < int(x1))
+            full_mask = _expand_halo_mask_np(core_mask=core_mask, edge_index_np=pei_np, hops=chunk_halo_hops)
+            halo_mask = full_mask & (~core_mask)
+
+            core_idx = np.nonzero(core_mask)[0].astype(np.int64, copy=False)
+            if core_idx.size == 0:
+                continue
+            halo_idx = np.nonzero(halo_mask)[0].astype(np.int64, copy=False)
+            full_idx = np.concatenate([core_idx, halo_idx], axis=0).astype(np.int64, copy=False)
+            ei_local, edge_ids = _build_local_edges_np(
+                edge_index_np=pei_np,
+                full_mask=full_mask,
+                full_idx=full_idx,
+            )
+            core_mask_local = np.zeros((full_idx.size,), dtype=np.uint8)
+            core_mask_local[: core_idx.size] = 1
+            out_np.append(
+                {
+                    "full_idx": full_idx,
+                    "edge_index_local": ei_local,
+                    "edge_ids_local": edge_ids,
+                    "core_mask_local_u8": core_mask_local,
+                    "is_active": True,
+                    "activity_score": float("nan"),
+                }
+            )
+        return _convert_chunk_specs_np(out_np, pei_np_for_rebuild=pei_np)
+
+    def _get_chunk_specs_for_step(
+        *,
+        pred_parents: torch.Tensor,
+        pred_ei: torch.Tensor,
+        step_t_abs: int | None,
+    ) -> list[dict[str, Any]] | None:
+        nonlocal chunk_warned_missing_sidecar, chunk_warned_sidecar_step_miss
+        if not chunk_enabled:
+            return None
+
+        # Runtime remeshing changes geometry every step; sidecar metadata is only valid
+        # for precomputed meshes and should not be reused here.
+        if runtime_mesh_enabled:
+            return _build_chunk_specs_on_the_fly(pred_parents=pred_parents, pred_ei=pred_ei)
+
+        if chunk_sidecar_ok and (step_t_abs is not None):
+            chunks_np = chunk_sidecar.get_timestep_chunks(int(step_t_abs))
+            if chunks_np is not None:
+                pei_np = pred_ei.detach().to("cpu").long().numpy().astype(np.int64, copy=False)
+                return _convert_chunk_specs_np(chunks_np, pei_np_for_rebuild=pei_np)
+            if not chunk_warned_sidecar_step_miss:
+                print(
+                    f"[CHUNK][WARN] sidecar has no timestep t={int(step_t_abs)}; falling back to on-the-fly chunking.",
+                    flush=True,
+                )
+                chunk_warned_sidecar_step_miss = True
+        elif chunk_enabled and (chunk_sidecar is None) and (not chunk_warned_missing_sidecar):
+            print(
+                "[CHUNK][INFO] chunk.enabled=true and no sidecar loaded; using on-the-fly chunking.",
+                flush=True,
+            )
+            chunk_warned_missing_sidecar = True
+
+        return _build_chunk_specs_on_the_fly(pred_parents=pred_parents, pred_ei=pred_ei)
+
+    def _forward_main_head_chunked(
+        *,
+        x_in_all: torch.Tensor,
+        edge_index_global: torch.Tensor,
+        edge_attr_global: torch.Tensor | None,
+        chunk_specs: list[dict[str, Any]] | None,
+        step_k: int,
+        step_t_abs: int | None,
+        stage_tag: str,
+    ) -> torch.Tensor:
+        nonlocal chunk_warned_coverage_gap
+        if (not chunk_enabled) or (not chunk_specs):
+            return _forward_main_head_with_edge_attr(model, x_in_all, edge_index_global, edge_attr=edge_attr_global)
+
+        y_out = None
+        covered = torch.zeros((x_in_all.size(0),), device=device, dtype=torch.bool)
+
+        for spec in chunk_specs:
+            full_idx = spec["full_idx"]
+            core_count = int(spec["core_count"])
+            ei_local = spec["edge_index_local"]
+            edge_ids_local = spec.get("edge_ids_local", None)
+
+            if core_count <= 0 or full_idx.numel() == 0:
+                continue
+
+            full_idx_d = full_idx.to(device=device, dtype=torch.long, non_blocking=True)
+            ei_local_d = ei_local.to(device=device, dtype=torch.long, non_blocking=True)
+            x_local = x_in_all.index_select(0, full_idx_d)
+
+            ea_local = None
+            if edge_attr_global is not None:
+                if edge_ids_local is None:
+                    raise RuntimeError(
+                        "Chunked forward with edge_attr requires edge_ids_local per chunk. "
+                        "Rebuild sidecar with current builder."
+                    )
+                edge_ids_d = edge_ids_local.to(device=device, dtype=torch.long, non_blocking=True)
+                if edge_ids_d.numel() != int(ei_local_d.shape[1]):
+                    raise RuntimeError(
+                        f"edge_ids_local length mismatch in {stage_tag} step_k={step_k}: "
+                        f"len(edge_ids_local)={int(edge_ids_d.numel())}, E_local={int(ei_local_d.shape[1])}"
+                    )
+                ea_local = edge_attr_global.index_select(0, edge_ids_d)
+
+            y_local = _forward_main_head_with_edge_attr(model, x_local, ei_local_d, edge_attr=ea_local)
+            core_global = full_idx_d[:core_count]
+            core_local = y_local[:core_count]
+
+            if y_out is None:
+                y_out = core_local.new_zeros((x_in_all.size(0), y_local.size(1)))
+            # MPS backend does not implement aten::index_copy; direct indexed assignment
+            # keeps this path device-native.
+            y_out[core_global] = core_local
+            covered[core_global] = True
+
+        if y_out is None:
+            return _forward_main_head_with_edge_attr(model, x_in_all, edge_index_global, edge_attr=edge_attr_global)
+
+        if not bool(torch.all(covered).item()):
+            y_full = _forward_main_head_with_edge_attr(
+                model, x_in_all, edge_index_global, edge_attr=edge_attr_global
+            )
+            y_out = torch.where(covered.view(-1, 1), y_out, y_full)
+            if not chunk_warned_coverage_gap:
+                n_missing = int((~covered).sum().item())
+                print(
+                    f"[CHUNK][WARN] {stage_tag} step_k={step_k}: {n_missing} nodes were not covered by chunk cores; "
+                    "filled from full-graph forward.",
+                    flush=True,
+                )
+                chunk_warned_coverage_gap = True
+
+        if chunk_stats_enabled:
+            should_print_stage = (stage_tag == "train-main") or bool(chunk_stats_include_rk4)
+            if should_print_stage and ((int(step_k) % chunk_stats_every_steps) == 0):
+                n_chunks = int(len(chunk_specs))
+                n_nodes = int(x_in_all.size(0))
+                n_cov = int(covered.sum().item())
+                core_counts = [int(s["core_count"]) for s in chunk_specs if int(s["core_count"]) > 0]
+                full_counts = [int(s["full_idx"].numel()) for s in chunk_specs if int(s["core_count"]) > 0]
+                halo_counts = [max(0, f - c) for c, f in zip(core_counts, full_counts)]
+                edge_counts = [int(s["edge_index_local"].shape[1]) for s in chunk_specs if int(s["core_count"]) > 0]
+                n_active = int(sum(1 for s in chunk_specs if bool(s.get("is_active", True))))
+
+                core_mean = float(np.mean(core_counts)) if core_counts else 0.0
+                halo_mean = float(np.mean(halo_counts)) if halo_counts else 0.0
+                full_mean = float(np.mean(full_counts)) if full_counts else 0.0
+                edge_mean = float(np.mean(edge_counts)) if edge_counts else 0.0
+                cov_frac = (float(n_cov) / float(max(n_nodes, 1))) if n_nodes > 0 else 0.0
+
+                t_abs_str = "n/a" if step_t_abs is None else str(int(step_t_abs))
+                print(
+                    f"[CHUNK-DBG] stage={stage_tag} step_k={int(step_k)} t_abs={t_abs_str} "
+                    f"chunks={n_chunks} active={n_active} covered={n_cov}/{n_nodes} ({cov_frac:.3f}) "
+                    f"mean_core={core_mean:.1f} mean_halo={halo_mean:.1f} mean_full={full_mean:.1f} "
+                    f"mean_local_edges={edge_mean:.1f}",
+                    flush=True,
+                )
+
+        return y_out
 
     train_one_epoch_multi_step._printed_loss_components = False
 
@@ -5166,6 +6634,7 @@ def train_one_epoch_multi_step(
         def _run_step(
             *,
             step_k: int,
+            step_t_abs: int | None,
             pred_centers,
             pred_levels,
             pred_parents,
@@ -5176,6 +6645,7 @@ def train_one_epoch_multi_step(
             dt_phys: torch.Tensor,      # scalar
             dt_ref_scalar,              # None or scalar (from batch)
             x_ops_abs: torch.Tensor | None = None,
+            chunk_specs_step: list[dict[str, Any]] | None = None,
         ):
             norm_in  = _maybe_norm(x_in_abs,  mu, sigma)
             norm_tgt = _maybe_norm(x_tgt_abs, mu, sigma)
@@ -5251,6 +6721,13 @@ def train_one_epoch_multi_step(
             with amp_ctx():
                 pei = pred_ei.to(device) if torch.is_tensor(pred_ei) else pred_ei
                 pea = pred_ea.to(device) if (pred_ea is not None and torch.is_tensor(pred_ea)) else pred_ea
+                chunk_specs_eff = chunk_specs_step
+                if chunk_enabled and (chunk_specs_eff is None):
+                    chunk_specs_eff = _get_chunk_specs_for_step(
+                        pred_parents=pred_parents,
+                        pred_ei=pei,
+                        step_t_abs=step_t_abs,
+                    )
 
                 # ----- physics operators (float32, no autocast) -----
                 r_adv_abs = r_diff_abs = r_phy_abs = area = None
@@ -5793,7 +7270,15 @@ def train_one_epoch_multi_step(
 
 
                 # ----- network outputs correction rate in model units -----
-                y_corr = _forward_main_head_with_edge_attr(model, x_in, pei, edge_attr=pea)
+                y_corr = _forward_main_head_chunked(
+                    x_in_all=x_in,
+                    edge_index_global=pei,
+                    edge_attr_global=pea,
+                    chunk_specs=chunk_specs_eff,
+                    step_k=step_k,
+                    step_t_abs=step_t_abs,
+                    stage_tag="train-main",
+                )
 
                 # ---------------------------
                 # NAN DEBUG: NN forward output
@@ -5979,7 +7464,15 @@ def train_one_epoch_multi_step(
                                 )
                                 x_stage_in = torch.cat([x_stage_in, parc_extra_stage.to(dtype=x_stage_in.dtype)], dim=1)
 
-                        y_corr_stage = _forward_main_head_with_edge_attr(model, x_stage_in, pei, edge_attr=pea)
+                        y_corr_stage = _forward_main_head_chunked(
+                            x_in_all=x_stage_in,
+                            edge_index_global=pei,
+                            edge_attr_global=pea,
+                            chunk_specs=chunk_specs_eff,
+                            step_k=step_k,
+                            step_t_abs=step_t_abs,
+                            stage_tag="train-rk4",
+                        )
                         y_stage = y_corr_stage
 
                         if need_phy and (dec_blend_w != 0.0) and (r_phy_stage is not None):
@@ -6152,6 +7645,7 @@ def train_one_epoch_multi_step(
                 and (len(feat_t_on_pred_list) > 1)
                 and (len(feat_tp1_on_pred_list) > 1)
                 and (runtime_domain_mode != "starting_mesh")
+                and (not runtime_multires_enabled)
             )
 
             for k in range(0, K - 1):
@@ -6171,6 +7665,11 @@ def train_one_epoch_multi_step(
                 n_src_tgt = -1
                 n_dst_tgt = -1
                 dtk = _to_scalar_dt(dt_list[k], device=device, dtype=state_feat.dtype)
+                t_dst_abs = (
+                    int(t_indices[k + 1].item())
+                    if (t_indices is not None and torch.is_tensor(t_indices))
+                    else (int(t_indices[k + 1]) if t_indices is not None else int(k + 1))
+                )
 
                 if (k == 0) and runtime_has_step0_precomp:
                     used_precomp_step0 = True
@@ -6238,27 +7737,67 @@ def train_one_epoch_multi_step(
                         batch_rt_mesh_predict_s += float(rebuild_timing.get("mesh_predict_s", 0.0))
                         batch_rt_mesh_materialize_s += float(rebuild_timing.get("mesh_materialize_s", 0.0))
                         batch_rt_edge_attr_s += float(rebuild_timing.get("edge_attr_s", 0.0))
+                        _runtime_mesh_plot_maybe_save(
+                            settings=runtime_mesh_plot_settings,
+                            state=runtime_mesh_plot_state,
+                            split="train",
+                            epoch_idx=epoch_idx,
+                            batch_idx=batch_idx,
+                            step_k=k,
+                            t_abs=int(t_dst_abs),
+                            pred_centers=active_pred_centers,
+                            pred_levels=active_pred_levels,
+                            H=H,
+                            W=W,
+                            bbox=runtime_bbox,
+                            refine_ratio=runtime_refine_ratio,
+                            wedge_path=runtime_mesh_plot_wedge_path,
+                        )
 
                         if k == 0:
                             n_src_xin = int(state_centers.shape[0])
                             n_dst_xin = int(active_pred_centers.shape[0])
-                            idw_dev_xin_t, idw_chunk_xin = _select_idw_backend(
-                                src_n=n_src_xin,
-                                requested_chunk=int(runtime_chunk),
-                                out_device=device,
-                            )
-                            idw_dev_xin = idw_dev_xin_t.type
-                            t_xin_t0 = time.perf_counter()
-                            x_in_abs = _map_gt_to_pred_mesh_once(
-                                src_centers=state_centers,
-                                src_feats=state_feat,
-                                pred_centers=active_pred_centers,
-                                knn_k=runtime_knn_k,
-                                chunk=runtime_chunk,
-                                knn_backend=runtime_idw_backend,
-                                knn_backend_kwargs=runtime_idw_backend_kwargs,
-                            )
-                            t_xin_map_s = time.perf_counter() - t_xin_t0
+                            if runtime_multires_enabled:
+                                if runtime_multires_lookup is None:
+                                    raise RuntimeError(
+                                        "Runtime multires GT lookup is enabled but lookup object is not initialized."
+                                    )
+                                t_xin_t0 = time.perf_counter()
+                                x_in_abs, xin_lookup_info = _lookup_gt_on_pred_mesh_multires(
+                                    lookup=runtime_multires_lookup,
+                                    t_dst=int(t_dst_abs),
+                                    dataset_name="feat_t_on_pred",
+                                    pred_centers=active_pred_centers,
+                                    pred_levels=active_pred_levels,
+                                    fallback_src_centers=state_centers,
+                                    fallback_src_feats=state_feat,
+                                    knn_k=runtime_knn_k,
+                                    chunk=runtime_chunk,
+                                    knn_backend=runtime_idw_backend,
+                                    knn_backend_kwargs=runtime_idw_backend_kwargs,
+                                    allow_fallback_to_idw=runtime_multires_fallback_to_idw,
+                                )
+                                t_xin_map_s = time.perf_counter() - t_xin_t0
+                                idw_dev_xin = str(xin_lookup_info.get("fallback_idw_dev", "lookup"))
+                                idw_chunk_xin = int(xin_lookup_info.get("fallback_idw_chunk", -1))
+                            else:
+                                idw_dev_xin_t, idw_chunk_xin = _select_idw_backend(
+                                    src_n=n_src_xin,
+                                    requested_chunk=int(runtime_chunk),
+                                    out_device=device,
+                                )
+                                idw_dev_xin = idw_dev_xin_t.type
+                                t_xin_t0 = time.perf_counter()
+                                x_in_abs = _map_gt_to_pred_mesh_once(
+                                    src_centers=state_centers,
+                                    src_feats=state_feat,
+                                    pred_centers=active_pred_centers,
+                                    knn_k=runtime_knn_k,
+                                    chunk=runtime_chunk,
+                                    knn_backend=runtime_idw_backend,
+                                    knn_backend_kwargs=runtime_idw_backend_kwargs,
+                                )
+                                t_xin_map_s = time.perf_counter() - t_xin_t0
                         else:
                             n_src_xin = int(state_centers.shape[0])
                             n_dst_xin = int(active_pred_centers.shape[0])
@@ -6297,27 +7836,58 @@ def train_one_epoch_multi_step(
                     gt_feat_tp1 = _to_dev_nb(feat_list[k + 1], dtype=torch.float32)
                     n_src_tgt = int(gt_centers_tp1.shape[0])
                     n_dst_tgt = int(active_pred_centers.shape[0])
-                    idw_dev_tgt_t, idw_chunk_tgt = _select_idw_backend(
-                        src_n=n_src_tgt,
-                        requested_chunk=int(runtime_chunk),
-                        out_device=device,
-                    )
-                    idw_dev_tgt = idw_dev_tgt_t.type
-                    t_xtgt_t0 = time.perf_counter()
-                    x_tgt_abs = _map_gt_to_pred_mesh_once(
-                        src_centers=gt_centers_tp1,
-                        src_feats=gt_feat_tp1,
-                        pred_centers=active_pred_centers,
-                        knn_k=runtime_knn_k,
-                        chunk=runtime_chunk,
-                        knn_backend=runtime_idw_backend,
-                        knn_backend_kwargs=runtime_idw_backend_kwargs,
-                    )
-                    t_xtgt_map_s = time.perf_counter() - t_xtgt_t0
+                    if runtime_multires_enabled:
+                        if runtime_multires_lookup is None:
+                            raise RuntimeError(
+                                "Runtime multires GT lookup is enabled but lookup object is not initialized."
+                            )
+                        t_xtgt_t0 = time.perf_counter()
+                        x_tgt_abs, xtgt_lookup_info = _lookup_gt_on_pred_mesh_multires(
+                            lookup=runtime_multires_lookup,
+                            t_dst=int(t_dst_abs),
+                            dataset_name="feat_tp1_on_pred",
+                            pred_centers=active_pred_centers,
+                            pred_levels=active_pred_levels,
+                            fallback_src_centers=gt_centers_tp1,
+                            fallback_src_feats=gt_feat_tp1,
+                            knn_k=runtime_knn_k,
+                            chunk=runtime_chunk,
+                            knn_backend=runtime_idw_backend,
+                            knn_backend_kwargs=runtime_idw_backend_kwargs,
+                            allow_fallback_to_idw=runtime_multires_fallback_to_idw,
+                        )
+                        t_xtgt_map_s = time.perf_counter() - t_xtgt_t0
+                        idw_dev_tgt = str(xtgt_lookup_info.get("fallback_idw_dev", "lookup"))
+                        idw_chunk_tgt = int(xtgt_lookup_info.get("fallback_idw_chunk", -1))
+                    else:
+                        idw_dev_tgt_t, idw_chunk_tgt = _select_idw_backend(
+                            src_n=n_src_tgt,
+                            requested_chunk=int(runtime_chunk),
+                            out_device=device,
+                        )
+                        idw_dev_tgt = idw_dev_tgt_t.type
+                        t_xtgt_t0 = time.perf_counter()
+                        x_tgt_abs = _map_gt_to_pred_mesh_once(
+                            src_centers=gt_centers_tp1,
+                            src_feats=gt_feat_tp1,
+                            pred_centers=active_pred_centers,
+                            knn_k=runtime_knn_k,
+                            chunk=runtime_chunk,
+                            knn_backend=runtime_idw_backend,
+                            knn_backend_kwargs=runtime_idw_backend_kwargs,
+                        )
+                        t_xtgt_map_s = time.perf_counter() - t_xtgt_t0
 
                 batch_rt_idw_remap_s += float(t_xin_map_s + t_xtgt_map_s)
 
                 dtk = dtk.to(device=device, dtype=x_in_abs.dtype, non_blocking=True)
+                step_t_abs_for_chunk = None
+                if t_indices is not None:
+                    step_t_abs_for_chunk = (
+                        int(t_indices[k + 1].item())
+                        if torch.is_tensor(t_indices)
+                        else int(t_indices[k + 1])
+                    )
 
                 t_model_t0 = time.perf_counter()
                 if batch_dbg:
@@ -6329,6 +7899,7 @@ def train_one_epoch_multi_step(
                     )
                 loss_k, y_pred_abs_k, _ = _run_step(
                     step_k=k,
+                    step_t_abs=step_t_abs_for_chunk,
                     pred_centers=active_pred_centers,
                     pred_levels=active_pred_levels,
                     pred_parents=active_pred_parents,
@@ -6490,9 +8061,13 @@ def train_one_epoch_multi_step(
             dt0 = torch.tensor(float(dt0), device=device, dtype=x_in_abs0.dtype)
 
         dt_ref_scalar = batch.get("dt_ref", None)
+        step0_t_abs = None
+        if t_indices is not None:
+            step0_t_abs = int(t_indices[1].item()) if torch.is_tensor(t_indices) else int(t_indices[1])
 
         loss0, y_pred_abs0, _x_tgt_abs0 = _run_step(
             step_k=0,
+            step_t_abs=step0_t_abs,
             pred_centers=pred_centers_1,
             pred_levels=pred_levels_1,
             pred_parents=pred_parents_1,
@@ -6654,9 +8229,13 @@ def train_one_epoch_multi_step(
             pred_ei_next      = _to_dev_nb(pred_ei_next)
             mask_pred_next    = _to_dev_nb(mask_pred_next)
             pred_ea_next      = _to_dev_nb(pred_ea_next)
+            stepk_t_abs = None
+            if t_indices is not None:
+                stepk_t_abs = int(t_indices[k + 1].item()) if torch.is_tensor(t_indices) else int(t_indices[k + 1])
 
             loss_k, y_pred_abs_k, _ = _run_step(
                 step_k=k,
+                step_t_abs=stepk_t_abs,
                 pred_centers=pred_centers_next,
                 pred_levels=pred_levels_next,
                 pred_parents=pred_parents_next,
@@ -6716,6 +8295,9 @@ def train_one_epoch_multi_step(
         "num_steps": n_steps,
         **_finalize_diagnostics_accumulator(diagnostics_accum, diag_cfg),
     }
+    if runtime_multires_lookup is not None:
+        runtime_multires_lookup.close()
+        runtime_multires_lookup = None
     return total_loss_accum / denom, mae_accum / denom, stats
 
 def evaluate_one_epoch_multi_step(
@@ -6787,6 +8369,10 @@ def evaluate_one_epoch_multi_step(
 
     runtime_mesh_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
     runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
+    runtime_multires_cfg = _runtime_multires_lookup_cfg(cfg)
+    runtime_multires_enabled = bool(runtime_mesh_enabled and runtime_multires_cfg.get("enabled", False))
+    runtime_multires_fallback_to_idw = bool(runtime_multires_cfg.get("fallback_to_idw", True))
+    runtime_multires_lookup: Optional[_RuntimeMultiResGtLookup] = None
     runtime_infer_only = bool(infer_only)
     runtime_update_every = int(runtime_mesh_cfg.get("update_every_steps", 1))
     runtime_mesh_backend = _runtime_mesh_backend(cfg)
@@ -6796,6 +8382,9 @@ def evaluate_one_epoch_multi_step(
     runtime_bbox = _get_bbox(cfg)
     runtime_refine_ratio = _get_refine_ratio(cfg)
     runtime_need_edge_attr = bool(need_phy and (not use_mls))
+    runtime_mesh_plot_settings = _runtime_mesh_plot_settings(cfg)
+    runtime_mesh_plot_state = {"rebuilds": 0, "saved": 0}
+    runtime_mesh_plot_wedge_path = None
     runtime_wedge_path = None
     runtime_wedge_constraints = None
     runtime_base_mesh = None
@@ -6836,11 +8425,58 @@ def evaluate_one_epoch_multi_step(
             raise RuntimeError(
                 "Runtime mesh backend is 'cnn' but runtime_mesh_policy was not loaded."
             )
+        if runtime_multires_enabled:
+            level_files = _resolve_runtime_multires_level_files(runtime_multires_cfg)
+            if not level_files:
+                raise RuntimeError(
+                    "Runtime multires GT lookup is enabled, but no level files were resolved. "
+                    "Set train.runtime_mesh.multires_gt_lookup.level_files "
+                    "or train.runtime_mesh.multires_gt_lookup.directory."
+                )
+            max_level_policy = int(cfg.get("policy", {}).get("max_level", max(level_files.keys())))
+            runtime_multires_lookup = _RuntimeMultiResGtLookup(
+                level_files=level_files,
+                H=H,
+                W=W,
+                bbox=runtime_bbox,
+                refine_ratio=runtime_refine_ratio,
+                max_level=max_level_policy,
+                max_cached_feature_steps=int(runtime_multires_cfg.get("max_cached_feature_steps", 16)),
+            )
         print(
             f"[RUNTIME-MESH] eval loop active (backend={runtime_mesh_backend}, domain_mode={runtime_domain_mode}, "
             f"idw_backend={runtime_idw_backend}, update_every_steps={runtime_update_every}, "
             f"infer_only={int(runtime_infer_only)})"
         )
+        if bool(runtime_mesh_plot_settings.get("enabled", False)):
+            print(
+                "[RUNTIME-MESH][PLOT] enabled: "
+                f"out_dir={runtime_mesh_plot_settings.get('out_dir')} "
+                f"split={runtime_mesh_plot_settings.get('split')} "
+                f"every_rebuilds={int(runtime_mesh_plot_settings.get('every_rebuilds', 1))} "
+                f"max_plots={int(runtime_mesh_plot_settings.get('max_plots', 0))}",
+                flush=True,
+            )
+        if runtime_multires_enabled:
+            levels_sorted = sorted(runtime_multires_lookup.level_files.keys()) if runtime_multires_lookup is not None else []
+            print(
+                f"[RUNTIME-MESH][MULTIRES] GT lookup enabled: levels={levels_sorted}, "
+                f"fallback_to_idw={int(runtime_multires_fallback_to_idw)}",
+                flush=True,
+            )
+        runtime_mesh_plot_wedge_path = runtime_wedge_path
+        if (
+            bool(runtime_mesh_plot_settings.get("enabled", False))
+            and bool(runtime_mesh_plot_settings.get("show_wedge", True))
+            and (runtime_mesh_plot_wedge_path is None)
+        ):
+            try:
+                runtime_mesh_plot_wedge_path = _load_wedge_path_from_spec(str(mesh_spec_path), cfg)
+            except Exception as e:
+                print(
+                    f"[RUNTIME-MESH][PLOT][WARN] Could not load wedge path for overlay: {e!r}",
+                    flush=True,
+                )
         if runtime_infer_only:
             print(
                 "[RUNTIME-MESH] infer_only enabled: skipping GT->pred remap and target-based eval metrics/loss.",
@@ -7545,6 +9181,7 @@ def evaluate_one_epoch_multi_step(
                     and (len(feat_t_on_pred_list) > 1)
                     and (len(feat_tp1_on_pred_list) > 1)
                     and (runtime_domain_mode != "starting_mesh")
+                    and (not runtime_multires_enabled)
                 )
 
                 for k in range(0, K - 1):
@@ -7564,6 +9201,11 @@ def evaluate_one_epoch_multi_step(
                     n_src_tgt = -1
                     n_dst_tgt = -1
                     dtk = _to_scalar_dt(dt_list[k], device=device, dtype=state_feat.dtype)
+                    t_dst_abs = (
+                        int(t_indices[k + 1].item())
+                        if (t_indices is not None and torch.is_tensor(t_indices))
+                        else (int(t_indices[k + 1]) if t_indices is not None else int(k + 1))
+                    )
 
                     if (k == 0) and runtime_has_step0_precomp:
                         used_precomp_step0 = True
@@ -7633,27 +9275,67 @@ def evaluate_one_epoch_multi_step(
                                 dt_ref=dt_ref_scalar,
                             )
                             t_rebuild_s = time.perf_counter() - t_rebuild_t0
+                            _runtime_mesh_plot_maybe_save(
+                                settings=runtime_mesh_plot_settings,
+                                state=runtime_mesh_plot_state,
+                                split="eval",
+                                epoch_idx=epoch_idx,
+                                batch_idx=batch_idx,
+                                step_k=k,
+                                t_abs=int(t_dst_abs),
+                                pred_centers=active_pred_centers,
+                                pred_levels=active_pred_levels,
+                                H=H,
+                                W=W,
+                                bbox=runtime_bbox,
+                                refine_ratio=runtime_refine_ratio,
+                                wedge_path=runtime_mesh_plot_wedge_path,
+                            )
 
                             if k == 0:
                                 n_src_xin = int(state_centers.shape[0])
                                 n_dst_xin = int(active_pred_centers.shape[0])
-                                idw_dev_xin_t, idw_chunk_xin = _select_idw_backend(
-                                    src_n=n_src_xin,
-                                    requested_chunk=int(runtime_chunk),
-                                    out_device=device,
-                                )
-                                idw_dev_xin = idw_dev_xin_t.type
-                                t_xin_t0 = time.perf_counter()
-                                x_in_abs = _map_gt_to_pred_mesh_once(
-                                    src_centers=state_centers,
-                                    src_feats=state_feat,
-                                    pred_centers=active_pred_centers,
-                                    knn_k=runtime_knn_k,
-                                    chunk=runtime_chunk,
-                                    knn_backend=runtime_idw_backend,
-                                    knn_backend_kwargs=runtime_idw_backend_kwargs,
-                                )
-                                t_xin_map_s = time.perf_counter() - t_xin_t0
+                                if runtime_multires_enabled:
+                                    if runtime_multires_lookup is None:
+                                        raise RuntimeError(
+                                            "Runtime multires GT lookup is enabled but lookup object is not initialized."
+                                        )
+                                    t_xin_t0 = time.perf_counter()
+                                    x_in_abs, xin_lookup_info = _lookup_gt_on_pred_mesh_multires(
+                                        lookup=runtime_multires_lookup,
+                                        t_dst=int(t_dst_abs),
+                                        dataset_name="feat_t_on_pred",
+                                        pred_centers=active_pred_centers,
+                                        pred_levels=active_pred_levels,
+                                        fallback_src_centers=state_centers,
+                                        fallback_src_feats=state_feat,
+                                        knn_k=runtime_knn_k,
+                                        chunk=runtime_chunk,
+                                        knn_backend=runtime_idw_backend,
+                                        knn_backend_kwargs=runtime_idw_backend_kwargs,
+                                        allow_fallback_to_idw=runtime_multires_fallback_to_idw,
+                                    )
+                                    t_xin_map_s = time.perf_counter() - t_xin_t0
+                                    idw_dev_xin = str(xin_lookup_info.get("fallback_idw_dev", "lookup"))
+                                    idw_chunk_xin = int(xin_lookup_info.get("fallback_idw_chunk", -1))
+                                else:
+                                    idw_dev_xin_t, idw_chunk_xin = _select_idw_backend(
+                                        src_n=n_src_xin,
+                                        requested_chunk=int(runtime_chunk),
+                                        out_device=device,
+                                    )
+                                    idw_dev_xin = idw_dev_xin_t.type
+                                    t_xin_t0 = time.perf_counter()
+                                    x_in_abs = _map_gt_to_pred_mesh_once(
+                                        src_centers=state_centers,
+                                        src_feats=state_feat,
+                                        pred_centers=active_pred_centers,
+                                        knn_k=runtime_knn_k,
+                                        chunk=runtime_chunk,
+                                        knn_backend=runtime_idw_backend,
+                                        knn_backend_kwargs=runtime_idw_backend_kwargs,
+                                    )
+                                    t_xin_map_s = time.perf_counter() - t_xin_t0
                             else:
                                 n_src_xin = int(state_centers.shape[0])
                                 n_dst_xin = int(active_pred_centers.shape[0])
@@ -7695,23 +9377,47 @@ def evaluate_one_epoch_multi_step(
                             gt_feat_tp1 = feat_list[k + 1].to(device=device, dtype=torch.float32)
                             n_src_tgt = int(gt_centers_tp1.shape[0])
                             n_dst_tgt = int(active_pred_centers.shape[0])
-                            idw_dev_tgt_t, idw_chunk_tgt = _select_idw_backend(
-                                src_n=n_src_tgt,
-                                requested_chunk=int(runtime_chunk),
-                                out_device=device,
-                            )
-                            idw_dev_tgt = idw_dev_tgt_t.type
-                            t_xtgt_t0 = time.perf_counter()
-                            x_tgt_abs = _map_gt_to_pred_mesh_once(
-                                src_centers=gt_centers_tp1,
-                                src_feats=gt_feat_tp1,
-                                pred_centers=active_pred_centers,
-                                knn_k=runtime_knn_k,
-                                chunk=runtime_chunk,
-                                knn_backend=runtime_idw_backend,
-                                knn_backend_kwargs=runtime_idw_backend_kwargs,
-                            )
-                            t_xtgt_map_s = time.perf_counter() - t_xtgt_t0
+                            if runtime_multires_enabled:
+                                if runtime_multires_lookup is None:
+                                    raise RuntimeError(
+                                        "Runtime multires GT lookup is enabled but lookup object is not initialized."
+                                    )
+                                t_xtgt_t0 = time.perf_counter()
+                                x_tgt_abs, xtgt_lookup_info = _lookup_gt_on_pred_mesh_multires(
+                                    lookup=runtime_multires_lookup,
+                                    t_dst=int(t_dst_abs),
+                                    dataset_name="feat_tp1_on_pred",
+                                    pred_centers=active_pred_centers,
+                                    pred_levels=active_pred_levels,
+                                    fallback_src_centers=gt_centers_tp1,
+                                    fallback_src_feats=gt_feat_tp1,
+                                    knn_k=runtime_knn_k,
+                                    chunk=runtime_chunk,
+                                    knn_backend=runtime_idw_backend,
+                                    knn_backend_kwargs=runtime_idw_backend_kwargs,
+                                    allow_fallback_to_idw=runtime_multires_fallback_to_idw,
+                                )
+                                t_xtgt_map_s = time.perf_counter() - t_xtgt_t0
+                                idw_dev_tgt = str(xtgt_lookup_info.get("fallback_idw_dev", "lookup"))
+                                idw_chunk_tgt = int(xtgt_lookup_info.get("fallback_idw_chunk", -1))
+                            else:
+                                idw_dev_tgt_t, idw_chunk_tgt = _select_idw_backend(
+                                    src_n=n_src_tgt,
+                                    requested_chunk=int(runtime_chunk),
+                                    out_device=device,
+                                )
+                                idw_dev_tgt = idw_dev_tgt_t.type
+                                t_xtgt_t0 = time.perf_counter()
+                                x_tgt_abs = _map_gt_to_pred_mesh_once(
+                                    src_centers=gt_centers_tp1,
+                                    src_feats=gt_feat_tp1,
+                                    pred_centers=active_pred_centers,
+                                    knn_k=runtime_knn_k,
+                                    chunk=runtime_chunk,
+                                    knn_backend=runtime_idw_backend,
+                                    knn_backend_kwargs=runtime_idw_backend_kwargs,
+                                )
+                                t_xtgt_map_s = time.perf_counter() - t_xtgt_t0
 
                     dtk = dtk.to(device=device, dtype=x_in_abs.dtype)
 
@@ -8084,6 +9790,9 @@ def evaluate_one_epoch_multi_step(
             }
             if collect_examples:
                 stats["examples"] = examples
+            if runtime_multires_lookup is not None:
+                runtime_multires_lookup.close()
+                runtime_multires_lookup = None
             return avg_loss, stats
         raise RuntimeError("No steps accumulated; check loader/window_size.")
 
@@ -8161,6 +9870,9 @@ def evaluate_one_epoch_multi_step(
     }
     if collect_examples:
         stats["examples"] = examples
+    if runtime_multires_lookup is not None:
+        runtime_multires_lookup.close()
+        runtime_multires_lookup = None
     return avg_loss, stats
 
 def parent_mask_from_selected(pred_parents: torch.Tensor,
@@ -8415,6 +10127,19 @@ def main(
     runtime_mesh_idw_cfg.setdefault("faiss_cache", True)
     runtime_mesh_idw_cfg.setdefault("faiss_cache_max_entries", 4)
     runtime_mesh_idw_cfg.setdefault("allow_fallback_to_exact", True)
+    runtime_multires_cfg = runtime_mesh_cfg.setdefault("multires_gt_lookup", {})
+    if isinstance(runtime_multires_cfg, bool):
+        runtime_multires_cfg = {"enabled": bool(runtime_multires_cfg)}
+        runtime_mesh_cfg["multires_gt_lookup"] = runtime_multires_cfg
+    if not isinstance(runtime_multires_cfg, dict):
+        raise ValueError("train.runtime_mesh.multires_gt_lookup must be a bool or JSON object.")
+    runtime_multires_cfg.setdefault("enabled", False)
+    runtime_multires_cfg.setdefault("directory", "")
+    runtime_multires_cfg.setdefault("level_files", {})
+    runtime_multires_cfg.setdefault("fallback_to_idw", True)
+    runtime_multires_cfg.setdefault("max_cached_feature_steps", 16)
+    if runtime_multires_cfg["level_files"] and (not isinstance(runtime_multires_cfg["level_files"], dict)):
+        raise ValueError("train.runtime_mesh.multires_gt_lookup.level_files must be a JSON object.")
     runtime_mesh_cnn_cfg = runtime_mesh_cfg.setdefault("cnn", {})
     if not isinstance(runtime_mesh_cnn_cfg, dict):
         raise ValueError("train.runtime_mesh.cnn must be a JSON object when provided.")
@@ -8422,6 +10147,12 @@ def main(
     runtime_mesh_cnn_cfg.setdefault("include_parent_mask", True)
     runtime_mesh_cnn_cfg.setdefault("include_coords", True)
     runtime_mesh_cnn_cfg.setdefault("include_dt", False)
+    runtime_mesh_cnn_cfg.setdefault("include_gradients", False)
+    runtime_mesh_cnn_cfg.setdefault("feature_norm_mode", "auto")
+    runtime_mesh_cnn_cfg.setdefault("feature_norm_stats", {})
+    runtime_mesh_cnn_cfg.setdefault("gradient_feature_indices", {})
+    runtime_mesh_cnn_cfg.setdefault("gradient_norm_mode", "auto")
+    runtime_mesh_cnn_cfg.setdefault("gradient_norm_stats", {})
     runtime_mesh_cnn_cfg.setdefault("dt_channel_mode", "dt_hat")
     runtime_mesh_cnn_cfg.setdefault("threshold_default", 0.5)
     runtime_mesh_cnn_cfg.setdefault("threshold_by_level", {})
@@ -8433,12 +10164,48 @@ def main(
     step_log_cfg.setdefault("enabled", False)
     step_log_cfg.setdefault("path", os.path.join(cfg.get("train", {}).get("save_dir", "."), "runtime_step_log.csv"))
     step_log_cfg.setdefault("append", False)
+    mesh_plot_cfg = runtime_mesh_cfg.setdefault("mesh_plot", {})
+    if not isinstance(mesh_plot_cfg, dict):
+        raise ValueError("train.runtime_mesh.mesh_plot must be a JSON object when provided.")
+    mesh_plot_cfg.setdefault("enabled", False)
+    mesh_plot_cfg.setdefault("out_dir", os.path.join(cfg.get("train", {}).get("save_dir", "."), "runtime_mesh_plots"))
+    mesh_plot_cfg.setdefault("split", "train")
+    mesh_plot_cfg.setdefault("every_rebuilds", 1)
+    mesh_plot_cfg.setdefault("max_plots", 20)
+    mesh_plot_cfg.setdefault("dpi", 180)
+    mesh_plot_cfg.setdefault("line_width", 0.2)
+    mesh_plot_cfg.setdefault("show_wedge", True)
+    chunk_cfg = cfg.setdefault("chunk", {})
+    if not isinstance(chunk_cfg, dict):
+        raise ValueError("chunk must be a JSON object when provided.")
+    chunk_cfg.setdefault("enabled", False)
+    chunk_cfg.setdefault("num_chunks", 16)
+    chunk_cfg.setdefault("halo_hops", 2)
+    chunk_cfg.setdefault("partition_mode", "parent_grid")
+    chunk_cfg.setdefault("activity_threshold", 0.0)
+    chunk_builder_cfg = chunk_cfg.setdefault("builder", {})
+    if not isinstance(chunk_builder_cfg, dict):
+        raise ValueError("chunk.builder must be a JSON object when provided.")
+    chunk_builder_cfg.setdefault("enabled", False)
+    chunk_builder_cfg.setdefault("sidecar_path", "")
+    chunk_builder_cfg.setdefault("overwrite", False)
+    chunk_builder_cfg.setdefault("progress", True)
+    chunk_builder_cfg.setdefault("compute_activity", True)
+    chunk_builder_cfg.setdefault("activity_feature_idx", [])
+    chunk_builder_cfg.setdefault("max_timesteps", None)
+    debug_cfg = cfg.setdefault("debug", {})
+    if not isinstance(debug_cfg, dict):
+        raise ValueError("debug must be a JSON object when provided.")
+    debug_cfg.setdefault("print_chunk_stats", False)
+    debug_cfg.setdefault("chunk_stats_every_steps", 1)
+    debug_cfg.setdefault("chunk_stats_include_rk4", False)
     diag_cfg_main = _resolve_diagnostics_cfg(cfg)
 
     runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
     runtime_update_every = int(runtime_mesh_cfg.get("update_every_steps", 1))
     if runtime_update_every < 1:
         raise ValueError("train.runtime_mesh.update_every_steps must be >= 1.")
+    _runtime_mesh_plot_settings(cfg)
 
     if runtime_mesh_enabled:
         runtime_backend = _runtime_mesh_backend(cfg)
@@ -8757,6 +10524,7 @@ def main(
                 progress=True,
                 cache_path=cache_path,
                 force_recompute=force_recompute,
+                require_existing_cache_when_not_forced=True,
             )
         else:
             precomp = precompute_pred_mesh_and_interps_for_rollout(
@@ -8770,6 +10538,7 @@ def main(
                 progress=True,
                 cache_path=cache_path,
                 force_recompute=force_recompute,
+                require_existing_cache_when_not_forced=True,
             )
 
         precomp = move_precomp_to_device(precomp, device="cpu")
@@ -8836,6 +10605,31 @@ def main(
         test_ds, batch_size=1, sampler=RandomSampler(test_ds),
         num_workers=0, pin_memory=False, collate_fn=collate
     )
+
+    chunk_sidecar_reader = None
+    chunk_cfg_main = cfg.get("chunk", {}) or {}
+    if bool(chunk_cfg_main.get("enabled", False)):
+        chunk_builder_cfg_main = chunk_cfg_main.get("builder", {}) or {}
+        precomp_path_for_sidecar = str(cfg.get("train", {}).get("precomp_cache_path", "")).strip()
+        sidecar_path_cfg = str(chunk_builder_cfg_main.get("sidecar_path", "")).strip()
+        if precomp_path_for_sidecar:
+            sidecar_path = derive_sidecar_path(precomp_path_for_sidecar, sidecar_path_cfg)
+            if os.path.exists(sidecar_path):
+                try:
+                    chunk_sidecar_reader = ChunkSidecarH5(sidecar_path)
+                    print(f"[CHUNK] loaded sidecar: {sidecar_path}")
+                except Exception as e:
+                    print(f"[CHUNK][WARN] failed to open sidecar '{sidecar_path}': {e!r}. Falling back to on-the-fly chunking.")
+            else:
+                print(
+                    f"[CHUNK][INFO] sidecar not found at '{sidecar_path}'. "
+                    "Falling back to on-the-fly chunking."
+                )
+        else:
+            print(
+                "[CHUNK][INFO] train.precomp_cache_path is empty; "
+                "chunking will use on-the-fly partitioning."
+            )
 
     # --- Step A debug (ONE batch, ONE step) ---
     if cfg.get("debug", {}).get("run_stepA", False):
@@ -9071,6 +10865,7 @@ def main(
             model, train_loader, opt, cfg, device,
             H=H, W=W, dx=dx, dy=dy, mu=mu, sigma=sigma, epoch_idx=epoch,
             runtime_mesh_policy=runtime_mesh_policy,
+            chunk_sidecar=chunk_sidecar_reader,
         )
         run_validation = ((epoch % val_every) == 0) or (epoch == total_epochs)
         vl_loss = float("nan")
@@ -9191,6 +10986,12 @@ def main(
             print(f"[RUNTIME-MESH] step log summary written: {summary_path}")
         except Exception as e:
             print(f"[RUNTIME-MESH][WARN] failed to write step log summary: {e!r}")
+
+    if chunk_sidecar_reader is not None:
+        try:
+            chunk_sidecar_reader.close()
+        except Exception:
+            pass
 
                 
 if __name__ == "__main__":
