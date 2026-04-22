@@ -23,7 +23,7 @@
   },
 
   "policy": {
-    "geometry_mode": "starting_refine",
+    "geometry_mode": "gt_gradients",
     "_comment_geometry_mode": "gt_gradients or starting_refine for uniform mesh",
     "starting_refine_policy": "min_level",
     "starting_refine_to_level": 3,
@@ -35,7 +35,7 @@
     "percentile_low": 85.0,
     "percentile_high": 95.0,
     "percentiles_by_level": {
-      "selection": "global",
+      "selection": "per_level",
       "_comment_selection": "global or per_level (or auto)",
       "1": {
         "low": 84.0,
@@ -183,7 +183,7 @@
 
   "train": {
     "precomp_cache_path": "./cache/L3_uniform/64by64-coarse/shock_ramp_precomp_L3_uniform_faceAdj_DEC.h5",
-    "precomp_force_recompute": true,
+    "precomp_force_recompute": false,
     "precompute_t_start": null,
     "precompute_t_end": null,
     "_comment_precompute_t_range": "Optional inclusive raw-snapshot range [start,end] used before windowing/precompute/training. Need at least 2 snapshots (e.g., 50..51 for one transition).",
@@ -199,10 +199,10 @@
       "detach_policy_input": true,
       "reset_to_coarse_each_step": true,
       "refine_only": true,
-      "max_cells_per_step": 500000,
-      "policy_backend": "gradient",
+      "max_cells_per_step": 1000000,
+      "policy_backend": "gradient_fast",
       "cnn": {
-        "checkpoint_path": "./runs_mesh_policy_cnn/without_parent_masks/unet_hierarchical/max_level_3/500ep_lr-scheduler_predict-next-ts_3-29-26/mesh_policy_cnn_last.pt",
+        "checkpoint_path": "./runs_mesh_policy_cnn/without_parent_masks/unet_hierarchical/max_level_3/predict_next_ts/500ep_lr-scheduler_predict-next-ts_3-29-26/mesh_policy_cnn_last.pt",
         "include_parent_mask": false,
         "include_coords": true,
         "include_dt": true,
@@ -218,7 +218,9 @@
         "append": false
       },
       "mesh_plot": {
-        "enabled": false,
+        "enabled": true,
+        "plot_predictor_inputs": true,
+        "plot_gt_features": true,
         "out_dir": "./runs_mesh_first/runtime_mesh_plots",
         "split": "train",
         "_comment_split": "train, eval, or both",
@@ -235,11 +237,11 @@
         "allow_fallback_to_exact": false
       },
       "multires_gt_lookup": {
-      "enabled": true,
-      "directory": "./cache/first_simulation/64by64-coarse/uniform_mesh/",
-      "level_files": {},
-      "fallback_to_idw": true,
-      "max_cached_feature_steps": 16
+        "enabled": true,
+        "directory": "./cache/first_simulation/64by64-coarse/uniform_mesh/",
+        "level_files": {},
+        "fallback_to_idw": true,
+        "max_cached_feature_steps": 16
       }
     },
 

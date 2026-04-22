@@ -21,6 +21,7 @@ from __future__ import annotations
 print("[train.py] module import started", flush=True)
 from typing import Dict, Any, List, Tuple, Optional, Sequence
 from collections import OrderedDict
+import inspect
 import os, io, json, time, zipfile, random, sys, csv, datetime, hashlib, re
 import torch
 import torch.nn.functional as F
@@ -34,7 +35,7 @@ from dataset import CellRefineWindowDataset
 from models import FeatureNet, ParcFeatureAdapter
 from amr_policy import coarse_aggregate_from_dynamic, predict_masks_hierarchical_from_gt_gradients
             
-from plots import plot_loss_curves
+from plots import plot_loss_curves, amr_composite_to_finest_grid
 from utils_geom import build_idw_map, apply_idw_map, apply_precomputed_idw_map, dynamic_cells_from_parent_masks
 
 from pretrain import (
@@ -1573,10 +1574,35 @@ def _forward_main_head(
     edge_index: torch.Tensor,
     edge_attr: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    feat_only_supported = getattr(model, "_feat_only_forward_supported", None)
+    if feat_only_supported is None:
+        try:
+            sig = inspect.signature(model.forward)
+            params = sig.parameters
+            feat_only_supported = ("return_score" in params) and ("return_hidden" in params)
+        except Exception:
+            feat_only_supported = False
+        try:
+            setattr(model, "_feat_only_forward_supported", bool(feat_only_supported))
+        except Exception:
+            pass
+
     if edge_attr is None:
-        out = model(X, edge_index)
+        if feat_only_supported:
+            out = model(X, edge_index, return_score=False, return_hidden=False)
+        else:
+            out = model(X, edge_index)
     else:
-        out = model(X, edge_index, edge_attr=edge_attr)
+        if feat_only_supported:
+            out = model(
+                X,
+                edge_index,
+                edge_attr=edge_attr,
+                return_score=False,
+                return_hidden=False,
+            )
+        else:
+            out = model(X, edge_index, edge_attr=edge_attr)
     if isinstance(out, (list, tuple)):
         return out[0]
     return out
@@ -1954,6 +1980,31 @@ def _runtime_mesh_plot_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
     line_width = float(plot_cfg.get("line_width", 0.2))
     if line_width <= 0.0:
         raise ValueError("train.runtime_mesh.mesh_plot.line_width must be > 0.")
+    predictor_input_max_channels = int(plot_cfg.get("predictor_input_max_channels", 4))
+    if predictor_input_max_channels < 1:
+        raise ValueError("train.runtime_mesh.mesh_plot.predictor_input_max_channels must be >= 1.")
+    gt_feature_max_channels = int(plot_cfg.get("gt_feature_max_channels", 4))
+    if gt_feature_max_channels < 1:
+        raise ValueError("train.runtime_mesh.mesh_plot.gt_feature_max_channels must be >= 1.")
+    gt_feature_indices_raw = plot_cfg.get("gt_feature_indices", [])
+    if gt_feature_indices_raw is None:
+        gt_feature_indices_raw = []
+    if not isinstance(gt_feature_indices_raw, (list, tuple)):
+        raise ValueError("train.runtime_mesh.mesh_plot.gt_feature_indices must be a list of integers.")
+    gt_feature_indices: List[int] = []
+    for v in gt_feature_indices_raw:
+        try:
+            gt_feature_indices.append(int(v))
+        except Exception:
+            raise ValueError(
+                f"train.runtime_mesh.mesh_plot.gt_feature_indices contains non-integer value: {v!r}"
+            )
+    feat_names_cfg = cfg.get("features", {}).get("names", None)
+    if not isinstance(feat_names_cfg, (list, tuple)):
+        feat_names_cfg = cfg.get("features", {}).get("dataset_order", None)
+    if not isinstance(feat_names_cfg, (list, tuple)):
+        feat_names_cfg = []
+    feature_names = [str(nm) for nm in feat_names_cfg]
     return {
         "enabled": bool(plot_cfg.get("enabled", False)),
         "out_dir": os.path.abspath(os.path.expanduser(str(plot_cfg.get("out_dir", out_default)))),
@@ -1963,6 +2014,12 @@ def _runtime_mesh_plot_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "dpi": dpi,
         "line_width": line_width,
         "show_wedge": bool(plot_cfg.get("show_wedge", True)),
+        "plot_predictor_inputs": bool(plot_cfg.get("plot_predictor_inputs", False)),
+        "predictor_input_max_channels": predictor_input_max_channels,
+        "plot_gt_features": bool(plot_cfg.get("plot_gt_features", False)),
+        "gt_feature_max_channels": gt_feature_max_channels,
+        "gt_feature_indices": gt_feature_indices,
+        "feature_names": feature_names,
     }
 
 
@@ -2051,6 +2108,292 @@ def _save_runtime_pred_mesh_plot(
     plt.close(fig)
 
 
+def _runtime_predictor_input_to_panels(
+    *,
+    predictor_input: Dict[str, Any] | None,
+    max_channels: int,
+) -> tuple[str, list[tuple[str, np.ndarray]]]:
+    if (predictor_input is None) or (not isinstance(predictor_input, dict)):
+        return "unknown", []
+    backend = str(predictor_input.get("backend", "unknown"))
+    panels: list[tuple[str, np.ndarray]] = []
+
+    if backend == "gradient_fast":
+        coarse_hwf = predictor_input.get("coarse_hwf", None)
+        selected_idx = predictor_input.get("selected_idx", [])
+        g_base_hxw = predictor_input.get("g_base_hxw", None)
+        if torch.is_tensor(coarse_hwf) and coarse_hwf.ndim == 3:
+            Fdim = int(coarse_hwf.shape[2])
+            idxs = [int(i) for i in selected_idx] if isinstance(selected_idx, (list, tuple)) else list(range(Fdim))
+            if len(idxs) == 0:
+                idxs = list(range(Fdim))
+            for c in idxs[: int(max_channels)]:
+                if 0 <= int(c) < Fdim:
+                    panels.append((f"coarse[c={int(c)}]", coarse_hwf[:, :, int(c)].detach().cpu().numpy()))
+        if torch.is_tensor(g_base_hxw) and g_base_hxw.ndim == 2:
+            panels.append(("combined_grad_score", g_base_hxw.detach().cpu().numpy()))
+        return backend, panels
+
+    if backend == "cnn":
+        x_in_chw = predictor_input.get("x_in_chw", None)
+        channel_names = predictor_input.get("channel_names", None)
+        if torch.is_tensor(x_in_chw) and x_in_chw.ndim == 3:
+            C = int(x_in_chw.shape[0])
+            if not isinstance(channel_names, (list, tuple)):
+                channel_names = [f"input[{i}]" for i in range(C)]
+            for c in range(min(int(max_channels), C)):
+                nm = str(channel_names[c]) if c < len(channel_names) else f"input[{c}]"
+                panels.append((nm, x_in_chw[c].detach().cpu().numpy()))
+        return backend, panels
+
+    if backend == "gradient":
+        G = predictor_input.get("G", None)
+        pooled = predictor_input.get("pooled_up", None)
+        if isinstance(G, dict):
+            for L in sorted(G.keys(), key=lambda v: int(v)):
+                v = G[L]
+                if torch.is_tensor(v) and v.ndim == 2:
+                    panels.append((f"G[L={int(L)}]", v.detach().cpu().numpy()))
+                if len(panels) >= int(max_channels):
+                    break
+        if isinstance(pooled, dict):
+            for L in sorted(pooled.keys(), key=lambda v: int(v)):
+                v = pooled[L]
+                if torch.is_tensor(v) and v.ndim == 2:
+                    panels.append((f"pooled_up[L={int(L)}]", v.detach().cpu().numpy()))
+                if len(panels) >= int(max_channels) + 1:
+                    break
+        return backend, panels
+
+    return backend, panels
+
+
+def _save_runtime_predictor_input_plot(
+    *,
+    out_path: str,
+    predictor_input: Dict[str, Any] | None,
+    title_prefix: str,
+    bbox: Tuple[float, float, float, float],
+    dpi: int = 180,
+    max_channels: int = 4,
+    wedge_path=None,
+    show_wedge: bool = True,
+) -> bool:
+    backend, panels = _runtime_predictor_input_to_panels(
+        predictor_input=predictor_input,
+        max_channels=int(max_channels),
+    )
+    if len(panels) == 0:
+        return False
+
+    # Local import to avoid forcing matplotlib on non-plot runs.
+    import matplotlib.pyplot as plt
+
+    n = int(len(panels))
+    ncols = min(3, n)
+    nrows = int(np.ceil(float(n) / float(max(1, ncols))))
+    fig, axs = plt.subplots(nrows=nrows, ncols=ncols, figsize=(5.0 * ncols, 3.8 * nrows), dpi=int(dpi))
+    axs_arr = np.atleast_1d(axs).reshape(-1)
+    xmin, xmax, ymin, ymax = [float(v) for v in bbox]
+
+    for i, (nm, img) in enumerate(panels):
+        ax = axs_arr[i]
+        arr = np.asarray(img, dtype=np.float32)
+        if arr.ndim != 2:
+            ax.axis("off")
+            ax.set_title(f"{nm} (invalid shape)")
+            continue
+        im = ax.imshow(
+            arr,
+            origin="lower",
+            extent=(xmin, xmax, ymin, ymax),
+            cmap="viridis",
+            aspect="auto",
+        )
+        if show_wedge and (wedge_path is not None) and hasattr(wedge_path, "vertices"):
+            vv = np.asarray(wedge_path.vertices, dtype=np.float32)
+            if vv.ndim == 2 and vv.shape[1] == 2 and vv.shape[0] >= 2:
+                ax.plot(vv[:, 0], vv[:, 1], color="tab:red", linewidth=0.8, alpha=0.9)
+        ax.set_title(str(nm))
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+
+    for j in range(n, axs_arr.size):
+        axs_arr[j].axis("off")
+
+    fig.suptitle(f"{title_prefix} | predictor_input backend={backend}", fontsize=10)
+    parent = os.path.dirname(out_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    fig.savefig(out_path, dpi=int(dpi), bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _runtime_gt_feature_to_panels(
+    *,
+    gt_centers: torch.Tensor,
+    gt_levels: torch.Tensor,
+    gt_feat: torch.Tensor,
+    H: int,
+    W: int,
+    bbox: Tuple[float, float, float, float],
+    refine_ratio: int,
+    max_channels: int,
+    feature_names: Sequence[str] | None = None,
+    feature_indices: Sequence[int] | None = None,
+) -> list[tuple[str, np.ndarray]]:
+    if (not torch.is_tensor(gt_centers)) or (not torch.is_tensor(gt_levels)) or (not torch.is_tensor(gt_feat)):
+        return []
+
+    centers = gt_centers.detach().to("cpu", dtype=torch.float32)
+    levels = gt_levels.detach().view(-1).to("cpu", dtype=torch.long)
+    feat = gt_feat.detach().to("cpu", dtype=torch.float32)
+
+    if centers.ndim != 2 or int(centers.shape[1]) != 2:
+        return []
+    if feat.ndim != 2:
+        return []
+    if int(levels.numel()) != int(centers.shape[0]) or int(feat.shape[0]) != int(centers.shape[0]):
+        return []
+
+    Fdim = int(feat.shape[1])
+    if Fdim <= 0:
+        return []
+
+    if isinstance(feature_indices, (list, tuple)) and len(feature_indices) > 0:
+        idxs = [int(i) for i in feature_indices if 0 <= int(i) < Fdim]
+    else:
+        idxs = list(range(Fdim))
+    if len(idxs) == 0:
+        return []
+    # Keep order, drop duplicates, cap channel count.
+    seen: set[int] = set()
+    sel: list[int] = []
+    for c in idxs:
+        cc = int(c)
+        if cc in seen:
+            continue
+        seen.add(cc)
+        sel.append(cc)
+        if len(sel) >= int(max_channels):
+            break
+    if len(sel) == 0:
+        return []
+
+    img_flat, valid_flat, HH, WW = amr_composite_to_finest_grid(
+        centers=centers,
+        levels=levels,
+        values=feat,
+        H=int(H),
+        W=int(W),
+        bbox=bbox,
+        refine_ratio=int(refine_ratio),
+    )
+    if (not torch.is_tensor(img_flat)) or (not torch.is_tensor(valid_flat)):
+        return []
+    if int(img_flat.numel()) <= 0 or int(valid_flat.numel()) <= 0:
+        return []
+
+    img = img_flat.view(int(HH), int(WW), -1).to("cpu", dtype=torch.float32).numpy()
+    valid = valid_flat.view(int(HH), int(WW)).to("cpu", dtype=torch.bool).numpy()
+
+    names = list(feature_names) if isinstance(feature_names, (list, tuple)) else []
+    panels: list[tuple[str, np.ndarray]] = []
+    for c in sel:
+        nm = str(names[c]) if (0 <= c < len(names)) else f"feat[{int(c)}]"
+        arr = img[:, :, int(c)]
+        arr = np.where(valid, arr, np.nan).astype(np.float32, copy=False)
+        panels.append((nm, arr))
+    return panels
+
+
+def _save_runtime_gt_feature_plot(
+    *,
+    out_path: str,
+    title_prefix: str,
+    t_label: str,
+    gt_centers: torch.Tensor,
+    gt_levels: torch.Tensor,
+    gt_feat: torch.Tensor,
+    H: int,
+    W: int,
+    bbox: Tuple[float, float, float, float],
+    refine_ratio: int,
+    dpi: int = 180,
+    max_channels: int = 4,
+    feature_names: Sequence[str] | None = None,
+    feature_indices: Sequence[int] | None = None,
+    wedge_path=None,
+    show_wedge: bool = True,
+) -> bool:
+    try:
+        panels = _runtime_gt_feature_to_panels(
+            gt_centers=gt_centers,
+            gt_levels=gt_levels,
+            gt_feat=gt_feat,
+            H=int(H),
+            W=int(W),
+            bbox=bbox,
+            refine_ratio=int(refine_ratio),
+            max_channels=int(max_channels),
+            feature_names=feature_names,
+            feature_indices=feature_indices,
+        )
+    except Exception as e:
+        print(f"[RUNTIME-MESH][PLOT][WARN] GT feature plot failed while preparing panels: {e!r}", flush=True)
+        return False
+
+    if len(panels) == 0:
+        return False
+
+    # Local import to avoid forcing matplotlib on non-plot runs.
+    import matplotlib.pyplot as plt
+
+    n = int(len(panels))
+    ncols = min(3, n)
+    nrows = int(np.ceil(float(n) / float(max(1, ncols))))
+    fig, axs = plt.subplots(nrows=nrows, ncols=ncols, figsize=(5.0 * ncols, 3.8 * nrows), dpi=int(dpi))
+    axs_arr = np.atleast_1d(axs).reshape(-1)
+    xmin, xmax, ymin, ymax = [float(v) for v in bbox]
+
+    for i, (nm, img) in enumerate(panels):
+        ax = axs_arr[i]
+        arr = np.asarray(img, dtype=np.float32)
+        if arr.ndim != 2:
+            ax.axis("off")
+            ax.set_title(f"{nm} (invalid shape)")
+            continue
+        marr = np.ma.masked_invalid(arr)
+        im = ax.imshow(
+            marr,
+            origin="lower",
+            extent=(xmin, xmax, ymin, ymax),
+            cmap="viridis",
+            aspect="auto",
+        )
+        if show_wedge and (wedge_path is not None) and hasattr(wedge_path, "vertices"):
+            vv = np.asarray(wedge_path.vertices, dtype=np.float32)
+            if vv.ndim == 2 and vv.shape[1] == 2 and vv.shape[0] >= 2:
+                ax.plot(vv[:, 0], vv[:, 1], color="tab:red", linewidth=0.8, alpha=0.9)
+        ax.set_title(str(nm))
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+
+    for j in range(n, axs_arr.size):
+        axs_arr[j].axis("off")
+
+    fig.suptitle(f"{title_prefix} | GT features ({t_label})", fontsize=10)
+    parent = os.path.dirname(out_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    fig.savefig(out_path, dpi=int(dpi), bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
 def _runtime_mesh_plot_maybe_save(
     *,
     settings: Dict[str, Any],
@@ -2067,6 +2410,8 @@ def _runtime_mesh_plot_maybe_save(
     bbox: Tuple[float, float, float, float],
     refine_ratio: int,
     wedge_path=None,
+    predictor_input: Dict[str, Any] | None = None,
+    gt_snapshots: List[Dict[str, Any]] | None = None,
 ) -> None:
     state["rebuilds"] = int(state.get("rebuilds", 0)) + 1
     if not bool(settings.get("enabled", False)):
@@ -2110,6 +2455,74 @@ def _runtime_mesh_plot_maybe_save(
         dpi=int(settings.get("dpi", 180)),
         line_width=float(settings.get("line_width", 0.2)),
     )
+    if bool(settings.get("plot_predictor_inputs", False)):
+        in_path = out_path[:-4] + "_input.png" if out_path.lower().endswith(".png") else (out_path + "_input.png")
+        saved_in = _save_runtime_predictor_input_plot(
+            out_path=in_path,
+            predictor_input=predictor_input,
+            title_prefix=title,
+            bbox=bbox,
+            dpi=int(settings.get("dpi", 180)),
+            max_channels=int(settings.get("predictor_input_max_channels", 4)),
+            wedge_path=wedge_path,
+            show_wedge=bool(settings.get("show_wedge", True)),
+        )
+        if saved_in:
+            print(
+                f"[RUNTIME-MESH][PLOT] saved {in_path}",
+                flush=True,
+            )
+    if bool(settings.get("plot_gt_features", False)) and isinstance(gt_snapshots, list):
+        for si, snap in enumerate(gt_snapshots):
+            if not isinstance(snap, dict):
+                continue
+            gt_centers = snap.get("centers", None)
+            gt_levels = snap.get("levels", None)
+            gt_feat = snap.get("feat", None)
+            if (not torch.is_tensor(gt_centers)) or (not torch.is_tensor(gt_levels)) or (not torch.is_tensor(gt_feat)):
+                continue
+            raw_tag = str(snap.get("tag", f"gt_{si}")).strip()
+            if raw_tag == "":
+                raw_tag = f"gt_{si}"
+            safe_tag = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_tag)
+            t_snap = snap.get("t_abs", None)
+            t_label = "t=?"
+            t_suffix = ""
+            if t_snap is not None:
+                try:
+                    t_i = int(t_snap)
+                    t_label = f"t={t_i}"
+                    t_suffix = f"_t{t_i:05d}"
+                except Exception:
+                    t_label = f"t={t_snap}"
+            gt_path = (
+                out_path[:-4] + f"_{safe_tag}{t_suffix}.png"
+                if out_path.lower().endswith(".png")
+                else (out_path + f"_{safe_tag}{t_suffix}.png")
+            )
+            saved_gt = _save_runtime_gt_feature_plot(
+                out_path=gt_path,
+                title_prefix=title,
+                t_label=t_label,
+                gt_centers=gt_centers,
+                gt_levels=gt_levels,
+                gt_feat=gt_feat,
+                H=H,
+                W=W,
+                bbox=bbox,
+                refine_ratio=refine_ratio,
+                dpi=int(settings.get("dpi", 180)),
+                max_channels=int(settings.get("gt_feature_max_channels", 4)),
+                feature_names=settings.get("feature_names", []),
+                feature_indices=settings.get("gt_feature_indices", []),
+                wedge_path=wedge_path,
+                show_wedge=bool(settings.get("show_wedge", True)),
+            )
+            if saved_gt:
+                print(
+                    f"[RUNTIME-MESH][PLOT] saved {gt_path}",
+                    flush=True,
+                )
     state["saved"] = saved_so_far + 1
     print(
         f"[RUNTIME-MESH][PLOT] saved {out_path}",
@@ -4686,11 +5099,24 @@ def _runtime_predict_masks_from_cnn(
     fill_empty_interior: bool = False,
     physical_parent_mask: torch.Tensor | None = None,
     coarse_rc_grid: torch.Tensor | None = None,
+    debug_out: Dict[str, Any] | None = None,
+    timing_out: Dict[str, float] | None = None,
 ) -> Dict[int, torch.Tensor]:
     if runtime_mesh_policy is None:
         raise RuntimeError("runtime_mesh_policy is None for CNN runtime mesh backend.")
     if runtime_mesh_policy.get("backend", None) != "cnn":
         raise RuntimeError("runtime_mesh_policy backend is not 'cnn'.")
+
+    timing: Dict[str, float] = {
+        "predict_parent_map_s": 0.0,
+        "predict_coarse_agg_s": 0.0,
+        "predict_fill_empty_s": 0.0,
+        "predict_feature_norm_s": 0.0,
+        "predict_gradient_channels_s": 0.0,
+        "predict_channel_assemble_s": 0.0,
+        "predict_model_forward_s": 0.0,
+        "predict_logits_to_masks_s": 0.0,
+    }
 
     pdev = torch.device(runtime_mesh_policy["device"])
     model = runtime_mesh_policy["model"]
@@ -4699,6 +5125,7 @@ def _runtime_predict_masks_from_cnn(
     thr_default = float(runtime_mesh_policy["threshold_default"])
     thr_by_level: Dict[int, float] = runtime_mesh_policy["threshold_by_level"]
 
+    t_parent_map_t0 = time.perf_counter()
     parent_mode = str(parent_mapping_mode).strip().lower()
     if parent_mode in ("dataset", "legacy", "from_dataset"):
         parents_for_cnn = parents_t.to(feat_policy.device, dtype=torch.long).view(-1)
@@ -4726,10 +5153,14 @@ def _runtime_predict_masks_from_cnn(
             f"Unknown runtime CNN parent_mapping_mode: {parent_mapping_mode!r}. "
             "Expected one of: dataset, from_centers"
         )
+    timing["predict_parent_map_s"] = float(time.perf_counter() - t_parent_map_t0)
 
+    t_coarse_t0 = time.perf_counter()
     coarse = coarse_aggregate_from_dynamic(feat_policy, parents_for_cnn, H, W)
     coarse = coarse.view(H, W, -1).permute(2, 0, 1).contiguous()  # (F,H,W)
+    timing["predict_coarse_agg_s"] = float(time.perf_counter() - t_coarse_t0)
     if bool(fill_empty_interior):
+        t_fill_t0 = time.perf_counter()
         phys = (
             torch.ones((H, W), dtype=torch.bool, device=coarse.device)
             if physical_parent_mask is None
@@ -4744,7 +5175,9 @@ def _runtime_predict_masks_from_cnn(
             rc_grid=coarse_rc_grid,
             chunk=1024,
         )
+        timing["predict_fill_empty_s"] = float(time.perf_counter() - t_fill_t0)
 
+    t_featnorm_t0 = time.perf_counter()
     coarse_raw = coarse
     feature_norm_mode = str(runtime_mesh_policy.get("feature_norm_mode", "none"))
     feature_norm_stats = _parse_feature_norm_stats(
@@ -4757,9 +5190,23 @@ def _runtime_predict_masks_from_cnn(
         stats=feature_norm_stats,
         require_stats=True,
     )
+    timing["predict_feature_norm_s"] = float(time.perf_counter() - t_featnorm_t0)
+
+    feat_names_cfg = cfg.get("features", {}).get("names", [])
+    if not isinstance(feat_names_cfg, (list, tuple)):
+        feat_names_cfg = []
+    state_names = []
+    F_state = int(coarse.shape[0])
+    for i in range(F_state):
+        if i < len(feat_names_cfg):
+            state_names.append(str(feat_names_cfg[i]))
+        else:
+            state_names.append(f"state[{i}]")
 
     channels = [coarse]
+    channel_names = list(state_names)
     if bool(runtime_mesh_policy.get("include_gradients", False)):
+        t_grad_t0 = time.perf_counter()
         gidx = runtime_mesh_policy.get("gradient_feature_indices", None)
         if not isinstance(gidx, dict):
             raise RuntimeError(
@@ -4820,13 +5267,24 @@ def _runtime_predict_masks_from_cnn(
             require_stats=True,
         ).view(H, W).unsqueeze(0)
         channels.extend([g_rho, g_E])
+        channel_names.extend(["grad_rho", "grad_E"])
+        timing["predict_gradient_channels_s"] = float(time.perf_counter() - t_grad_t0)
+
+    t_chan_t0 = time.perf_counter()
     if bool(runtime_mesh_policy.get("include_parent_mask", True)):
         channels.append(mask_for_cnn.to(coarse.device, dtype=torch.float32).unsqueeze(0))
+        channel_names.append("parent_mask")
     if bool(runtime_mesh_policy.get("include_coords", True)):
         coord_grid = runtime_mesh_policy.get("coord_grid", None)
         if coord_grid is None:
             raise RuntimeError("CNN runtime mesh policy expects coord channels, but coord_grid is missing.")
-        channels.append(coord_grid.to(coarse.device, dtype=torch.float32))
+        coord_chw = coord_grid.to(coarse.device, dtype=torch.float32)
+        channels.append(coord_chw)
+        Cc = int(coord_chw.shape[0])
+        if Cc >= 2:
+            channel_names.extend(["coord_x", "coord_y"])
+        else:
+            channel_names.extend([f"coord[{i}]" for i in range(Cc)])
     if bool(runtime_mesh_policy.get("include_dt", False)):
         if dt_phys is None:
             raise RuntimeError(
@@ -4854,6 +5312,7 @@ def _runtime_predict_masks_from_cnn(
             device=coarse.device,
         )
         channels.append(dt_plane)
+        channel_names.append("dt_hat" if mode == "dt_hat" else "dt_raw")
 
     x_in = torch.cat(channels, dim=0).unsqueeze(0)  # (1,C,H,W)
     expected_in = int(runtime_mesh_policy.get("in_channels", -1))
@@ -4862,15 +5321,19 @@ def _runtime_predict_masks_from_cnn(
             f"CNN runtime mesh input channel mismatch: built={int(x_in.shape[1])}, expected={expected_in}. "
             "Check runtime_mesh.cnn.include_parent_mask/include_coords/include_gradients and feature channel setup."
         )
+    timing["predict_channel_assemble_s"] = float(time.perf_counter() - t_chan_t0)
 
+    t_fwd_t0 = time.perf_counter()
     logits_raw = model(x_in.to(pdev, dtype=torch.float32, non_blocking=True))
     if not isinstance(logits_raw, dict):
         raise RuntimeError(f"CNN runtime mesh model forward must return dict[int,Tensor], got {type(logits_raw)}")
+    timing["predict_model_forward_s"] = float(time.perf_counter() - t_fwd_t0)
 
     logits_by_level: Dict[int, torch.Tensor] = {}
     for k, v in logits_raw.items():
         logits_by_level[int(k)] = v
 
+    t_logits_to_masks_t0 = time.perf_counter()
     masks_by_level: Dict[int, torch.Tensor] = {}
     for L in range(1, Lmax + 1):
         if L not in logits_by_level:
@@ -4912,6 +5375,15 @@ def _runtime_predict_masks_from_cnn(
             m = m & allow[:, :h, :w]
         masks_by_level[L] = m
 
+    timing["predict_logits_to_masks_s"] = float(time.perf_counter() - t_logits_to_masks_t0)
+    if isinstance(debug_out, dict):
+        debug_out.clear()
+        debug_out["backend"] = "cnn"
+        debug_out["x_in_chw"] = x_in[0].detach().to("cpu", dtype=torch.float32).clone()
+        debug_out["channel_names"] = list(channel_names)
+    if isinstance(timing_out, dict):
+        timing_out.clear()
+        timing_out.update(timing)
     return {L: masks_by_level[L][0].to(device=device, dtype=torch.bool) for L in masks_by_level.keys()}
 
 
@@ -4929,6 +5401,11 @@ def _runtime_predict_masks_from_fast_gradients(
     dx: float,
     dy: float,
     device: torch.device,
+    physical_parent_mask: torch.Tensor | None = None,
+    coarse_rc_grid: torch.Tensor | None = None,
+    use_prev_state_masks: bool = True,
+    debug_out: Dict[str, Any] | None = None,
+    timing_out: Dict[str, float] | None = None,
 ) -> Dict[int, torch.Tensor]:
     """
     Fast gradient backend for runtime mesh prediction.
@@ -4940,7 +5417,21 @@ def _runtime_predict_masks_from_fast_gradients(
     alternative for timing/quality comparison.
     """
     dev = torch.device(device)
+    timing: Dict[str, float] = {
+        "predict_coarse_agg_s": 0.0,
+        "predict_fill_empty_s": 0.0,
+        "predict_grad_score_s": 0.0,
+        "predict_prev_masks_s": 0.0,
+        "predict_hierarchy_s": 0.0,
+        "predict_threshold_hysteresis_s": 0.0,
+        "predict_dilation_s": 0.0,
+        "predict_pool_up_s": 0.0,
+    }
     pol = cfg.get("policy", {}) or {}
+    rt_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
+    gf_cfg = rt_cfg.get("gradient_fast", {}) or {}
+    if not isinstance(gf_cfg, dict):
+        gf_cfg = {}
     rr = _get_refine_ratio(cfg)
     Lmax = int(pol.get("max_level", cfg.get("data", {}).get("L_max", 3)))
 
@@ -4988,7 +5479,101 @@ def _runtime_predict_masks_from_fast_gradients(
                 return tau_low_def, float(ent)
         return tau_low_def, tau_high_def
 
+    def _first_present(src: Dict[str, Any], keys: list[str]):
+        if not isinstance(src, dict):
+            return None
+        for k in keys:
+            if k in src:
+                return src.get(k)
+        return None
+
+    def _resolve_dilate_cells_for_level(L: int) -> float | None:
+        raw_cells = _first_present(
+            gf_cfg,
+            [f"dilate_cells_L{L}", f"dilate_cells_l{L}", f"dilate_cells_level{L}"],
+        )
+        if raw_cells is None:
+            raw_cells = _first_present(
+                pol,
+                [f"dilate_cells_L{L}", f"dilate_cells_l{L}", f"dilate_cells_level{L}"],
+            )
+        if raw_cells is None and (L == Lmax):
+            raw_cells = _first_present(
+                gf_cfg,
+                ["dilate_cells_lmax", "dilate_cells_Lmax", "dilate_cells_max"],
+            )
+        if raw_cells is None and (L == Lmax):
+            raw_cells = _first_present(
+                pol,
+                ["dilate_cells_lmax", "dilate_cells_Lmax", "dilate_cells_max"],
+            )
+        if raw_cells is None:
+            return None
+        try:
+            return float(raw_cells)
+        except Exception:
+            return None
+
+    def _resolve_dilate_phys_for_level(L: int) -> float:
+        raw_phys = _first_present(
+            gf_cfg,
+            [f"dilate_phys_L{L}", f"dilate_phys_l{L}", f"dilate_phys_level{L}"],
+        )
+        if raw_phys is None:
+            raw_phys = _first_present(
+                pol,
+                [f"dilate_phys_L{L}", f"dilate_phys_l{L}", f"dilate_phys_level{L}"],
+            )
+        try:
+            return float(raw_phys) if raw_phys is not None else 0.0
+        except Exception:
+            return 0.0
+
+    raw_lmax_cells = _first_present(
+        gf_cfg,
+        ["dilate_cells_lmax", "dilate_cells_Lmax", "dilate_cells_max"],
+    )
+    if raw_lmax_cells is None:
+        raw_lmax_cells = _first_present(
+            pol,
+            ["dilate_cells_lmax", "dilate_cells_Lmax", "dilate_cells_max"],
+        )
+    try:
+        lmax_cells_val = float(raw_lmax_cells) if raw_lmax_cells is not None else None
+    except Exception:
+        lmax_cells_val = None
+    has_lmax_dilation_cfg = bool((lmax_cells_val is not None) and (lmax_cells_val > 0.0))
+
+    propagate_lmax_to_parents = bool(
+        gf_cfg.get(
+            "dilate_cells_lmax_propagate_to_parents",
+            pol.get("dilate_cells_lmax_propagate_to_parents", True),
+        )
+    )
+
+    t_coarse_t0 = time.perf_counter()
     coarse = coarse_aggregate_from_dynamic(feat_policy, parents_t, H, W).to(dev, dtype=torch.float32)
+    timing["predict_coarse_agg_s"] = float(time.perf_counter() - t_coarse_t0)
+    coarse_hwf = coarse.view(H, W, -1).contiguous()
+    if bool(gf_cfg.get("fill_empty_interior", True)) and (physical_parent_mask is not None):
+        t_fill_t0 = time.perf_counter()
+        fill_chunk = int(gf_cfg.get("fill_empty_chunk", 1024))
+        if fill_chunk < 1:
+            fill_chunk = 1
+        coarse_chw = coarse_hwf.permute(2, 0, 1).contiguous()
+        coarse_chw = _runtime_fill_empty_interior_coarse_nearest(
+            coarse_chw=coarse_chw,
+            parents=parents_t,
+            H=H,
+            W=W,
+            physical_parent_mask=torch.as_tensor(physical_parent_mask, dtype=torch.bool, device=dev),
+            rc_grid=coarse_rc_grid,
+            chunk=fill_chunk,
+        )
+        coarse_hwf = coarse_chw.permute(1, 2, 0).contiguous()
+        timing["predict_fill_empty_s"] = float(time.perf_counter() - t_fill_t0)
+    coarse = coarse_hwf.view(H * W, -1).contiguous()
+    t_gradscore_t0 = time.perf_counter()
     Fdim = int(coarse.shape[1])
     idxs = [int(c) for c in _resolve_channel_indices(cfg) if 0 <= int(c) < Fdim]
     if len(idxs) == 0:
@@ -5024,53 +5609,59 @@ def _runtime_predict_masks_from_fast_gradients(
         posinf=0.0,
         neginf=0.0,
     ).to(dev)
+    timing["predict_grad_score_s"] = float(time.perf_counter() - t_gradscore_t0)
 
     xmin, xmax, ymin, ymax = _get_bbox(cfg)
     masks_by_level: Dict[int, torch.Tensor] = {}
 
     # Reconstruct previous refine masks per level from current runtime mesh state.
     # prev_refine_by_level[L] lives on the parent grid for level L (H*rr^(L-1), W*rr^(L-1)).
+    t_prev_t0 = time.perf_counter()
     prev_refine_by_level: Dict[int, torch.Tensor] = {}
-    try:
-        lv_prev = level_t.to(dev, dtype=torch.long).view(-1)
-        centers_prev = centers_t.to(dev, dtype=torch.float32)
-        if lv_prev.numel() == int(centers_prev.shape[0]) and lv_prev.numel() > 0:
-            row_prev, col_prev = _cell_level_ij_from_centers(
-                centers=centers_prev,
-                levels=lv_prev,
-                H=H,
-                W=W,
-                bbox=(xmin, xmax, ymin, ymax),
-                refine_ratio=rr,
-            )
-            for L in range(1, Lmax + 1):
-                h_p = int(H * (rr ** (L - 1)))
-                w_p = int(W * (rr ** (L - 1)))
-                prev_mask_L = torch.zeros((h_p, w_p), dtype=torch.bool, device=dev)
+    if bool(use_prev_state_masks):
+        try:
+            lv_prev = level_t.to(dev, dtype=torch.long).view(-1)
+            centers_prev = centers_t.to(dev, dtype=torch.float32)
+            if lv_prev.numel() == int(centers_prev.shape[0]) and lv_prev.numel() > 0:
+                row_prev, col_prev = _cell_level_ij_from_centers(
+                    centers=centers_prev,
+                    levels=lv_prev,
+                    H=H,
+                    W=W,
+                    bbox=(xmin, xmax, ymin, ymax),
+                    refine_ratio=rr,
+                )
+                for L in range(1, Lmax + 1):
+                    h_p = int(H * (rr ** (L - 1)))
+                    w_p = int(W * (rr ** (L - 1)))
+                    prev_mask_L = torch.zeros((h_p, w_p), dtype=torch.bool, device=dev)
 
-                sel = (lv_prev >= int(L))
-                if bool(sel.any()):
-                    exp = (lv_prev[sel] - int(L - 1)).to(torch.long)
-                    max_e = int(torch.clamp(exp.max(), min=0).item())
-                    pow_tbl = torch.tensor(
-                        [rr ** i for i in range(max_e + 1)],
-                        device=dev,
-                        dtype=torch.long,
-                    )
-                    scale = pow_tbl.index_select(0, exp.clamp(0, max_e))
-                    prow = torch.div(row_prev[sel], scale, rounding_mode="floor")
-                    pcol = torch.div(col_prev[sel], scale, rounding_mode="floor")
-                    prow = prow.clamp_(0, h_p - 1)
-                    pcol = pcol.clamp_(0, w_p - 1)
-                    parent_flat = (prow * int(w_p) + pcol).view(-1).long()
-                    if parent_flat.numel() > 0:
-                        prev_mask_L.view(-1)[parent_flat] = True
+                    sel = (lv_prev >= int(L))
+                    if bool(sel.any()):
+                        exp = (lv_prev[sel] - int(L - 1)).to(torch.long)
+                        max_e = int(torch.clamp(exp.max(), min=0).item())
+                        pow_tbl = torch.tensor(
+                            [rr ** i for i in range(max_e + 1)],
+                            device=dev,
+                            dtype=torch.long,
+                        )
+                        scale = pow_tbl.index_select(0, exp.clamp(0, max_e))
+                        prow = torch.div(row_prev[sel], scale, rounding_mode="floor")
+                        pcol = torch.div(col_prev[sel], scale, rounding_mode="floor")
+                        prow = prow.clamp_(0, h_p - 1)
+                        pcol = pcol.clamp_(0, w_p - 1)
+                        parent_flat = (prow * int(w_p) + pcol).view(-1).long()
+                        if parent_flat.numel() > 0:
+                            prev_mask_L.view(-1)[parent_flat] = True
 
-                prev_refine_by_level[L] = prev_mask_L
-    except Exception:
-        # Fallback below keeps old behavior when previous masks cannot be reconstructed.
-        prev_refine_by_level = {}
+                    prev_refine_by_level[L] = prev_mask_L
+        except Exception:
+            # Fallback below keeps old behavior when previous masks cannot be reconstructed.
+            prev_refine_by_level = {}
+    timing["predict_prev_masks_s"] = float(time.perf_counter() - t_prev_t0)
 
+    t_hier_t0 = time.perf_counter()
+    dilation_s = 0.0
     for L in range(1, Lmax + 1):
         h_p = H * (rr ** (L - 1))
         w_p = W * (rr ** (L - 1))
@@ -5147,22 +5738,15 @@ def _runtime_predict_masks_from_fast_gradients(
         #   policy.dilate_phys_L{L} = physical radius
         dxL_here = (xmax - xmin) / float(W * (rr ** (L - 1)))
 
-        n_cells = None
-        raw_cells = pol.get(f"dilate_cells_L{L}", None)
-        if raw_cells is None and (L == Lmax):
-            raw_cells = pol.get("dilate_cells_lmax", None)
-        if raw_cells is not None:
-            try:
-                n_cells = float(raw_cells)
-            except Exception:
-                n_cells = None
+        n_cells = _resolve_dilate_cells_for_level(L)
 
         if n_cells is not None:
             r_phys = float(max(0.0, n_cells) * dxL_here)
         else:
-            r_phys = float(pol.get(f"dilate_phys_L{L}", 0.0))
+            r_phys = _resolve_dilate_phys_for_level(L)
 
         if r_phys > 0:
+            t_dilate_t0 = time.perf_counter()
             r_cells = max(1, int(round(r_phys / max(dxL_here, 1e-12))))
             k = 2 * r_cells + 1
             M = F.max_pool2d(
@@ -5171,9 +5755,53 @@ def _runtime_predict_masks_from_fast_gradients(
                 stride=1,
                 padding=r_cells,
             )[0, 0].bool()
+            dilation_s += float(time.perf_counter() - t_dilate_t0)
 
         masks_by_level[L] = M
+    thr_total = float(time.perf_counter() - t_hier_t0)
 
+    # If finest-level dilation is requested, ensure hierarchy closure by OR-ing
+    # required parent refine masks upward (L -> L-1). Without this, wedge/hierarchy
+    # clipping can erase most or all apparent Lmax dilation effect.
+    if has_lmax_dilation_cfg and propagate_lmax_to_parents:
+        t_pool_t0 = time.perf_counter()
+        for L in range(int(Lmax), 1, -1):
+            child = masks_by_level.get(L, None)
+            parent = masks_by_level.get(L - 1, None)
+            if child is None:
+                continue
+            child = child.to(dev, dtype=torch.bool)
+            req_parent = F.max_pool2d(
+                child.float()[None, None],
+                kernel_size=int(rr),
+                stride=int(rr),
+            )[0, 0].bool()
+            if parent is None:
+                parent = torch.zeros_like(req_parent, dtype=torch.bool, device=dev)
+            else:
+                parent = parent.to(dev, dtype=torch.bool)
+                if tuple(parent.shape) != tuple(req_parent.shape):
+                    parent = F.interpolate(
+                        parent.float()[None, None],
+                        size=tuple(req_parent.shape),
+                        mode="nearest",
+                    )[0, 0].bool()
+            masks_by_level[L - 1] = parent | req_parent
+        timing["predict_pool_up_s"] = float(time.perf_counter() - t_pool_t0)
+
+    timing["predict_hierarchy_s"] = thr_total
+    timing["predict_dilation_s"] = float(dilation_s)
+    timing["predict_threshold_hysteresis_s"] = max(0.0, thr_total - float(dilation_s))
+
+    if isinstance(timing_out, dict):
+        timing_out.clear()
+        timing_out.update(timing)
+    if isinstance(debug_out, dict):
+        debug_out.clear()
+        debug_out["backend"] = "gradient_fast"
+        debug_out["selected_idx"] = [int(i) for i in idxs]
+        debug_out["coarse_hwf"] = coarse_hwf.detach().to("cpu", dtype=torch.float32).clone()
+        debug_out["g_base_hxw"] = g_base.detach().to("cpu", dtype=torch.float32).clone()
     return {L: masks_by_level[L].to(device=device, dtype=torch.bool) for L in masks_by_level.keys()}
 
 
@@ -5195,6 +5823,8 @@ def _runtime_build_pred_mesh_from_state(
     runtime_mesh_policy: Dict[str, Any] | None = None,
     runtime_wedge_constraints: Dict[str, Any] | None = None,
     runtime_base_mesh: Dict[str, Any] | None = None,
+    predictor_input_out: Dict[str, Any] | None = None,
+    step_k: int | None = None,
     cnn_parent_mapping_mode: str = "dataset",
     cnn_fill_empty_interior: bool = False,
     dt_phys: torch.Tensor | float | None = None,
@@ -5215,6 +5845,25 @@ def _runtime_build_pred_mesh_from_state(
         "wedge_edge_build_s": 0.0,
         "wedge_legacy_geom_s": 0.0,
         "edge_attr_s": 0.0,
+        "predict_parent_map_s": 0.0,
+        "predict_coarse_agg_s": 0.0,
+        "predict_fill_empty_s": 0.0,
+        "predict_feature_norm_s": 0.0,
+        "predict_gradient_channels_s": 0.0,
+        "predict_channel_assemble_s": 0.0,
+        "predict_model_forward_s": 0.0,
+        "predict_logits_to_masks_s": 0.0,
+        "predict_grad_score_s": 0.0,
+        "predict_prev_masks_s": 0.0,
+        "predict_hierarchy_s": 0.0,
+        "predict_grad_raster_s": 0.0,
+        "predict_combine_levels_s": 0.0,
+        "predict_pool_up_s": 0.0,
+        "predict_threshold_hysteresis_s": 0.0,
+        "predict_dilation_s": 0.0,
+        "predict_normalize_masks_s": 0.0,
+        "predict_debug_out_s": 0.0,
+        "predict_legacy_policy_s": 0.0,
         "total_s": 0.0,
     }
 
@@ -5222,6 +5871,7 @@ def _runtime_build_pred_mesh_from_state(
     rr = _get_refine_ratio(cfg)
     rt_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
     domain_mode = _runtime_mesh_domain_mode(cfg)
+    policy_backend = _runtime_mesh_backend(cfg)
     reset_each = bool(rt_cfg.get("reset_to_coarse_each_step", True))
     detach_policy_input = bool(rt_cfg.get("detach_policy_input", True))
 
@@ -5247,17 +5897,64 @@ def _runtime_build_pred_mesh_from_state(
     else:
         mask_t_parent = _mask_from_parent_indices(parents_t, H, W, dev)
 
+    parents_for_policy = parents_t
+    mask_for_policy = mask_t_parent
+    parents_source = "dataset"
+    if policy_backend in ("gradient", "gradient_fast"):
+        step0_parent_mode_raw = str(
+            rt_cfg.get("gradient_step0_parent_mapping_mode", "from_centers")
+        ).strip().lower()
+        if (step_k is not None) and (int(step_k) == 0):
+            if step0_parent_mode_raw in ("from_centers", "centers", "runtime_like", "coarse_from_centers"):
+                t_parent_map_t0 = time.perf_counter()
+                row_t, col_t = _cell_level_ij_from_centers(
+                    centers=centers_t,
+                    levels=level_t,
+                    H=H,
+                    W=W,
+                    bbox=_get_bbox(cfg),
+                    refine_ratio=rr,
+                )
+                parents_for_policy = _runtime_parents_from_level_ij(
+                    levels=level_t,
+                    row=row_t,
+                    col=col_t,
+                    H=H,
+                    W=W,
+                    refine_ratio=rr,
+                ).view(-1)
+                mask_for_policy = _mask_from_parent_indices(parents_for_policy, H, W, dev)
+                timing["predict_parent_map_s"] = float(time.perf_counter() - t_parent_map_t0)
+                parents_source = "from_centers"
+            elif step0_parent_mode_raw in ("dataset", "legacy", "from_dataset"):
+                parents_source = "dataset"
+            else:
+                raise ValueError(
+                    "train.runtime_mesh.gradient_step0_parent_mapping_mode must be "
+                    f"'dataset' or 'from_centers', got {step0_parent_mode_raw!r}"
+                )
+
     batch_like = {
         "centers_t": centers_t,
         "center_feat_t": feat_policy,
         "dyn_feat_t": feat_policy,
-        "dyn_parents": parents_t,
-        "mask_t": mask_t_parent.view(-1),
+        "dyn_parents": parents_for_policy,
+        "mask_t": mask_for_policy.view(-1),
         "level_t": level_t,
     }
-    policy_backend = _runtime_mesh_backend(cfg)
+    policy_debug_out: Dict[str, Any] | None = {} if isinstance(predictor_input_out, dict) else None
+    prev_mode_raw = str((cfg.get("policy", {}) or {}).get("hysteresis_prev_source", "predicted")).strip().lower()
+    if prev_mode_raw in ("prediction", "runtime", "state"):
+        prev_mode = "predicted"
+    elif prev_mode_raw in ("gt", "ground_truth", "ground-truth", "truth"):
+        prev_mode = "gt"
+    else:
+        prev_mode = "predicted"
+    use_prev_state_masks = (prev_mode == "gt") or ((step_k is not None) and (int(step_k) > 0))
+
     t_policy_t0 = time.perf_counter()
     if policy_backend == "cnn":
+        policy_timing: Dict[str, float] = {}
         base_refine_by_level = None
         if (domain_mode == "starting_mesh") and (runtime_base_mesh is not None):
             base_refine_by_level = runtime_base_mesh.get("base_refine_by_level", None)
@@ -5287,22 +5984,43 @@ def _runtime_build_pred_mesh_from_state(
             fill_empty_interior=bool(cnn_fill_empty_interior),
             physical_parent_mask=cnn_physical_parent_mask,
             coarse_rc_grid=runtime_mesh_policy.get("coarse_rc_grid", None) if isinstance(runtime_mesh_policy, dict) else None,
+            debug_out=policy_debug_out,
+            timing_out=policy_timing,
         )
+        for k, v in policy_timing.items():
+            timing[k] = float(v)
     elif policy_backend == "gradient_fast":
+        policy_timing = {}
+        gf_physical_parent_mask = None
+        if (domain_mode == "starting_mesh") and (runtime_base_mesh is not None):
+            gf_physical_parent_mask = runtime_base_mesh.get("parent_mask", None)
+        elif runtime_wedge_constraints is not None:
+            parent_intersect = runtime_wedge_constraints.get("parent_intersect", {})
+            if isinstance(parent_intersect, dict):
+                gf_physical_parent_mask = parent_intersect.get(1, None)
         masks_pred_by_level = _runtime_predict_masks_from_fast_gradients(
             centers_t=centers_t,
             level_t=level_t,
             feat_policy=feat_policy,
-            parents_t=parents_t,
-            mask_t_parent=mask_t_parent,
+            parents_t=parents_for_policy,
+            mask_t_parent=mask_for_policy,
             cfg=cfg,
             H=H,
             W=W,
             dx=dx,
             dy=dy,
             device=dev,
+            physical_parent_mask=gf_physical_parent_mask,
+            coarse_rc_grid=runtime_mesh_policy.get("coarse_rc_grid", None) if isinstance(runtime_mesh_policy, dict) else None,
+            use_prev_state_masks=bool(use_prev_state_masks),
+            debug_out=policy_debug_out,
+            timing_out=policy_timing,
         )
+        for k, v in policy_timing.items():
+            timing[k] = float(v)
     else:
+        policy_timing = {}
+        t_legacy_policy_t0 = time.perf_counter()
         masks_pred_by_level = predict_masks_hierarchical_from_gt_gradients(
             batch_like,
             cfg,
@@ -5311,8 +6029,49 @@ def _runtime_build_pred_mesh_from_state(
             dx,
             dy,
             device=dev,
+            debug_out=policy_debug_out,
+            timing_out=policy_timing,
         )
+        if isinstance(policy_timing, dict) and len(policy_timing) > 0:
+            for k, v in policy_timing.items():
+                timing[k] = float(v)
+        else:
+            timing["predict_legacy_policy_s"] = float(time.perf_counter() - t_legacy_policy_t0)
     timing["mesh_predict_s"] = float(time.perf_counter() - t_policy_t0)
+
+    if isinstance(predictor_input_out, dict):
+        predictor_input_out.clear()
+        predictor_input_out["backend"] = str(policy_backend)
+        predictor_input_out["parents_source"] = str(parents_source)
+        if (
+            (policy_backend in ("gradient", "gradient_fast"))
+            and (step_k is not None)
+            and (int(step_k) == 0)
+            and (parents_source == "from_centers")
+            and (parents_t.numel() == parents_for_policy.numel())
+        ):
+            mismatch = int((parents_t != parents_for_policy).sum().item())
+            predictor_input_out["parents_mismatch"] = int(mismatch)
+            predictor_input_out["parents_total"] = int(parents_t.numel())
+        if isinstance(policy_debug_out, dict):
+            if policy_backend == "gradient":
+                G = policy_debug_out.get("G", None)
+                pooled = policy_debug_out.get("pooled_up", None)
+                if isinstance(G, dict):
+                    predictor_input_out["G"] = {
+                        int(L): v.detach().to("cpu", dtype=torch.float32).clone()
+                        for L, v in G.items()
+                        if torch.is_tensor(v)
+                    }
+                if isinstance(pooled, dict):
+                    predictor_input_out["pooled_up"] = {
+                        int(L): v.detach().to("cpu", dtype=torch.float32).clone()
+                        for L, v in pooled.items()
+                        if torch.is_tensor(v)
+                    }
+            else:
+                for kk, vv in policy_debug_out.items():
+                    predictor_input_out[kk] = vv
 
     if domain_mode == "starting_mesh":
         t_mesh_mat_t0 = time.perf_counter()
@@ -5779,6 +6538,8 @@ def train_one_epoch_multi_step(
     dbg = cfg.get("debug", {})
     nan_watch = bool(dbg.get("nan_watch", True))          # turn on/off
     nan_watch_first_only = bool(dbg.get("nan_first_only", True))
+    assert_finite_checks = bool(dbg.get("assert_finite_checks", False))
+    ops_danger_watch = bool(dbg.get("ops_danger_watch", False))
     hang_watch = bool(dbg.get("hang_watch", True))
     hang_watch_batches = int(dbg.get("hang_watch_batches", 4))
     if hang_watch_batches < 0:
@@ -5888,6 +6649,7 @@ def train_one_epoch_multi_step(
 
     speed = cfg.get("speed", {})
     use_amp = bool(speed.get("amp", True)) and device.type == "cuda"
+    forward_force_fp32 = bool(speed.get("forward_force_fp32", True))
 
     huber_delta = float(cfg["loss"].get("huber_delta", 0.05))
     lap_w  = float(cfg["loss"].get("laplacian_weight", 0.0))
@@ -5915,6 +6677,34 @@ def train_one_epoch_multi_step(
 
     # Determine whether we must compute physics operators this step
     need_phy = parc_use or (dec_use and (dec_blend_w != 0.0 or dec_resid_w != 0.0))
+
+    parc_sel_cache: Dict[int, Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]] = {}
+    parc_mask_cache: Dict[Tuple[int, str, int], torch.Tensor] = {}
+
+    def _get_parc_selections(Fdim: int) -> Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]:
+        key = int(Fdim)
+        cached = parc_sel_cache.get(key, None)
+        if cached is not None:
+            return cached
+        sel_adv = tuple(int(i) for i in dec.parc_select_feature_indices_adv(cfg, key))
+        sel_diff = tuple(int(i) for i in dec.parc_select_feature_indices_diff(cfg, key))
+        sel_union = tuple(sorted(set(sel_adv + sel_diff)))
+        out = (sel_adv, sel_diff, sel_union)
+        parc_sel_cache[key] = out
+        return out
+
+    def _get_parc_channel_mask(Fdim: int, dev: torch.device) -> torch.Tensor:
+        dev_index = int(dev.index) if dev.index is not None else -1
+        key = (int(Fdim), str(dev.type), dev_index)
+        cached = parc_mask_cache.get(key, None)
+        if cached is not None:
+            return cached
+        _, _, sel_union = _get_parc_selections(int(Fdim))
+        mask = torch.zeros((int(Fdim),), device=dev, dtype=torch.float32)
+        if len(sel_union) > 0:
+            mask[torch.as_tensor(sel_union, device=dev, dtype=torch.long)] = 1.0
+        parc_mask_cache[key] = mask
+        return mask
 
     backend = str(loss_cfg.get("physics_backend", "dec")).lower()
     use_mls = (backend in ("mls", "moving_least_squares", "moving-least-squares"))
@@ -5996,9 +6786,23 @@ def train_one_epoch_multi_step(
                 max_level=max_level_policy,
                 max_cached_feature_steps=int(runtime_multires_cfg.get("max_cached_feature_steps", 16)),
             )
+        grad_step0_parent_mode = str(
+            runtime_mesh_cfg.get("gradient_step0_parent_mapping_mode", "from_centers")
+        ).strip().lower()
+        grad_parent_msg = (
+            f", gradient_step0_parent_mapping_mode={grad_step0_parent_mode}"
+            if runtime_mesh_backend in ("gradient", "gradient_fast")
+            else ""
+        )
+        gf_fill_msg = ""
+        if runtime_mesh_backend == "gradient_fast":
+            gf_cfg = runtime_mesh_cfg.get("gradient_fast", {}) or {}
+            gf_fill_msg = (
+                f", gradient_fast.fill_empty_interior={int(bool(gf_cfg.get('fill_empty_interior', True)))}"
+            )
         print(
             f"[RUNTIME-MESH] train loop active (backend={runtime_mesh_backend}, domain_mode={runtime_domain_mode}, "
-            f"idw_backend={runtime_idw_backend}, update_every_steps={runtime_update_every})"
+            f"idw_backend={runtime_idw_backend}, update_every_steps={runtime_update_every}{grad_parent_msg}{gf_fill_msg})"
         )
         if bool(runtime_mesh_plot_settings.get("enabled", False)):
             print(
@@ -6006,7 +6810,11 @@ def train_one_epoch_multi_step(
                 f"out_dir={runtime_mesh_plot_settings.get('out_dir')} "
                 f"split={runtime_mesh_plot_settings.get('split')} "
                 f"every_rebuilds={int(runtime_mesh_plot_settings.get('every_rebuilds', 1))} "
-                f"max_plots={int(runtime_mesh_plot_settings.get('max_plots', 0))}",
+                f"max_plots={int(runtime_mesh_plot_settings.get('max_plots', 0))} "
+                f"plot_predictor_inputs={int(bool(runtime_mesh_plot_settings.get('plot_predictor_inputs', False)))} "
+                f"predictor_input_max_channels={int(runtime_mesh_plot_settings.get('predictor_input_max_channels', 4))} "
+                f"plot_gt_features={int(bool(runtime_mesh_plot_settings.get('plot_gt_features', False)))} "
+                f"gt_feature_max_channels={int(runtime_mesh_plot_settings.get('gt_feature_max_channels', 4))}",
                 flush=True,
             )
         if runtime_multires_enabled:
@@ -6348,7 +7156,13 @@ def train_one_epoch_multi_step(
     ) -> torch.Tensor:
         nonlocal chunk_warned_coverage_gap
         if (not chunk_enabled) or (not chunk_specs):
-            return _forward_main_head_with_edge_attr(model, x_in_all, edge_index_global, edge_attr=edge_attr_global)
+            return _forward_main_head_with_edge_attr(
+                model,
+                x_in_all,
+                edge_index_global,
+                edge_attr=edge_attr_global,
+                force_fp32=forward_force_fp32,
+            )
 
         y_out = None
         covered = torch.zeros((x_in_all.size(0),), device=device, dtype=torch.bool)
@@ -6381,7 +7195,13 @@ def train_one_epoch_multi_step(
                     )
                 ea_local = edge_attr_global.index_select(0, edge_ids_d)
 
-            y_local = _forward_main_head_with_edge_attr(model, x_local, ei_local_d, edge_attr=ea_local)
+            y_local = _forward_main_head_with_edge_attr(
+                model,
+                x_local,
+                ei_local_d,
+                edge_attr=ea_local,
+                force_fp32=forward_force_fp32,
+            )
             core_global = full_idx_d[:core_count]
             core_local = y_local[:core_count]
 
@@ -6393,11 +7213,21 @@ def train_one_epoch_multi_step(
             covered[core_global] = True
 
         if y_out is None:
-            return _forward_main_head_with_edge_attr(model, x_in_all, edge_index_global, edge_attr=edge_attr_global)
+            return _forward_main_head_with_edge_attr(
+                model,
+                x_in_all,
+                edge_index_global,
+                edge_attr=edge_attr_global,
+                force_fp32=forward_force_fp32,
+            )
 
         if not bool(torch.all(covered).item()):
             y_full = _forward_main_head_with_edge_attr(
-                model, x_in_all, edge_index_global, edge_attr=edge_attr_global
+                model,
+                x_in_all,
+                edge_index_global,
+                edge_attr=edge_attr_global,
+                force_fp32=forward_force_fp32,
             )
             y_out = torch.where(covered.view(-1, 1), y_out, y_full)
             if not chunk_warned_coverage_gap:
@@ -6523,6 +7353,200 @@ def train_one_epoch_multi_step(
             flush=True,
         )
 
+    def _maybe_print_runtime_mesh_predict_detail(
+        batch_idx: int,
+        *,
+        t_mesh_predict_s: float,
+        n_rebuilds: int,
+        predict_parts_s: Dict[str, float],
+    ) -> None:
+        if (not runtime_mesh_enabled) or (not print_runtime_mesh_batch_breakdown):
+            return
+        if not isinstance(predict_parts_s, dict):
+            return
+        parts_raw = {str(k): float(v) for k, v in predict_parts_s.items() if float(v) > 0.0}
+        if len(parts_raw) == 0:
+            return
+
+        label_map = {
+            "predict_parent_map_s": "parent_map",
+            "predict_coarse_agg_s": "coarse_agg",
+            "predict_fill_empty_s": "fill_empty",
+            "predict_feature_norm_s": "feature_norm",
+            "predict_gradient_channels_s": "gradient_channels",
+            "predict_channel_assemble_s": "assemble_input",
+            "predict_model_forward_s": "model_forward",
+            "predict_logits_to_masks_s": "logits_to_masks",
+            "predict_grad_score_s": "grad_score",
+            "predict_prev_masks_s": "prev_masks",
+            "predict_hierarchy_s": "hierarchy",
+            "predict_grad_raster_s": "grad_raster",
+            "predict_combine_levels_s": "combine_levels",
+            "predict_pool_up_s": "pool_up",
+            "predict_threshold_hysteresis_s": "threshold_hysteresis",
+            "predict_dilation_s": "dilation",
+            "predict_normalize_masks_s": "normalize_masks",
+            "predict_debug_out_s": "debug_out",
+            "predict_legacy_policy_s": "legacy_policy",
+        }
+        parts = sorted(parts_raw.items(), key=lambda kv: kv[1], reverse=True)
+        total = float(max(t_mesh_predict_s, 1e-12))
+        sum_parts = float(sum(v for _, v in parts))
+        unattributed = max(0.0, total - sum_parts)
+
+        segs = []
+        for k, v in parts:
+            nm = label_map.get(k, k)
+            segs.append(f"{nm}={v:.3f}s ({100.0 * v / total:.1f}%)")
+        if unattributed > 0.0:
+            segs.append(f"unattributed={unattributed:.3f}s ({100.0 * unattributed / total:.1f}%)")
+        segs.append(f"per_rebuild={total / float(max(1, int(n_rebuilds))):.3f}s")
+        segs.append(f"rebuilds={int(n_rebuilds)}")
+
+        bi = int(batch_idx) + 1
+        if total_batches > 0:
+            prefix = f"[RUNTIME-MESH-PREDICT-DETAIL] train batch {bi}/{total_batches}"
+        else:
+            prefix = f"[RUNTIME-MESH-PREDICT-DETAIL] train batch {bi}"
+        print(f"{prefix} " + " | ".join(segs), flush=True)
+
+    def _maybe_print_runtime_other_detail(
+        batch_idx: int,
+        batch_wall_s: float,
+        *,
+        t_mesh_predict_s: float,
+        t_mesh_materialize_s: float,
+        t_edge_attr_s: float,
+        t_idw_remap_s: float,
+        other_parts_s: Dict[str, float],
+    ) -> None:
+        if (not runtime_mesh_enabled) or (not print_runtime_mesh_batch_breakdown):
+            return
+        total = float(max(batch_wall_s, 1e-12))
+        accounted = (
+            float(t_mesh_predict_s)
+            + float(t_mesh_materialize_s)
+            + float(t_edge_attr_s)
+            + float(t_idw_remap_s)
+        )
+        other = max(0.0, total - accounted)
+        if other <= 0.0:
+            return
+        if not isinstance(other_parts_s, dict):
+            return
+        parts_raw = {str(k): float(v) for k, v in other_parts_s.items() if float(v) > 0.0}
+        if len(parts_raw) == 0:
+            return
+        label_map = {
+            "model_step_s": "model_step",
+            "metrics_sync_s": "metrics_sync",
+            "state_diag_s": "state_diag",
+            "mem_snapshot_s": "mem_snapshot",
+            "step_log_io_s": "step_log_io",
+            "mesh_plot_s": "mesh_plot",
+            "backward_s": "backward",
+            "unscale_clip_s": "unscale_clip",
+            "optimizer_s": "optimizer",
+            "zero_grad_s": "zero_grad",
+        }
+        parts = sorted(parts_raw.items(), key=lambda kv: kv[1], reverse=True)
+        sum_parts = float(sum(v for _, v in parts))
+        unattributed = max(0.0, float(other - sum_parts))
+
+        bi = int(batch_idx) + 1
+        if total_batches > 0:
+            prefix = f"[RUNTIME-OTHER-DETAIL] train batch {bi}/{total_batches}"
+        else:
+            prefix = f"[RUNTIME-OTHER-DETAIL] train batch {bi}"
+
+        segs = [f"other={other:.3f}s"]
+        denom = float(max(other, 1e-12))
+        for k, v in parts:
+            nm = label_map.get(k, k)
+            segs.append(f"{nm}={v:.3f}s ({100.0 * v / denom:.1f}%)")
+        segs.append(f"unattributed={unattributed:.3f}s ({100.0 * unattributed / denom:.1f}%)")
+        print(f"{prefix} " + " | ".join(segs), flush=True)
+
+    def _maybe_print_runtime_model_step_detail(
+        batch_idx: int,
+        *,
+        t_model_step_s: float,
+        model_calls: int,
+        model_parts_s: Dict[str, float],
+    ) -> None:
+        if (not runtime_mesh_enabled) or (not print_runtime_mesh_batch_breakdown):
+            return
+        if float(t_model_step_s) <= 0.0:
+            return
+        if not isinstance(model_parts_s, dict):
+            return
+        parts_raw = {
+            str(k): float(v)
+            for k, v in model_parts_s.items()
+            if (str(k) != "model_step_total_s") and (float(v) > 0.0)
+        }
+        if len(parts_raw) == 0:
+            return
+
+        label_map = {
+            "prep_norm_dt_s": "prep_norm_dt",
+            "chunk_specs_s": "chunk_specs",
+            "physics_ops_s": "physics_ops",
+            "input_assemble_s": "input_assemble",
+            "gnn_forward_s": "gnn_forward",
+            "baseline_blend_s": "baseline_blend",
+            "rk4_s": "rk4",
+            "target_loss_s": "target_loss",
+        }
+        parts = sorted(parts_raw.items(), key=lambda kv: kv[1], reverse=True)
+        total = float(max(t_model_step_s, 1e-12))
+        sum_parts = float(sum(v for _, v in parts))
+        unattributed = max(0.0, total - sum_parts)
+
+        bi = int(batch_idx) + 1
+        if total_batches > 0:
+            prefix = f"[RUNTIME-MODEL-STEP-DETAIL] train batch {bi}/{total_batches}"
+        else:
+            prefix = f"[RUNTIME-MODEL-STEP-DETAIL] train batch {bi}"
+
+        segs = [f"model_step={total:.3f}s"]
+        for k, v in parts:
+            nm = label_map.get(k, k)
+            segs.append(f"{nm}={v:.3f}s ({100.0 * v / total:.1f}%)")
+        segs.append(f"unattributed={unattributed:.3f}s ({100.0 * unattributed / total:.1f}%)")
+        segs.append(f"per_call={total / float(max(1, int(model_calls))):.3f}s")
+        segs.append(f"calls={int(model_calls)}")
+        print(f"{prefix} " + " | ".join(segs), flush=True)
+
+    def _maybe_print_runtime_multires_batch_mismatch(
+        batch_idx: int,
+        *,
+        lookup_calls: int,
+        requested_total: int,
+        missing_total: int,
+        fallback_calls: int,
+        xin_requested: int,
+        xin_missing: int,
+        xtgt_requested: int,
+        xtgt_missing: int,
+    ) -> None:
+        if (not runtime_mesh_enabled) or (not runtime_multires_enabled):
+            return
+        bi = int(batch_idx) + 1
+        miss_pct = 100.0 * float(max(0, missing_total)) / float(max(1, requested_total))
+        if total_batches > 0:
+            prefix = f"[RUNTIME-MULTIRES-MISMATCH] train batch {bi}/{total_batches}"
+        else:
+            prefix = f"[RUNTIME-MULTIRES-MISMATCH] train batch {bi}"
+        print(
+            f"{prefix} calls={int(lookup_calls)} "
+            f"| missing={int(missing_total)}/{int(requested_total)} ({miss_pct:.2f}%) "
+            f"| feat_t_on_pred={int(xin_missing)}/{int(xin_requested)} "
+            f"| feat_tp1_on_pred={int(xtgt_missing)}/{int(xtgt_requested)} "
+            f"| fallback_calls={int(fallback_calls)}",
+            flush=True,
+        )
+
     for batch_idx, batch in enumerate(loader):
         if hang_watch_enabled and (not hang_cap_notified) and (batch_idx == hang_watch_batches):
             print(
@@ -6543,6 +7567,27 @@ def train_one_epoch_multi_step(
         batch_rt_edge_attr_s = 0.0
         batch_rt_idw_remap_s = 0.0
         batch_rt_rebuilds = 0
+        batch_rt_mesh_predict_parts_s: Dict[str, float] = {}
+        batch_rt_other_model_s = 0.0
+        batch_rt_other_metrics_sync_s = 0.0
+        batch_rt_other_state_diag_s = 0.0
+        batch_rt_other_mem_snapshot_s = 0.0
+        batch_rt_other_step_log_io_s = 0.0
+        batch_rt_other_mesh_plot_s = 0.0
+        batch_rt_other_backward_s = 0.0
+        batch_rt_other_unscale_clip_s = 0.0
+        batch_rt_other_optimizer_s = 0.0
+        batch_rt_other_zero_grad_s = 0.0
+        batch_rt_model_calls = 0
+        batch_rt_model_parts_s: Dict[str, float] = {}
+        batch_rt_multires_lookup_calls = 0
+        batch_rt_multires_requested_total = 0
+        batch_rt_multires_missing_total = 0
+        batch_rt_multires_fallback_calls = 0
+        batch_rt_multires_xin_requested = 0
+        batch_rt_multires_xin_missing = 0
+        batch_rt_multires_xtgt_requested = 0
+        batch_rt_multires_xtgt_missing = 0
 
         dt_list = batch.get("dt_list", None)
         if dt_list is None:
@@ -6605,7 +7650,9 @@ def train_one_epoch_multi_step(
         window_mae = 0.0
         window_loss_graph = None
 
+        t_zero_grad_t0 = time.perf_counter()
         opt.zero_grad(set_to_none=True)
+        batch_rt_other_zero_grad_s += float(time.perf_counter() - t_zero_grad_t0)
 
         # Only DEC needs edge_attr. MLS does not.
         if (not runtime_mesh_enabled) and need_phy and (not use_mls) and (pred_ea_list is None):
@@ -6627,6 +7674,11 @@ def train_one_epoch_multi_step(
                 return x
             return x.to(device=device, dtype=(dtype if dtype is not None else x.dtype), non_blocking=True)
 
+        def _assert_finite_if(name: str, t: torch.Tensor, crash: bool = True):
+            if not assert_finite_checks:
+                return True
+            return _assert_finite(name, t, crash=crash)
+
 
         # ==========================================================
         # Helper closure: one step computation (k -> k+1 on pred mesh)
@@ -6646,7 +7698,19 @@ def train_one_epoch_multi_step(
             dt_ref_scalar,              # None or scalar (from batch)
             x_ops_abs: torch.Tensor | None = None,
             chunk_specs_step: list[dict[str, Any]] | None = None,
+            timing_out: Dict[str, float] | None = None,
         ):
+            step_timing: Dict[str, float] = {
+                "prep_norm_dt_s": 0.0,
+                "chunk_specs_s": 0.0,
+                "physics_ops_s": 0.0,
+                "input_assemble_s": 0.0,
+                "gnn_forward_s": 0.0,
+                "baseline_blend_s": 0.0,
+                "rk4_s": 0.0,
+                "target_loss_s": 0.0,
+            }
+            t_prep_t0 = time.perf_counter()
             norm_in  = _maybe_norm(x_in_abs,  mu, sigma)
             norm_tgt = _maybe_norm(x_tgt_abs, mu, sigma)
 
@@ -6677,8 +7741,8 @@ def train_one_epoch_multi_step(
 
                 _mark_printed()
 
-            _assert_finite("norm_in", norm_in)
-            _assert_finite("norm_tgt", norm_tgt)
+            _assert_finite_if("norm_in", norm_in)
+            _assert_finite_if("norm_tgt", norm_tgt)
 
             dt_ref_t = (torch.tensor(float(dt_ref_scalar), device=device, dtype=norm_in.dtype)
                         if dt_ref_scalar is not None else None)
@@ -6691,7 +7755,7 @@ def train_one_epoch_multi_step(
                 _tstats("dt_hat", dt_hat)
                 _mark_printed()
 
-            _assert_finite("dt_hat", dt_hat)
+            _assert_finite_if("dt_hat", dt_hat)
 
             # ---------------------------
             # NAN DEBUG: dt and targets
@@ -6704,7 +7768,7 @@ def train_one_epoch_multi_step(
                 print("[NAN-DBG] dt_hat <= 0:", bool((dt_hat <= 0).any().item()) if torch.is_tensor(dt_hat) else (dt_hat <= 0))
                 _mark_printed()
 
-            _assert_finite("dt_hat", dt_hat)
+            _assert_finite_if("dt_hat", dt_hat)
 
             if torch.is_tensor(dt_hat):
                 if (dt_hat <= 0).any():
@@ -6717,17 +7781,20 @@ def train_one_epoch_multi_step(
 
             dt_phys_f32 = dt_phys.to(device=device, dtype=torch.float32)
             dt_ref_f32  = (dt_ref_t.to(device=device, dtype=torch.float32) if dt_ref_t is not None else None)
+            step_timing["prep_norm_dt_s"] += float(time.perf_counter() - t_prep_t0)
 
             with amp_ctx():
                 pei = pred_ei.to(device) if torch.is_tensor(pred_ei) else pred_ei
                 pea = pred_ea.to(device) if (pred_ea is not None and torch.is_tensor(pred_ea)) else pred_ea
                 chunk_specs_eff = chunk_specs_step
                 if chunk_enabled and (chunk_specs_eff is None):
+                    t_chunk_t0 = time.perf_counter()
                     chunk_specs_eff = _get_chunk_specs_for_step(
                         pred_parents=pred_parents,
                         pred_ei=pei,
                         step_t_abs=step_t_abs,
                     )
+                    step_timing["chunk_specs_s"] += float(time.perf_counter() - t_chunk_t0)
 
                 # ----- physics operators (float32, no autocast) -----
                 r_adv_abs = r_diff_abs = r_phy_abs = area = None
@@ -6774,6 +7841,7 @@ def train_one_epoch_multi_step(
 
                     _mark_printed()
 
+                t_phy_t0 = time.perf_counter()
                 if need_phy:
                     #print("[DEC-CHK] Computing DEC operators for step", step_k)
                     with torch.autocast(device_type=device.type, enabled=False):
@@ -6807,7 +7875,7 @@ def train_one_epoch_multi_step(
                         #x_for_ops = sanitize_state_for_ops(x_ops_base, cfg, rho_floor=1e-6, E_floor=1e-6)
 
                         # Triggered dump: only when state is already “dangerous”
-                        if torch.is_tensor(x_in_abs):
+                        if ops_danger_watch and torch.is_tensor(x_in_abs):
                             danger = (
                                 (~torch.isfinite(x_in_abs)).any()
                                 or (x_in_abs.abs().max() > 1e6)          # tune threshold
@@ -6817,7 +7885,7 @@ def train_one_epoch_multi_step(
                                 _dump_state("x_in_abs", x_in_abs)
 
                         # after enforce_physical_state
-                        if torch.is_tensor(x_for_ops):
+                        if ops_danger_watch and torch.is_tensor(x_for_ops):
                             danger2 = (
                                 (~torch.isfinite(x_for_ops)).any()
                                 or (x_for_ops.abs().max() > 1e6)
@@ -6826,87 +7894,33 @@ def train_one_epoch_multi_step(
                                 print(f"\n[NAN-DBG] step={step_k} TRIGGER: x_for_ops looks dangerous after enforce")
                                 _dump_state("x_for_ops", x_for_ops)
 
-                        with torch.autocast(device_type=device.type, enabled=False):
-                            with torch.no_grad():
-                                def _pick_mls_at_k(batch, k, N, E=None):
-                                    """
-                                    Pick an index kk near k such that:
-                                    - grad_M_inv[kk].shape[0] == N
-                                    - and if E is provided, grad_dX[kk].shape[0] == E
-                                    Returns (kk, M_inv, dX, lap_w, ei_used)
-                                    """
-                                    M_list  = batch.get("mls_grad_M_inv_list", None)
-                                    dX_list = batch.get("mls_grad_dX_list", None)
-                                    w_list  = batch.get("mls_lap_weights_list", None) or batch.get("mls_lap_w_list", None)
-                                    ei_list = batch.get("mls_grad_ei_used_list", None)  # strongly preferred
+                        with torch.no_grad():
+                            if use_mls:
+                                # FACE-ADJ edges (same ones used by DEC)
+                                r_adv_abs, r_diff_abs, area = mls_advdiff_terms_abs_faceadj(
+                                    x_abs=x_for_ops.float(),          # your absolute state tensor on pred mesh
+                                    pos=pred_centers,                # (N,2) for that mesh
+                                    edge_index=pei.long(),           # (2,E) face-adj from precomp_rollout.h5
+                                    levels=pred_levels,              # (N,)
+                                    dx0=float(dx),
+                                    dy0=float(dy),
+                                    cfg=cfg,
+                                    compute_adv=need_adv,
+                                    compute_diff=need_diff,
+                                )
 
-                                    if M_list is None or dX_list is None:
-                                        raise RuntimeError("Missing MLS lists in batch (mls_grad_M_inv_list / mls_grad_dX_list).")
-
-                                    for kk in (k, k + 1, k - 1):
-                                        if not (0 <= kk < len(M_list)):
-                                            continue
-                                        M = M_list[kk]
-                                        dX = dX_list[kk]
-                                        if M is None or dX is None:
-                                            continue
-                                        if int(M.shape[0]) != int(N):
-                                            continue
-
-                                        ei_used = None
-                                        if ei_list is not None and 0 <= kk < len(ei_list):
-                                            ei_used = ei_list[kk]
-                                            if ei_used is not None:
-                                                # ensure E consistency with dX if possible
-                                                if int(ei_used.shape[1]) != int(dX.shape[0]):
-                                                    continue
-
-                                        if E is not None and int(dX.shape[0]) != int(E):
-                                            # if caller supplied E, enforce it
-                                            continue
-
-                                        lap_w = None
-                                        if w_list is not None and 0 <= kk < len(w_list):
-                                            lap_w = w_list[kk]
-
-                                        return kk, M, dX, lap_w, ei_used
-
-                                    # If we got here, show the nearby sizes to make the indexing bug obvious
-                                    def _sz(x): 
-                                        return None if x is None else tuple(x.shape)
-                                    dbg = []
-                                    for kk in (k, k+1, k-1):
-                                        if 0 <= kk < len(M_list):
-                                            dbg.append((kk, _sz(M_list[kk]), _sz(dX_list[kk]), _sz(ei_list[kk]) if ei_list is not None else None))
-                                    raise RuntimeError(f"Could not align MLS geometry to x_abs(N={N}). Nearby shapes: {dbg}")
-
-                                if use_mls:
-                                    # FACE-ADJ edges (same ones used by DEC)
-                                    r_adv_abs, r_diff_abs, area = mls_advdiff_terms_abs_faceadj(
-                                        x_abs=x_for_ops.float(),          # your absolute state tensor on pred mesh
-                                        pos=pred_centers,                # (N,2) for that mesh
-                                        edge_index=pei.long(),           # (2,E) face-adj from precomp_rollout.h5
-                                        levels=pred_levels,              # (N,)
-                                        dx0=float(dx),
-                                        dy0=float(dy),
-                                        cfg=cfg,
-                                        compute_adv=need_adv,
-                                        compute_diff=need_diff,
-                                    )
-
-                                else:
-                                    r_adv_abs, r_diff_abs, area = dec.dec_advdiff_terms_abs(
-                                        #x_abs=x_in_abs.float(),
-                                        x_abs=x_for_ops.float(),
-                                        edge_index=pei.long(),
-                                        pred_ea=pea.float(),
-                                        levels=pred_levels.long().to(device),
-                                        dx0=float(dx),
-                                        dy0=float(dy),
-                                        cfg=cfg,
-                                        compute_adv=need_adv,
-                                        compute_diff=need_diff,
-                                    )
+                            else:
+                                r_adv_abs, r_diff_abs, area = dec.dec_advdiff_terms_abs(
+                                    x_abs=x_for_ops.float(),
+                                    edge_index=pei.long(),
+                                    pred_ea=pea.float(),
+                                    levels=pred_levels.long().to(device),
+                                    dx0=float(dx),
+                                    dy0=float(dy),
+                                    cfg=cfg,
+                                    compute_adv=need_adv,
+                                    compute_diff=need_diff,
+                                )
 
                                 # If not computed, dec_ops should return None; if it returns something else, normalize here:
                                 if (r_adv_abs is None) and need_adv:
@@ -6990,14 +8004,8 @@ def train_one_epoch_multi_step(
                         #ch_mask = torch.zeros((x_in_abs.size(1),), device=device, dtype=torch.float32)
                         #ch_mask[torch.as_tensor(sel, device=device)] = 1.0
 
-                        Fdim = x_in_abs.size(1)
-                        sel_adv  = dec.parc_select_feature_indices_adv(cfg, Fdim)
-                        sel_diff = dec.parc_select_feature_indices_diff(cfg, Fdim)
-                        sel = sorted(set(sel_adv + sel_diff))
-
-                        ch_mask = torch.zeros((Fdim,), device=device, dtype=torch.float32)
-                        if len(sel) > 0:
-                            ch_mask[torch.as_tensor(sel, device=device)] = 1.0
+                        Fdim = int(x_in_abs.size(1))
+                        ch_mask = _get_parc_channel_mask(Fdim, device)
 
                     # ---------------------------
                     # NAN DEBUG: physics operator outputs
@@ -7011,14 +8019,16 @@ def train_one_epoch_multi_step(
                         _tstats("ch_mask", ch_mask)
                         _mark_printed()
 
-                    _assert_finite("r_adv_abs", r_adv_abs, crash=False)
-                    _assert_finite("r_diff_abs", r_diff_abs, crash=False)
-                    _assert_finite("area", area)
+                    _assert_finite_if("r_adv_abs", r_adv_abs, crash=False)
+                    _assert_finite_if("r_diff_abs", r_diff_abs, crash=False)
+                    _assert_finite_if("area", area)
                     #_assert_finite("r_adv_abs", r_adv_abs)
                     if r_phy_abs is not None:
-                        _assert_finite("r_phy_abs", r_phy_abs)
+                        _assert_finite_if("r_phy_abs", r_phy_abs)
+                step_timing["physics_ops_s"] += float(time.perf_counter() - t_phy_t0)
 
                 # ----- build node input X (PARC appends operator inputs) -----
+                t_input_t0 = time.perf_counter()
                 x_in = _build_X(norm_in, pred_centers, pred_levels, cfg, dt_hat=dt_hat)
 
                 # Allow diffusion-only or advection-only PARC inputs:
@@ -7092,7 +8102,7 @@ def train_one_epoch_multi_step(
 
 
                     watch_steps = set(cfg.get("debug", {}).get("parc_scale_watch_steps", [0, 3, 6, 9]))
-                    if cfg.get("debug", {}).get("parc_scale_watch", True) and (step_k in watch_steps):
+                    if cfg.get("debug", {}).get("parc_scale_watch", False) and (step_k in watch_steps):
                         with torch.no_grad():
                             _tstats("norm_in", norm_in)
                             _tstats("r_adv_abs", r_adv_abs)
@@ -7142,8 +8152,9 @@ def train_one_epoch_multi_step(
                         _mark_printed()
 
                     if parc_extra is not None:
-                        _assert_finite("parc_extra", parc_extra)
-                    _assert_finite("x_in (final)", x_in)
+                        _assert_finite_if("parc_extra", parc_extra)
+                    _assert_finite_if("x_in (final)", x_in)
+                step_timing["input_assemble_s"] += float(time.perf_counter() - t_input_t0)
 
                 # one-time print guard
                 if not hasattr(train_one_epoch_multi_step, "_printed_input_contract"):
@@ -7270,6 +8281,7 @@ def train_one_epoch_multi_step(
 
 
                 # ----- network outputs correction rate in model units -----
+                t_gnn_t0 = time.perf_counter()
                 y_corr = _forward_main_head_chunked(
                     x_in_all=x_in,
                     edge_index_global=pei,
@@ -7279,6 +8291,7 @@ def train_one_epoch_multi_step(
                     step_t_abs=step_t_abs,
                     stage_tag="train-main",
                 )
+                step_timing["gnn_forward_s"] += float(time.perf_counter() - t_gnn_t0)
 
                 # ---------------------------
                 # NAN DEBUG: NN forward output
@@ -7288,9 +8301,10 @@ def train_one_epoch_multi_step(
                     _tstats("y_corr", y_corr)
                     _mark_printed()
 
-                _assert_finite("y_corr", y_corr)
+                _assert_finite_if("y_corr", y_corr)
 
                 # ----- add Variant-B baseline in model units -----
+                t_blend_t0 = time.perf_counter()
                 y_pred = y_corr
 
                 if need_phy and (dec_blend_w != 0.0) and (r_phy_abs is not None):
@@ -7320,18 +8334,20 @@ def train_one_epoch_multi_step(
                         _tstats("y_pred", y_pred)
                         _mark_printed()
 
-                    _assert_finite("phy_units", phy_units)
-                    _assert_finite("y_pred", y_pred)
+                    _assert_finite_if("phy_units", phy_units)
+                    _assert_finite_if("y_pred", y_pred)
                 else:
                     if _should_print():
                         print(f"[NAN-DBG] step={step_k} ---- y_pred (no baseline) ----")
                         _tstats("y_pred", y_pred)
                         _mark_printed()
-                    _assert_finite("y_pred", y_pred)
+                    _assert_finite_if("y_pred", y_pred)
+                step_timing["baseline_blend_s"] += float(time.perf_counter() - t_blend_t0)
 
                 r_phy_for_loss = r_phy_abs
 
                 # Optional higher-order integration in normalized-rate space.
+                t_rk4_t0 = time.perf_counter()
                 if rk4_alpha > 0.0:
                     def _predict_rate_for_norm_state(
                         norm_state: torch.Tensor,
@@ -7512,9 +8528,11 @@ def train_one_epoch_multi_step(
                         if (r_phy_abs is not None) and (r_phy_rk4 is not None):
                             r_phy_for_loss = (1.0 - rk4_alpha) * r_phy_abs + rk4_alpha * r_phy_rk4
 
-                    _assert_finite("y_pred_rk_sched", y_pred)
+                    _assert_finite_if("y_pred_rk_sched", y_pred)
+                step_timing["rk4_s"] += float(time.perf_counter() - t_rk4_t0)
 
                 # ----- supervision target -----
+                t_loss_t0 = time.perf_counter()
                 delta_target = norm_tgt - norm_in
                 rate_target = delta_target / dt_hat.clamp_min(1e-12)
 
@@ -7524,10 +8542,10 @@ def train_one_epoch_multi_step(
                     _tstats("rate_target", rate_target)
                     _mark_printed()
 
-                _assert_finite("rate_target", rate_target)
+                _assert_finite_if("rate_target", rate_target)
 
                 watch_steps = set(cfg.get("debug", {}).get("parc_scale_watch_steps", [0, 3, 6, 9]))
-                if cfg.get("debug", {}).get("parc_scale_watch", True) and (step_k in watch_steps):
+                if cfg.get("debug", {}).get("parc_scale_watch", False) and (step_k in watch_steps):
                     with torch.no_grad():
                         _tstats("rate_target", rate_target)
                         _tstats("y_pred", y_pred)
@@ -7619,6 +8637,12 @@ def train_one_epoch_multi_step(
                         y_pred=y_pred,
                     )
                     train_one_epoch_multi_step._printed_loss_components = True
+                step_timing["target_loss_s"] += float(time.perf_counter() - t_loss_t0)
+
+            if isinstance(timing_out, dict):
+                timing_out.clear()
+                timing_out.update(step_timing)
+                timing_out["model_step_total_s"] = float(sum(step_timing.values()))
 
             return loss_step, y_pred_abs, x_tgt_abs
 
@@ -7665,6 +8689,11 @@ def train_one_epoch_multi_step(
                 n_src_tgt = -1
                 n_dst_tgt = -1
                 dtk = _to_scalar_dt(dt_list[k], device=device, dtype=state_feat.dtype)
+                t_src_abs = (
+                    int(t_indices[k].item())
+                    if (t_indices is not None and torch.is_tensor(t_indices))
+                    else (int(t_indices[k]) if t_indices is not None else int(k))
+                )
                 t_dst_abs = (
                     int(t_indices[k + 1].item())
                     if (t_indices is not None and torch.is_tensor(t_indices))
@@ -7703,6 +8732,7 @@ def train_one_epoch_multi_step(
                     if do_rebuild:
                         t_rebuild_t0 = time.perf_counter()
                         rebuild_timing: Dict[str, float] = {}
+                        predictor_input_dbg: Dict[str, Any] = {}
                         (
                             active_pred_centers,
                             active_pred_levels,
@@ -7726,6 +8756,8 @@ def train_one_epoch_multi_step(
                             runtime_mesh_policy=runtime_mesh_policy,
                             runtime_wedge_constraints=runtime_wedge_constraints,
                             runtime_base_mesh=runtime_base_mesh,
+                            predictor_input_out=predictor_input_dbg,
+                            step_k=k,
                             cnn_parent_mapping_mode=("from_centers" if (k == 0) else "dataset"),
                             cnn_fill_empty_interior=bool(k == 0),
                             dt_phys=dtk,
@@ -7737,6 +8769,12 @@ def train_one_epoch_multi_step(
                         batch_rt_mesh_predict_s += float(rebuild_timing.get("mesh_predict_s", 0.0))
                         batch_rt_mesh_materialize_s += float(rebuild_timing.get("mesh_materialize_s", 0.0))
                         batch_rt_edge_attr_s += float(rebuild_timing.get("edge_attr_s", 0.0))
+                        for tk, tv in rebuild_timing.items():
+                            if str(tk).startswith("predict_"):
+                                batch_rt_mesh_predict_parts_s[tk] = (
+                                    float(batch_rt_mesh_predict_parts_s.get(tk, 0.0)) + float(tv)
+                                )
+                        t_plot_t0 = time.perf_counter()
                         _runtime_mesh_plot_maybe_save(
                             settings=runtime_mesh_plot_settings,
                             state=runtime_mesh_plot_state,
@@ -7752,7 +8790,25 @@ def train_one_epoch_multi_step(
                             bbox=runtime_bbox,
                             refine_ratio=runtime_refine_ratio,
                             wedge_path=runtime_mesh_plot_wedge_path,
+                            predictor_input=predictor_input_dbg,
+                            gt_snapshots=[
+                                {
+                                    "tag": "gt_t",
+                                    "t_abs": int(t_src_abs),
+                                    "centers": centers_list[k],
+                                    "levels": level_list[k],
+                                    "feat": feat_list[k],
+                                },
+                                {
+                                    "tag": "gt_tp1",
+                                    "t_abs": int(t_dst_abs),
+                                    "centers": centers_list[k + 1],
+                                    "levels": level_list[k + 1],
+                                    "feat": feat_list[k + 1],
+                                },
+                            ],
                         )
+                        batch_rt_other_mesh_plot_s += float(time.perf_counter() - t_plot_t0)
 
                         if k == 0:
                             n_src_xin = int(state_centers.shape[0])
@@ -7777,6 +8833,20 @@ def train_one_epoch_multi_step(
                                     knn_backend_kwargs=runtime_idw_backend_kwargs,
                                     allow_fallback_to_idw=runtime_multires_fallback_to_idw,
                                 )
+                                xin_requested = int(xin_lookup_info.get("requested", n_dst_xin))
+                                xin_missing = int(
+                                    xin_lookup_info.get(
+                                        "missing_lookup",
+                                        xin_lookup_info.get("missing_total", 0),
+                                    )
+                                )
+                                batch_rt_multires_lookup_calls += 1
+                                batch_rt_multires_requested_total += xin_requested
+                                batch_rt_multires_missing_total += xin_missing
+                                batch_rt_multires_xin_requested += xin_requested
+                                batch_rt_multires_xin_missing += xin_missing
+                                if bool(xin_lookup_info.get("fallback_used", False)):
+                                    batch_rt_multires_fallback_calls += 1
                                 t_xin_map_s = time.perf_counter() - t_xin_t0
                                 idw_dev_xin = str(xin_lookup_info.get("fallback_idw_dev", "lookup"))
                                 idw_chunk_xin = int(xin_lookup_info.get("fallback_idw_chunk", -1))
@@ -7856,6 +8926,20 @@ def train_one_epoch_multi_step(
                             knn_backend_kwargs=runtime_idw_backend_kwargs,
                             allow_fallback_to_idw=runtime_multires_fallback_to_idw,
                         )
+                        xtgt_requested = int(xtgt_lookup_info.get("requested", n_dst_tgt))
+                        xtgt_missing = int(
+                            xtgt_lookup_info.get(
+                                "missing_lookup",
+                                xtgt_lookup_info.get("missing_total", 0),
+                            )
+                        )
+                        batch_rt_multires_lookup_calls += 1
+                        batch_rt_multires_requested_total += xtgt_requested
+                        batch_rt_multires_missing_total += xtgt_missing
+                        batch_rt_multires_xtgt_requested += xtgt_requested
+                        batch_rt_multires_xtgt_missing += xtgt_missing
+                        if bool(xtgt_lookup_info.get("fallback_used", False)):
+                            batch_rt_multires_fallback_calls += 1
                         t_xtgt_map_s = time.perf_counter() - t_xtgt_t0
                         idw_dev_tgt = str(xtgt_lookup_info.get("fallback_idw_dev", "lookup"))
                         idw_chunk_tgt = int(xtgt_lookup_info.get("fallback_idw_chunk", -1))
@@ -7897,6 +8981,7 @@ def train_one_epoch_multi_step(
                         f"E={int(active_pred_ei.shape[1]) if (torch.is_tensor(active_pred_ei) and active_pred_ei.ndim == 2) else -1}",
                         flush=True,
                     )
+                step_model_timing: Dict[str, float] = {}
                 loss_k, y_pred_abs_k, _ = _run_step(
                     step_k=k,
                     step_t_abs=step_t_abs_for_chunk,
@@ -7910,17 +8995,25 @@ def train_one_epoch_multi_step(
                     dt_phys=dtk,
                     dt_ref_scalar=dt_ref_scalar,
                     x_ops_abs=None,
+                    timing_out=step_model_timing,
                 )
                 if batch_dbg:
                     print(f"[HANG-DBG] train _run_step returned: step={k}", flush=True)
                 t_model_s = time.perf_counter() - t_model_t0
+                batch_rt_other_model_s += float(t_model_s)
+                batch_rt_model_calls += 1
+                for tk, tv in step_model_timing.items():
+                    batch_rt_model_parts_s[tk] = float(batch_rt_model_parts_s.get(tk, 0.0)) + float(tv)
 
+                t_metrics_t0 = time.perf_counter()
                 window_loss += float(loss_k.detach().cpu())
                 step_mae = float(torch.mean(torch.abs(y_pred_abs_k.detach() - x_tgt_abs)).cpu())
                 window_mae += step_mae
                 n_steps += 1
                 window_loss_graph = loss_k if window_loss_graph is None else (window_loss_graph + loss_k)
+                batch_rt_other_metrics_sync_s += float(time.perf_counter() - t_metrics_t0)
 
+                t_state_diag_t0 = time.perf_counter()
                 state_feat = _enforce_physical_state(y_pred_abs_k, cfg, rho_floor=1e-6, E_floor=1e-6)
                 _record_step_diagnostics(
                     pred_raw_abs=y_pred_abs_k,
@@ -7933,11 +9026,15 @@ def train_one_epoch_multi_step(
                 state_centers = active_pred_centers
                 state_levels = active_pred_levels
                 state_parents = active_pred_parents
+                batch_rt_other_state_diag_s += float(time.perf_counter() - t_state_diag_t0)
 
                 step_t_abs = -1
                 if t_indices is not None:
                     step_t_abs = int(t_indices[k + 1].item()) if torch.is_tensor(t_indices) else int(t_indices[k + 1])
+                t_mem_snap_t0 = time.perf_counter()
                 mem_alloc_mb, mem_reserved_mb = _runtime_memory_snapshot_mb(device)
+                batch_rt_other_mem_snapshot_s += float(time.perf_counter() - t_mem_snap_t0)
+                t_steplog_t0 = time.perf_counter()
                 _runtime_step_log_write(
                     cfg,
                     {
@@ -7974,6 +9071,7 @@ def train_one_epoch_multi_step(
                         "mem_reserved_mb": float(mem_reserved_mb),
                     },
                 )
+                batch_rt_other_step_log_io_s += float(time.perf_counter() - t_steplog_t0)
 
             # ===== backward + step once per window =====
             if window_loss_graph is not None:
@@ -7981,35 +9079,49 @@ def train_one_epoch_multi_step(
                     print("[HANG-DBG] starting backward+step", flush=True)
                 t_bw0 = time.perf_counter() if batch_dbg else None
                 if scaler is not None:
+                    t_bw_real_t0 = time.perf_counter()
                     scaler.scale(window_loss_graph).backward()
+                    batch_rt_other_backward_s += float(time.perf_counter() - t_bw_real_t0)
                     if batch_dbg:
                         print(f"[HANG-DBG] backward done (scaled) in {time.perf_counter() - t_bw0:.3f}s", flush=True)
                     t_clip0 = time.perf_counter() if batch_dbg else None
+                    t_clip_real_t0 = time.perf_counter()
                     scaler.unscale_(opt)  # <-- required before clipping
                     if grad_clip > 0.0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    batch_rt_other_unscale_clip_s += float(time.perf_counter() - t_clip_real_t0)
                     if batch_dbg:
                         print(f"[HANG-DBG] unscale+clip done in {time.perf_counter() - t_clip0:.3f}s", flush=True)
                     t_step0 = time.perf_counter() if batch_dbg else None
+                    t_step_real_t0 = time.perf_counter()
                     scaler.step(opt)
                     scaler.update()
+                    batch_rt_other_optimizer_s += float(time.perf_counter() - t_step_real_t0)
                     if batch_dbg:
                         print(f"[HANG-DBG] optimizer step+update done in {time.perf_counter() - t_step0:.3f}s", flush=True)
                 else:
+                    t_bw_real_t0 = time.perf_counter()
                     window_loss_graph.backward()
+                    batch_rt_other_backward_s += float(time.perf_counter() - t_bw_real_t0)
                     if batch_dbg:
                         print(f"[HANG-DBG] backward done in {time.perf_counter() - t_bw0:.3f}s", flush=True)
                     t_clip0 = time.perf_counter() if batch_dbg else None
+                    t_clip_real_t0 = time.perf_counter()
                     if grad_clip > 0.0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    batch_rt_other_unscale_clip_s += float(time.perf_counter() - t_clip_real_t0)
                     if batch_dbg:
                         print(f"[HANG-DBG] clip done in {time.perf_counter() - t_clip0:.3f}s", flush=True)
                     t_step0 = time.perf_counter() if batch_dbg else None
+                    t_step_real_t0 = time.perf_counter()
                     opt.step()
+                    batch_rt_other_optimizer_s += float(time.perf_counter() - t_step_real_t0)
                     if batch_dbg:
                         print(f"[HANG-DBG] optimizer step done in {time.perf_counter() - t_step0:.3f}s", flush=True)
             else:
+                t_step_real_t0 = time.perf_counter()
                 opt.step()
+                batch_rt_other_optimizer_s += float(time.perf_counter() - t_step_real_t0)
                 if batch_dbg:
                     print("[HANG-DBG] no graph loss; optimizer step only", flush=True)
 
@@ -8025,6 +9137,49 @@ def train_one_epoch_multi_step(
                 t_edge_attr_s=batch_rt_edge_attr_s,
                 t_idw_remap_s=batch_rt_idw_remap_s,
                 n_rebuilds=batch_rt_rebuilds,
+            )
+            _maybe_print_runtime_mesh_predict_detail(
+                batch_idx,
+                t_mesh_predict_s=batch_rt_mesh_predict_s,
+                n_rebuilds=batch_rt_rebuilds,
+                predict_parts_s=batch_rt_mesh_predict_parts_s,
+            )
+            _maybe_print_runtime_other_detail(
+                batch_idx,
+                batch_wall,
+                t_mesh_predict_s=batch_rt_mesh_predict_s,
+                t_mesh_materialize_s=batch_rt_mesh_materialize_s,
+                t_edge_attr_s=batch_rt_edge_attr_s,
+                t_idw_remap_s=batch_rt_idw_remap_s,
+                other_parts_s={
+                    "model_step_s": float(batch_rt_other_model_s),
+                    "metrics_sync_s": float(batch_rt_other_metrics_sync_s),
+                    "state_diag_s": float(batch_rt_other_state_diag_s),
+                    "mem_snapshot_s": float(batch_rt_other_mem_snapshot_s),
+                    "step_log_io_s": float(batch_rt_other_step_log_io_s),
+                    "mesh_plot_s": float(batch_rt_other_mesh_plot_s),
+                    "backward_s": float(batch_rt_other_backward_s),
+                    "unscale_clip_s": float(batch_rt_other_unscale_clip_s),
+                    "optimizer_s": float(batch_rt_other_optimizer_s),
+                    "zero_grad_s": float(batch_rt_other_zero_grad_s),
+                },
+            )
+            _maybe_print_runtime_model_step_detail(
+                batch_idx,
+                t_model_step_s=float(batch_rt_other_model_s),
+                model_calls=int(batch_rt_model_calls),
+                model_parts_s=batch_rt_model_parts_s,
+            )
+            _maybe_print_runtime_multires_batch_mismatch(
+                batch_idx,
+                lookup_calls=batch_rt_multires_lookup_calls,
+                requested_total=batch_rt_multires_requested_total,
+                missing_total=batch_rt_multires_missing_total,
+                fallback_calls=batch_rt_multires_fallback_calls,
+                xin_requested=batch_rt_multires_xin_requested,
+                xin_missing=batch_rt_multires_xin_missing,
+                xtgt_requested=batch_rt_multires_xtgt_requested,
+                xtgt_missing=batch_rt_multires_xtgt_missing,
             )
             if batch_dbg:
                 print(
@@ -8443,9 +9598,23 @@ def evaluate_one_epoch_multi_step(
                 max_level=max_level_policy,
                 max_cached_feature_steps=int(runtime_multires_cfg.get("max_cached_feature_steps", 16)),
             )
+        grad_step0_parent_mode = str(
+            runtime_mesh_cfg.get("gradient_step0_parent_mapping_mode", "from_centers")
+        ).strip().lower()
+        grad_parent_msg = (
+            f", gradient_step0_parent_mapping_mode={grad_step0_parent_mode}"
+            if runtime_mesh_backend in ("gradient", "gradient_fast")
+            else ""
+        )
+        gf_fill_msg = ""
+        if runtime_mesh_backend == "gradient_fast":
+            gf_cfg = runtime_mesh_cfg.get("gradient_fast", {}) or {}
+            gf_fill_msg = (
+                f", gradient_fast.fill_empty_interior={int(bool(gf_cfg.get('fill_empty_interior', True)))}"
+            )
         print(
             f"[RUNTIME-MESH] eval loop active (backend={runtime_mesh_backend}, domain_mode={runtime_domain_mode}, "
-            f"idw_backend={runtime_idw_backend}, update_every_steps={runtime_update_every}, "
+            f"idw_backend={runtime_idw_backend}, update_every_steps={runtime_update_every}{grad_parent_msg}{gf_fill_msg}, "
             f"infer_only={int(runtime_infer_only)})"
         )
         if bool(runtime_mesh_plot_settings.get("enabled", False)):
@@ -8454,7 +9623,11 @@ def evaluate_one_epoch_multi_step(
                 f"out_dir={runtime_mesh_plot_settings.get('out_dir')} "
                 f"split={runtime_mesh_plot_settings.get('split')} "
                 f"every_rebuilds={int(runtime_mesh_plot_settings.get('every_rebuilds', 1))} "
-                f"max_plots={int(runtime_mesh_plot_settings.get('max_plots', 0))}",
+                f"max_plots={int(runtime_mesh_plot_settings.get('max_plots', 0))} "
+                f"plot_predictor_inputs={int(bool(runtime_mesh_plot_settings.get('plot_predictor_inputs', False)))} "
+                f"predictor_input_max_channels={int(runtime_mesh_plot_settings.get('predictor_input_max_channels', 4))} "
+                f"plot_gt_features={int(bool(runtime_mesh_plot_settings.get('plot_gt_features', False)))} "
+                f"gt_feature_max_channels={int(runtime_mesh_plot_settings.get('gt_feature_max_channels', 4))}",
                 flush=True,
             )
         if runtime_multires_enabled:
@@ -9201,6 +10374,11 @@ def evaluate_one_epoch_multi_step(
                     n_src_tgt = -1
                     n_dst_tgt = -1
                     dtk = _to_scalar_dt(dt_list[k], device=device, dtype=state_feat.dtype)
+                    t_src_abs = (
+                        int(t_indices[k].item())
+                        if (t_indices is not None and torch.is_tensor(t_indices))
+                        else (int(t_indices[k]) if t_indices is not None else int(k))
+                    )
                     t_dst_abs = (
                         int(t_indices[k + 1].item())
                         if (t_indices is not None and torch.is_tensor(t_indices))
@@ -9246,6 +10424,7 @@ def evaluate_one_epoch_multi_step(
 
                         if do_rebuild:
                             t_rebuild_t0 = time.perf_counter()
+                            predictor_input_dbg: Dict[str, Any] = {}
                             (
                                 active_pred_centers,
                                 active_pred_levels,
@@ -9269,6 +10448,8 @@ def evaluate_one_epoch_multi_step(
                                 runtime_mesh_policy=runtime_mesh_policy,
                                 runtime_wedge_constraints=runtime_wedge_constraints,
                                 runtime_base_mesh=runtime_base_mesh,
+                                predictor_input_out=predictor_input_dbg,
+                                step_k=k,
                                 cnn_parent_mapping_mode=("from_centers" if (k == 0) else "dataset"),
                                 cnn_fill_empty_interior=bool(k == 0),
                                 dt_phys=dtk,
@@ -9290,6 +10471,23 @@ def evaluate_one_epoch_multi_step(
                                 bbox=runtime_bbox,
                                 refine_ratio=runtime_refine_ratio,
                                 wedge_path=runtime_mesh_plot_wedge_path,
+                                predictor_input=predictor_input_dbg,
+                                gt_snapshots=[
+                                    {
+                                        "tag": "gt_t",
+                                        "t_abs": int(t_src_abs),
+                                        "centers": centers_list[k],
+                                        "levels": level_list[k],
+                                        "feat": feat_list[k],
+                                    },
+                                    {
+                                        "tag": "gt_tp1",
+                                        "t_abs": int(t_dst_abs),
+                                        "centers": centers_list[k + 1],
+                                        "levels": level_list[k + 1],
+                                        "feat": feat_list[k + 1],
+                                    },
+                                ],
                             )
 
                             if k == 0:
@@ -10115,6 +11313,7 @@ def main(
     runtime_mesh_cfg.setdefault("update_every_steps", 1)
     runtime_mesh_cfg.setdefault("max_cells_per_step", 400_000)
     runtime_mesh_cfg.setdefault("policy_backend", "gradient")
+    runtime_mesh_cfg.setdefault("gradient_step0_parent_mapping_mode", "from_centers")
     runtime_mesh_cfg.setdefault("domain_mode", "wedge_lookup")
     runtime_mesh_cfg.setdefault("wedge_clip_use_lookup", True)
     runtime_mesh_cfg.setdefault("wedge_clip_lookup_fallback", False)
@@ -10140,6 +11339,11 @@ def main(
     runtime_multires_cfg.setdefault("max_cached_feature_steps", 16)
     if runtime_multires_cfg["level_files"] and (not isinstance(runtime_multires_cfg["level_files"], dict)):
         raise ValueError("train.runtime_mesh.multires_gt_lookup.level_files must be a JSON object.")
+    runtime_mesh_gf_cfg = runtime_mesh_cfg.setdefault("gradient_fast", {})
+    if not isinstance(runtime_mesh_gf_cfg, dict):
+        raise ValueError("train.runtime_mesh.gradient_fast must be a JSON object when provided.")
+    runtime_mesh_gf_cfg.setdefault("fill_empty_interior", True)
+    runtime_mesh_gf_cfg.setdefault("fill_empty_chunk", 1024)
     runtime_mesh_cnn_cfg = runtime_mesh_cfg.setdefault("cnn", {})
     if not isinstance(runtime_mesh_cnn_cfg, dict):
         raise ValueError("train.runtime_mesh.cnn must be a JSON object when provided.")
@@ -10175,6 +11379,11 @@ def main(
     mesh_plot_cfg.setdefault("dpi", 180)
     mesh_plot_cfg.setdefault("line_width", 0.2)
     mesh_plot_cfg.setdefault("show_wedge", True)
+    mesh_plot_cfg.setdefault("plot_predictor_inputs", False)
+    mesh_plot_cfg.setdefault("predictor_input_max_channels", 4)
+    mesh_plot_cfg.setdefault("plot_gt_features", False)
+    mesh_plot_cfg.setdefault("gt_feature_max_channels", 4)
+    mesh_plot_cfg.setdefault("gt_feature_indices", [])
     chunk_cfg = cfg.setdefault("chunk", {})
     if not isinstance(chunk_cfg, dict):
         raise ValueError("chunk must be a JSON object when provided.")
@@ -10210,6 +11419,20 @@ def main(
     if runtime_mesh_enabled:
         runtime_backend = _runtime_mesh_backend(cfg)
         runtime_domain_mode = _runtime_mesh_domain_mode(cfg)
+        if runtime_backend in ("gradient", "gradient_fast"):
+            grad_parent_mode = str(
+                runtime_mesh_cfg.get("gradient_step0_parent_mapping_mode", "from_centers")
+            ).strip().lower()
+            if grad_parent_mode in ("dataset", "legacy", "from_dataset"):
+                grad_parent_mode = "dataset"
+            elif grad_parent_mode in ("from_centers", "centers", "runtime_like", "coarse_from_centers"):
+                grad_parent_mode = "from_centers"
+            else:
+                raise ValueError(
+                    "train.runtime_mesh.gradient_step0_parent_mapping_mode must be "
+                    f"'dataset' or 'from_centers', got {grad_parent_mode!r}"
+                )
+            cfg["train"]["runtime_mesh"]["gradient_step0_parent_mapping_mode"] = grad_parent_mode
         if not bool(runtime_mesh_cfg.get("reset_to_coarse_each_step", True)):
             raise RuntimeError(
                 "Runtime mesh mode requires reset_to_coarse_each_step=true "

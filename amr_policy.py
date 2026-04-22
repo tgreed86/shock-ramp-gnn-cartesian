@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 from typing import Any, Dict, Optional, Tuple
+import time
 
 import numpy as np
 import torch
@@ -455,7 +456,20 @@ def predict_masks_hierarchical_from_gt_gradients(
     *,
     device=None,
     debug_out: dict | None = None,
+    timing_out: dict | None = None,
 ) -> dict[int, torch.Tensor]:
+    t_all_t0 = time.perf_counter()
+    timing: Dict[str, float] = {
+        "predict_grad_raster_s": 0.0,
+        "predict_combine_levels_s": 0.0,
+        "predict_pool_up_s": 0.0,
+        "predict_prev_masks_s": 0.0,
+        "predict_threshold_hysteresis_s": 0.0,
+        "predict_dilation_s": 0.0,
+        "predict_normalize_masks_s": 0.0,
+        "predict_debug_out_s": 0.0,
+        "predict_legacy_policy_s": 0.0,
+    }
     dev = device or next((v.device for v in batch.values() if torch.is_tensor(v)), torch.device("cpu"))
 
     pol          = cfg.get("policy", {})
@@ -504,13 +518,16 @@ def predict_masks_hierarchical_from_gt_gradients(
     dy0 = (ymax - ymin) / float(H)
 
     # --- compute grads (on the same path used by the policy) ---
+    t_grad_t0 = time.perf_counter()
     grads = compute_hierarchical_gradients_from_gt_raster(
         batch, cfg, H, W, dx0, dy0,
         feature_idx=None,
         feature_names=None,
     )
+    timing["predict_grad_raster_s"] = float(time.perf_counter() - t_grad_t0)
 
     # --- per-feature combine -> single (h,w) per level ---
+    t_combine_t0 = time.perf_counter()
     combine = str(cfg.get("policy", {}).get("combine", "l2")).lower()
     _anyL = next(iter(grads["grad_feat_by_level"].keys()))
     Fdim = grads["grad_feat_by_level"][_anyL].shape[-1]
@@ -537,8 +554,10 @@ def predict_masks_hierarchical_from_gt_gradients(
         )
         for L in grads["grad_feat_by_level"]
     }
+    timing["predict_combine_levels_s"] = float(time.perf_counter() - t_combine_t0)
 
     # --- pooled-up max propagation (level-agnostic) ---
+    t_pool_t0 = time.perf_counter()
     pooled_up = {L: G[L].clone() for L in G}
     maxL = max(G.keys())
     for L in range(maxL - 1, -1, -1):
@@ -546,9 +565,11 @@ def predict_masks_hierarchical_from_gt_gradients(
             scale = rr ** (Lc - L)
             pooled = torch.nn.functional.max_pool2d(G[Lc][None, None], kernel_size=scale, stride=scale)[0, 0]
             pooled_up[L] = torch.maximum(pooled_up[L], pooled)
+    timing["predict_pool_up_s"] = float(time.perf_counter() - t_pool_t0)
 
     # Reconstruct previous refine masks per level from current mesh state.
     # prev_refine_by_level[L] lives on the parent grid for level L (shape H*rr^(L-1), W*rr^(L-1)).
+    t_prev_masks_t0 = time.perf_counter()
     prev_refine_by_level: Dict[int, torch.Tensor] = {}
     # Hysteresis previous-state source:
     # - default uses current mesh state keys (level_t/ij_t)
@@ -595,8 +616,11 @@ def predict_masks_hierarchical_from_gt_gradients(
         except Exception as e:
             if dbg_thr:
                 print(f"[THR] warning: failed to build per-level previous masks ({e}); using fallback.")
+    timing["predict_prev_masks_s"] = float(time.perf_counter() - t_prev_masks_t0)
 
     # --- thresholding with absolute/percentile hysteresis (unchanged logic) ---
+    t_thr_t0 = time.perf_counter()
+    dilation_s = 0.0
     masks_by_level = {}
     for L in range(1, maxL + 1):
         parent = L - 1
@@ -704,6 +728,7 @@ def predict_masks_hierarchical_from_gt_gradients(
             r_phys = float(pol_cfg.get(f"dilate_phys_L{L}", 0.0))
 
         if r_phys > 0:
+            t_dilate_t0 = time.perf_counter()
             r_cells = max(1, int(round(r_phys / dxL_here)))
             k = 2 * r_cells + 1
             M = torch.nn.functional.max_pool2d(
@@ -712,10 +737,15 @@ def predict_masks_hierarchical_from_gt_gradients(
                 stride=1,
                 padding=r_cells,
             )[0, 0].bool()
+            dilation_s += float(time.perf_counter() - t_dilate_t0)
 
         masks_by_level[L] = M
+    thr_total = float(time.perf_counter() - t_thr_t0)
+    timing["predict_dilation_s"] = float(dilation_s)
+    timing["predict_threshold_hysteresis_s"] = max(0.0, thr_total - float(dilation_s))
 
     # --- Normalize masks to parent grid resolution expected by geometry builder ---
+    t_norm_t0 = time.perf_counter()
     norm_masks_by_level = {}
     for L, M in masks_by_level.items():
         M = M.to(torch.bool)
@@ -744,12 +774,19 @@ def predict_masks_hierarchical_from_gt_gradients(
         norm_masks_by_level[L] = Mp
 
     masks_by_level = norm_masks_by_level
+    timing["predict_normalize_masks_s"] = float(time.perf_counter() - t_norm_t0)
 
     # --- optional: export gradient maps for debugging / plotting ---
+    t_dbg_out_t0 = time.perf_counter()
     if debug_out is not None:
         # store *copies* so policy can freely mutate its own tensors later
         debug_out["G"] = {L: v.detach().clone() for L, v in G.items()}
         debug_out["pooled_up"] = {L: v.detach().clone() for L, v in pooled_up.items()}
+    timing["predict_debug_out_s"] = float(time.perf_counter() - t_dbg_out_t0)
+    timing["predict_legacy_policy_s"] = float(time.perf_counter() - t_all_t0)
+    if isinstance(timing_out, dict):
+        timing_out.clear()
+        timing_out.update(timing)
 
     return masks_by_level
 

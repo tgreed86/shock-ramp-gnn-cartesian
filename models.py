@@ -239,7 +239,15 @@ class FeatureNet(nn.Module):
                 nn.Linear(hidden//2, 1)  # refine score (logit)
             )
 
-    def forward(self, X, edge_index, edge_attr=None):
+    def forward(
+        self,
+        X,
+        edge_index,
+        edge_attr=None,
+        *,
+        return_score: bool = True,
+        return_hidden: bool = True,
+    ):
         h = X
         hang_dbg_once = not hasattr(self, "_hang_dbg_once")
         if hang_dbg_once:
@@ -306,7 +314,7 @@ class FeatureNet(nn.Module):
             h = h + self.input_skip_proj(X)
 
         y_feat = self.feat_head(h)
-        y_score = self.score_head(h) if self.score_head is not None else None
+        y_score = self.score_head(h) if (return_score and self.score_head is not None) else None
         if hang_dbg_once:
             print(
                 f"[HANG-DBG] FeatureNet heads done: y_feat={tuple(y_feat.shape)} "
@@ -314,7 +322,9 @@ class FeatureNet(nn.Module):
                 flush=True,
             )
             self._hang_dbg_once = True
-        return y_feat, y_score, h
+        if return_score or return_hidden:
+            return y_feat, y_score, (h if return_hidden else None)
+        return y_feat
 
 class FeatureExtractorGNN(nn.Module):
     """
