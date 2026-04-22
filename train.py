@@ -6549,6 +6549,9 @@ def train_one_epoch_multi_step(
     print_batch_time = bool(dbg.get("print_batch_time", False))
     print_runtime_mesh_batch_breakdown = bool(dbg.get("print_runtime_mesh_batch_breakdown", True))
     sync_runtime_timing = bool(dbg.get("sync_runtime_timing", False))
+    runtime_mesh_enabled = bool(
+        (cfg.get("train", {}).get("runtime_mesh", {}) or {}).get("enabled", False)
+    )
     progress_every_batches_raw = int(dbg.get("progress_every_batches", 10))
     # 0 (or negative) disables periodic [PROGRESS] logging.
     progress_print_enabled = bool(progress_every_batches_raw > 0)
