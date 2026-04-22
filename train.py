@@ -6548,10 +6548,28 @@ def train_one_epoch_multi_step(
     hang_watch_enabled = bool(hang_watch and (hang_watch_batches > 0))
     print_batch_time = bool(dbg.get("print_batch_time", False))
     print_runtime_mesh_batch_breakdown = bool(dbg.get("print_runtime_mesh_batch_breakdown", True))
+    sync_runtime_timing = bool(dbg.get("sync_runtime_timing", False))
     progress_every_batches_raw = int(dbg.get("progress_every_batches", 10))
     # 0 (or negative) disables periodic [PROGRESS] logging.
     progress_print_enabled = bool(progress_every_batches_raw > 0)
     progress_every_batches = max(1, int(progress_every_batches_raw))
+
+    if sync_runtime_timing and runtime_mesh_enabled and (device.type in ("cuda", "mps")):
+        print(
+            f"[RUNTIME-TIMING] sync_runtime_timing=1 on device={device.type}. "
+            "Per-step timings include synchronization overhead.",
+            flush=True,
+        )
+
+    def _rt_t0() -> float:
+        if sync_runtime_timing:
+            _sync_device(device)
+        return time.perf_counter()
+
+    def _rt_dt(t0: float) -> float:
+        if sync_runtime_timing:
+            _sync_device(device)
+        return float(time.perf_counter() - t0)
 
     if not hasattr(train_one_epoch_multi_step, "_nan_printed"):
         train_one_epoch_multi_step._nan_printed = False
@@ -7271,35 +7289,54 @@ def train_one_epoch_multi_step(
     train_one_epoch_multi_step._printed_loss_components = False
 
     epoch_loop_t0 = time.perf_counter()
+    iter_wait_anchor_t = float(epoch_loop_t0)
+    epoch_body_time_accum_s = 0.0
     try:
         total_batches = int(len(loader))
     except Exception:
         total_batches = -1
     hang_cap_notified = False
 
-    def _maybe_print_batch_progress(batch_idx: int, batch_wall_s: float) -> None:
+    def _maybe_print_batch_progress(
+        batch_idx: int,
+        batch_wall_s: float,
+        *,
+        data_wait_s: float,
+        avg_body_s: float,
+    ) -> None:
         bi = int(batch_idx) + 1
         if print_batch_time:
             if total_batches > 0:
-                print(f"[BATCH-TIME] train batch {bi}/{total_batches} wall={batch_wall_s:.3f}s", flush=True)
+                print(
+                    f"[BATCH-TIME] train batch {bi}/{total_batches} wall={batch_wall_s:.3f}s "
+                    f"data_wait={float(data_wait_s):.3f}s",
+                    flush=True,
+                )
             else:
-                print(f"[BATCH-TIME] train batch {bi} wall={batch_wall_s:.3f}s", flush=True)
+                print(
+                    f"[BATCH-TIME] train batch {bi} wall={batch_wall_s:.3f}s "
+                    f"data_wait={float(data_wait_s):.3f}s",
+                    flush=True,
+                )
         if not progress_print_enabled:
             return
         if (bi % progress_every_batches) != 0:
             return
         elapsed = float(time.perf_counter() - epoch_loop_t0)
-        avg = elapsed / float(max(bi, 1))
+        avg_total = elapsed / float(max(bi, 1))
+        avg_body = float(avg_body_s)
         if total_batches > 0:
             print(
                 f"[PROGRESS] train batch {bi}/{total_batches} "
-                f"batch_wall={batch_wall_s:.3f}s avg_batch={avg:.3f}s elapsed={elapsed:.1f}s",
+                f"batch_wall={batch_wall_s:.3f}s data_wait={float(data_wait_s):.3f}s "
+                f"avg_batch={avg_total:.3f}s avg_body={avg_body:.3f}s elapsed={elapsed:.1f}s",
                 flush=True,
             )
         else:
             print(
                 f"[PROGRESS] train batch {bi} "
-                f"batch_wall={batch_wall_s:.3f}s avg_batch={avg:.3f}s elapsed={elapsed:.1f}s",
+                f"batch_wall={batch_wall_s:.3f}s data_wait={float(data_wait_s):.3f}s "
+                f"avg_batch={avg_total:.3f}s avg_body={avg_body:.3f}s elapsed={elapsed:.1f}s",
                 flush=True,
             )
 
@@ -7309,6 +7346,7 @@ def train_one_epoch_multi_step(
         *,
         t_mesh_predict_s: float,
         t_mesh_materialize_s: float,
+        t_wedge_clip_s: float,
         t_edge_attr_s: float,
         t_idw_remap_s: float,
         n_rebuilds: int,
@@ -7320,6 +7358,7 @@ def train_one_epoch_multi_step(
         accounted = (
             float(t_mesh_predict_s)
             + float(t_mesh_materialize_s)
+            + float(t_wedge_clip_s)
             + float(t_edge_attr_s)
             + float(t_idw_remap_s)
         )
@@ -7336,6 +7375,7 @@ def train_one_epoch_multi_step(
         print(
             f"{prefix} wall={total:.3f}s "
             f"| mesh_materialize={float(t_mesh_materialize_s):.3f}s ({_pct(t_mesh_materialize_s):.1f}%) "
+            f"| wedge_clip={float(t_wedge_clip_s):.3f}s ({_pct(t_wedge_clip_s):.1f}%) "
             f"| idw_remap={float(t_idw_remap_s):.3f}s ({_pct(t_idw_remap_s):.1f}%) "
             f"| edge_attr={float(t_edge_attr_s):.3f}s ({_pct(t_edge_attr_s):.1f}%) "
             f"| other={other:.3f}s ({_pct(other):.1f}%) "
@@ -7410,12 +7450,74 @@ def train_one_epoch_multi_step(
             prefix = f"[RUNTIME-MESH-PREDICT-DETAIL] train batch {bi}"
         print(f"{prefix} " + " | ".join(segs), flush=True)
 
+    def _maybe_print_runtime_wedge_detail(
+        batch_idx: int,
+        *,
+        t_wedge_clip_s: float,
+        wedge_parts_s: Dict[str, float],
+        n_rebuilds: int,
+    ) -> None:
+        if (not runtime_mesh_enabled) or (not print_runtime_mesh_batch_breakdown):
+            return
+        total = float(t_wedge_clip_s)
+        if total <= 0.0:
+            return
+        if not isinstance(wedge_parts_s, dict):
+            return
+        parts_raw = {str(k): float(v) for k, v in wedge_parts_s.items() if float(v) > 0.0}
+        if len(parts_raw) == 0:
+            return
+        label_map = {
+            "wedge_lookup_classify_s": "classify",
+            "wedge_lookup_refine_s": "refine",
+            "wedge_edge_build_s": "edge_build",
+            "wedge_legacy_geom_s": "legacy_geom",
+        }
+        parts = sorted(parts_raw.items(), key=lambda kv: kv[1], reverse=True)
+        sum_parts = float(sum(v for _, v in parts))
+        unattributed = max(0.0, total - sum_parts)
+
+        bi = int(batch_idx) + 1
+        if total_batches > 0:
+            prefix = f"[RUNTIME-WEDGE-DETAIL] train batch {bi}/{total_batches}"
+        else:
+            prefix = f"[RUNTIME-WEDGE-DETAIL] train batch {bi}"
+        segs = [f"wedge_clip={total:.3f}s"]
+        for k, v in parts:
+            nm = label_map.get(k, k)
+            segs.append(f"{nm}={v:.3f}s ({100.0 * v / max(total, 1e-12):.1f}%)")
+        if unattributed > 0.0:
+            segs.append(f"unattributed={unattributed:.3f}s ({100.0 * unattributed / max(total, 1e-12):.1f}%)")
+        segs.append(f"per_rebuild={total / float(max(1, int(n_rebuilds))):.3f}s")
+        segs.append(f"rebuilds={int(n_rebuilds)}")
+        print(f"{prefix} " + " | ".join(segs), flush=True)
+
+    def _maybe_print_runtime_outside_detail(
+        batch_idx: int,
+        *,
+        data_wait_s: float,
+    ) -> None:
+        if (not runtime_mesh_enabled) or (not print_runtime_mesh_batch_breakdown):
+            return
+        if float(data_wait_s) <= 0.0:
+            return
+        bi = int(batch_idx) + 1
+        if total_batches > 0:
+            prefix = f"[RUNTIME-OUTSIDE-DETAIL] train batch {bi}/{total_batches}"
+        else:
+            prefix = f"[RUNTIME-OUTSIDE-DETAIL] train batch {bi}"
+        print(
+            f"{prefix} dataloader_wait={float(data_wait_s):.3f}s (outside batch_wall)",
+            flush=True,
+        )
+
     def _maybe_print_runtime_other_detail(
         batch_idx: int,
         batch_wall_s: float,
         *,
         t_mesh_predict_s: float,
         t_mesh_materialize_s: float,
+        t_wedge_clip_s: float,
         t_edge_attr_s: float,
         t_idw_remap_s: float,
         other_parts_s: Dict[str, float],
@@ -7426,6 +7528,7 @@ def train_one_epoch_multi_step(
         accounted = (
             float(t_mesh_predict_s)
             + float(t_mesh_materialize_s)
+            + float(t_wedge_clip_s)
             + float(t_edge_attr_s)
             + float(t_idw_remap_s)
         )
@@ -7558,12 +7661,16 @@ def train_one_epoch_multi_step(
             hang_cap_notified = True
 
         batch_dbg = bool(hang_watch_enabled and (batch_idx < hang_watch_batches))
-        batch_t0 = time.perf_counter()
+        iter_enter_t = time.perf_counter()
+        data_wait_s = max(0.0, float(iter_enter_t - iter_wait_anchor_t))
+        batch_t0 = float(iter_enter_t)
         if batch_dbg:
             print(f"[HANG-DBG] batch fetched: idx={batch_idx}", flush=True)
 
         batch_rt_mesh_predict_s = 0.0
         batch_rt_mesh_materialize_s = 0.0
+        batch_rt_wedge_clip_s = 0.0
+        batch_rt_wedge_parts_s: Dict[str, float] = {}
         batch_rt_edge_attr_s = 0.0
         batch_rt_idw_remap_s = 0.0
         batch_rt_rebuilds = 0
@@ -7650,9 +7757,9 @@ def train_one_epoch_multi_step(
         window_mae = 0.0
         window_loss_graph = None
 
-        t_zero_grad_t0 = time.perf_counter()
+        t_zero_grad_t0 = _rt_t0()
         opt.zero_grad(set_to_none=True)
-        batch_rt_other_zero_grad_s += float(time.perf_counter() - t_zero_grad_t0)
+        batch_rt_other_zero_grad_s += _rt_dt(t_zero_grad_t0)
 
         # Only DEC needs edge_attr. MLS does not.
         if (not runtime_mesh_enabled) and need_phy and (not use_mls) and (pred_ea_list is None):
@@ -7710,7 +7817,17 @@ def train_one_epoch_multi_step(
                 "rk4_s": 0.0,
                 "target_loss_s": 0.0,
             }
-            t_prep_t0 = time.perf_counter()
+            def _step_t0() -> float:
+                if sync_runtime_timing:
+                    _sync_device(device)
+                return time.perf_counter()
+
+            def _step_dt(t0: float) -> float:
+                if sync_runtime_timing:
+                    _sync_device(device)
+                return float(time.perf_counter() - t0)
+
+            t_prep_t0 = _step_t0()
             norm_in  = _maybe_norm(x_in_abs,  mu, sigma)
             norm_tgt = _maybe_norm(x_tgt_abs, mu, sigma)
 
@@ -7781,20 +7898,20 @@ def train_one_epoch_multi_step(
 
             dt_phys_f32 = dt_phys.to(device=device, dtype=torch.float32)
             dt_ref_f32  = (dt_ref_t.to(device=device, dtype=torch.float32) if dt_ref_t is not None else None)
-            step_timing["prep_norm_dt_s"] += float(time.perf_counter() - t_prep_t0)
+            step_timing["prep_norm_dt_s"] += _step_dt(t_prep_t0)
 
             with amp_ctx():
                 pei = pred_ei.to(device) if torch.is_tensor(pred_ei) else pred_ei
                 pea = pred_ea.to(device) if (pred_ea is not None and torch.is_tensor(pred_ea)) else pred_ea
                 chunk_specs_eff = chunk_specs_step
                 if chunk_enabled and (chunk_specs_eff is None):
-                    t_chunk_t0 = time.perf_counter()
+                    t_chunk_t0 = _step_t0()
                     chunk_specs_eff = _get_chunk_specs_for_step(
                         pred_parents=pred_parents,
                         pred_ei=pei,
                         step_t_abs=step_t_abs,
                     )
-                    step_timing["chunk_specs_s"] += float(time.perf_counter() - t_chunk_t0)
+                    step_timing["chunk_specs_s"] += _step_dt(t_chunk_t0)
 
                 # ----- physics operators (float32, no autocast) -----
                 r_adv_abs = r_diff_abs = r_phy_abs = area = None
@@ -7841,7 +7958,7 @@ def train_one_epoch_multi_step(
 
                     _mark_printed()
 
-                t_phy_t0 = time.perf_counter()
+                t_phy_t0 = _step_t0()
                 if need_phy:
                     #print("[DEC-CHK] Computing DEC operators for step", step_k)
                     with torch.autocast(device_type=device.type, enabled=False):
@@ -8025,10 +8142,10 @@ def train_one_epoch_multi_step(
                     #_assert_finite("r_adv_abs", r_adv_abs)
                     if r_phy_abs is not None:
                         _assert_finite_if("r_phy_abs", r_phy_abs)
-                step_timing["physics_ops_s"] += float(time.perf_counter() - t_phy_t0)
+                step_timing["physics_ops_s"] += _step_dt(t_phy_t0)
 
                 # ----- build node input X (PARC appends operator inputs) -----
-                t_input_t0 = time.perf_counter()
+                t_input_t0 = _step_t0()
                 x_in = _build_X(norm_in, pred_centers, pred_levels, cfg, dt_hat=dt_hat)
 
                 # Allow diffusion-only or advection-only PARC inputs:
@@ -8154,7 +8271,7 @@ def train_one_epoch_multi_step(
                     if parc_extra is not None:
                         _assert_finite_if("parc_extra", parc_extra)
                     _assert_finite_if("x_in (final)", x_in)
-                step_timing["input_assemble_s"] += float(time.perf_counter() - t_input_t0)
+                step_timing["input_assemble_s"] += _step_dt(t_input_t0)
 
                 # one-time print guard
                 if not hasattr(train_one_epoch_multi_step, "_printed_input_contract"):
@@ -8281,7 +8398,7 @@ def train_one_epoch_multi_step(
 
 
                 # ----- network outputs correction rate in model units -----
-                t_gnn_t0 = time.perf_counter()
+                t_gnn_t0 = _step_t0()
                 y_corr = _forward_main_head_chunked(
                     x_in_all=x_in,
                     edge_index_global=pei,
@@ -8291,7 +8408,7 @@ def train_one_epoch_multi_step(
                     step_t_abs=step_t_abs,
                     stage_tag="train-main",
                 )
-                step_timing["gnn_forward_s"] += float(time.perf_counter() - t_gnn_t0)
+                step_timing["gnn_forward_s"] += _step_dt(t_gnn_t0)
 
                 # ---------------------------
                 # NAN DEBUG: NN forward output
@@ -8304,7 +8421,7 @@ def train_one_epoch_multi_step(
                 _assert_finite_if("y_corr", y_corr)
 
                 # ----- add Variant-B baseline in model units -----
-                t_blend_t0 = time.perf_counter()
+                t_blend_t0 = _step_t0()
                 y_pred = y_corr
 
                 if need_phy and (dec_blend_w != 0.0) and (r_phy_abs is not None):
@@ -8342,12 +8459,12 @@ def train_one_epoch_multi_step(
                         _tstats("y_pred", y_pred)
                         _mark_printed()
                     _assert_finite_if("y_pred", y_pred)
-                step_timing["baseline_blend_s"] += float(time.perf_counter() - t_blend_t0)
+                step_timing["baseline_blend_s"] += _step_dt(t_blend_t0)
 
                 r_phy_for_loss = r_phy_abs
 
                 # Optional higher-order integration in normalized-rate space.
-                t_rk4_t0 = time.perf_counter()
+                t_rk4_t0 = _step_t0()
                 if rk4_alpha > 0.0:
                     def _predict_rate_for_norm_state(
                         norm_state: torch.Tensor,
@@ -8529,10 +8646,10 @@ def train_one_epoch_multi_step(
                             r_phy_for_loss = (1.0 - rk4_alpha) * r_phy_abs + rk4_alpha * r_phy_rk4
 
                     _assert_finite_if("y_pred_rk_sched", y_pred)
-                step_timing["rk4_s"] += float(time.perf_counter() - t_rk4_t0)
+                step_timing["rk4_s"] += _step_dt(t_rk4_t0)
 
                 # ----- supervision target -----
-                t_loss_t0 = time.perf_counter()
+                t_loss_t0 = _step_t0()
                 delta_target = norm_tgt - norm_in
                 rate_target = delta_target / dt_hat.clamp_min(1e-12)
 
@@ -8637,7 +8754,7 @@ def train_one_epoch_multi_step(
                         y_pred=y_pred,
                     )
                     train_one_epoch_multi_step._printed_loss_components = True
-                step_timing["target_loss_s"] += float(time.perf_counter() - t_loss_t0)
+                step_timing["target_loss_s"] += _step_dt(t_loss_t0)
 
             if isinstance(timing_out, dict):
                 timing_out.clear()
@@ -8730,7 +8847,7 @@ def train_one_epoch_multi_step(
                     do_rebuild = (k == 0) or ((step_idx % runtime_update_every) == 0)
 
                     if do_rebuild:
-                        t_rebuild_t0 = time.perf_counter()
+                        t_rebuild_t0 = _rt_t0()
                         rebuild_timing: Dict[str, float] = {}
                         predictor_input_dbg: Dict[str, Any] = {}
                         (
@@ -8764,15 +8881,20 @@ def train_one_epoch_multi_step(
                             dt_ref=dt_ref_scalar,
                             timing_out=rebuild_timing,
                         )
-                        t_rebuild_s = time.perf_counter() - t_rebuild_t0
+                        t_rebuild_s = _rt_dt(t_rebuild_t0)
                         batch_rt_rebuilds += 1
                         batch_rt_mesh_predict_s += float(rebuild_timing.get("mesh_predict_s", 0.0))
                         batch_rt_mesh_materialize_s += float(rebuild_timing.get("mesh_materialize_s", 0.0))
+                        batch_rt_wedge_clip_s += float(rebuild_timing.get("wedge_clip_s", 0.0))
                         batch_rt_edge_attr_s += float(rebuild_timing.get("edge_attr_s", 0.0))
                         for tk, tv in rebuild_timing.items():
                             if str(tk).startswith("predict_"):
                                 batch_rt_mesh_predict_parts_s[tk] = (
                                     float(batch_rt_mesh_predict_parts_s.get(tk, 0.0)) + float(tv)
+                                )
+                            elif str(tk).startswith("wedge_"):
+                                batch_rt_wedge_parts_s[tk] = (
+                                    float(batch_rt_wedge_parts_s.get(tk, 0.0)) + float(tv)
                                 )
                         t_plot_t0 = time.perf_counter()
                         _runtime_mesh_plot_maybe_save(
@@ -8818,7 +8940,7 @@ def train_one_epoch_multi_step(
                                     raise RuntimeError(
                                         "Runtime multires GT lookup is enabled but lookup object is not initialized."
                                     )
-                                t_xin_t0 = time.perf_counter()
+                                t_xin_t0 = _rt_t0()
                                 x_in_abs, xin_lookup_info = _lookup_gt_on_pred_mesh_multires(
                                     lookup=runtime_multires_lookup,
                                     t_dst=int(t_dst_abs),
@@ -8847,7 +8969,7 @@ def train_one_epoch_multi_step(
                                 batch_rt_multires_xin_missing += xin_missing
                                 if bool(xin_lookup_info.get("fallback_used", False)):
                                     batch_rt_multires_fallback_calls += 1
-                                t_xin_map_s = time.perf_counter() - t_xin_t0
+                                t_xin_map_s = _rt_dt(t_xin_t0)
                                 idw_dev_xin = str(xin_lookup_info.get("fallback_idw_dev", "lookup"))
                                 idw_chunk_xin = int(xin_lookup_info.get("fallback_idw_chunk", -1))
                             else:
@@ -8857,7 +8979,7 @@ def train_one_epoch_multi_step(
                                     out_device=device,
                                 )
                                 idw_dev_xin = idw_dev_xin_t.type
-                                t_xin_t0 = time.perf_counter()
+                                t_xin_t0 = _rt_t0()
                                 x_in_abs = _map_gt_to_pred_mesh_once(
                                     src_centers=state_centers,
                                     src_feats=state_feat,
@@ -8867,7 +8989,7 @@ def train_one_epoch_multi_step(
                                     knn_backend=runtime_idw_backend,
                                     knn_backend_kwargs=runtime_idw_backend_kwargs,
                                 )
-                                t_xin_map_s = time.perf_counter() - t_xin_t0
+                                t_xin_map_s = _rt_dt(t_xin_t0)
                         else:
                             n_src_xin = int(state_centers.shape[0])
                             n_dst_xin = int(active_pred_centers.shape[0])
@@ -8877,7 +8999,7 @@ def train_one_epoch_multi_step(
                                 out_device=device,
                             )
                             idw_dev_xin = idw_dev_xin_t.type
-                            t_xin_t0 = time.perf_counter()
+                            t_xin_t0 = _rt_t0()
                             x_in_abs = _map_pred_to_next_pred(
                                 pred_centers_src=state_centers,
                                 feats_src=state_feat,
@@ -8896,7 +9018,7 @@ def train_one_epoch_multi_step(
                                 knn_backend=runtime_idw_backend,
                                 knn_backend_kwargs=runtime_idw_backend_kwargs,
                             )
-                            t_xin_map_s = time.perf_counter() - t_xin_t0
+                            t_xin_map_s = _rt_dt(t_xin_t0)
                     else:
                         if active_pred_centers is None:
                             raise RuntimeError("Runtime mesh state is not initialized before a reuse step.")
@@ -8911,7 +9033,7 @@ def train_one_epoch_multi_step(
                             raise RuntimeError(
                                 "Runtime multires GT lookup is enabled but lookup object is not initialized."
                             )
-                        t_xtgt_t0 = time.perf_counter()
+                        t_xtgt_t0 = _rt_t0()
                         x_tgt_abs, xtgt_lookup_info = _lookup_gt_on_pred_mesh_multires(
                             lookup=runtime_multires_lookup,
                             t_dst=int(t_dst_abs),
@@ -8940,7 +9062,7 @@ def train_one_epoch_multi_step(
                         batch_rt_multires_xtgt_missing += xtgt_missing
                         if bool(xtgt_lookup_info.get("fallback_used", False)):
                             batch_rt_multires_fallback_calls += 1
-                        t_xtgt_map_s = time.perf_counter() - t_xtgt_t0
+                        t_xtgt_map_s = _rt_dt(t_xtgt_t0)
                         idw_dev_tgt = str(xtgt_lookup_info.get("fallback_idw_dev", "lookup"))
                         idw_chunk_tgt = int(xtgt_lookup_info.get("fallback_idw_chunk", -1))
                     else:
@@ -8950,7 +9072,7 @@ def train_one_epoch_multi_step(
                             out_device=device,
                         )
                         idw_dev_tgt = idw_dev_tgt_t.type
-                        t_xtgt_t0 = time.perf_counter()
+                        t_xtgt_t0 = _rt_t0()
                         x_tgt_abs = _map_gt_to_pred_mesh_once(
                             src_centers=gt_centers_tp1,
                             src_feats=gt_feat_tp1,
@@ -8960,7 +9082,7 @@ def train_one_epoch_multi_step(
                             knn_backend=runtime_idw_backend,
                             knn_backend_kwargs=runtime_idw_backend_kwargs,
                         )
-                        t_xtgt_map_s = time.perf_counter() - t_xtgt_t0
+                        t_xtgt_map_s = _rt_dt(t_xtgt_t0)
 
                 batch_rt_idw_remap_s += float(t_xin_map_s + t_xtgt_map_s)
 
@@ -8973,7 +9095,7 @@ def train_one_epoch_multi_step(
                         else int(t_indices[k + 1])
                     )
 
-                t_model_t0 = time.perf_counter()
+                t_model_t0 = _rt_t0()
                 if batch_dbg:
                     print(
                         f"[HANG-DBG] train entering _run_step: step={k} "
@@ -8999,7 +9121,7 @@ def train_one_epoch_multi_step(
                 )
                 if batch_dbg:
                     print(f"[HANG-DBG] train _run_step returned: step={k}", flush=True)
-                t_model_s = time.perf_counter() - t_model_t0
+                t_model_s = _rt_dt(t_model_t0)
                 batch_rt_other_model_s += float(t_model_s)
                 batch_rt_model_calls += 1
                 for tk, tv in step_model_timing.items():
@@ -9079,61 +9201,69 @@ def train_one_epoch_multi_step(
                     print("[HANG-DBG] starting backward+step", flush=True)
                 t_bw0 = time.perf_counter() if batch_dbg else None
                 if scaler is not None:
-                    t_bw_real_t0 = time.perf_counter()
+                    t_bw_real_t0 = _rt_t0()
                     scaler.scale(window_loss_graph).backward()
-                    batch_rt_other_backward_s += float(time.perf_counter() - t_bw_real_t0)
+                    batch_rt_other_backward_s += _rt_dt(t_bw_real_t0)
                     if batch_dbg:
                         print(f"[HANG-DBG] backward done (scaled) in {time.perf_counter() - t_bw0:.3f}s", flush=True)
                     t_clip0 = time.perf_counter() if batch_dbg else None
-                    t_clip_real_t0 = time.perf_counter()
+                    t_clip_real_t0 = _rt_t0()
                     scaler.unscale_(opt)  # <-- required before clipping
                     if grad_clip > 0.0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                    batch_rt_other_unscale_clip_s += float(time.perf_counter() - t_clip_real_t0)
+                    batch_rt_other_unscale_clip_s += _rt_dt(t_clip_real_t0)
                     if batch_dbg:
                         print(f"[HANG-DBG] unscale+clip done in {time.perf_counter() - t_clip0:.3f}s", flush=True)
                     t_step0 = time.perf_counter() if batch_dbg else None
-                    t_step_real_t0 = time.perf_counter()
+                    t_step_real_t0 = _rt_t0()
                     scaler.step(opt)
                     scaler.update()
-                    batch_rt_other_optimizer_s += float(time.perf_counter() - t_step_real_t0)
+                    batch_rt_other_optimizer_s += _rt_dt(t_step_real_t0)
                     if batch_dbg:
                         print(f"[HANG-DBG] optimizer step+update done in {time.perf_counter() - t_step0:.3f}s", flush=True)
                 else:
-                    t_bw_real_t0 = time.perf_counter()
+                    t_bw_real_t0 = _rt_t0()
                     window_loss_graph.backward()
-                    batch_rt_other_backward_s += float(time.perf_counter() - t_bw_real_t0)
+                    batch_rt_other_backward_s += _rt_dt(t_bw_real_t0)
                     if batch_dbg:
                         print(f"[HANG-DBG] backward done in {time.perf_counter() - t_bw0:.3f}s", flush=True)
                     t_clip0 = time.perf_counter() if batch_dbg else None
-                    t_clip_real_t0 = time.perf_counter()
+                    t_clip_real_t0 = _rt_t0()
                     if grad_clip > 0.0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                    batch_rt_other_unscale_clip_s += float(time.perf_counter() - t_clip_real_t0)
+                    batch_rt_other_unscale_clip_s += _rt_dt(t_clip_real_t0)
                     if batch_dbg:
                         print(f"[HANG-DBG] clip done in {time.perf_counter() - t_clip0:.3f}s", flush=True)
                     t_step0 = time.perf_counter() if batch_dbg else None
-                    t_step_real_t0 = time.perf_counter()
+                    t_step_real_t0 = _rt_t0()
                     opt.step()
-                    batch_rt_other_optimizer_s += float(time.perf_counter() - t_step_real_t0)
+                    batch_rt_other_optimizer_s += _rt_dt(t_step_real_t0)
                     if batch_dbg:
                         print(f"[HANG-DBG] optimizer step done in {time.perf_counter() - t_step0:.3f}s", flush=True)
             else:
-                t_step_real_t0 = time.perf_counter()
+                t_step_real_t0 = _rt_t0()
                 opt.step()
-                batch_rt_other_optimizer_s += float(time.perf_counter() - t_step_real_t0)
+                batch_rt_other_optimizer_s += _rt_dt(t_step_real_t0)
                 if batch_dbg:
                     print("[HANG-DBG] no graph loss; optimizer step only", flush=True)
 
             total_loss_accum += window_loss
             mae_accum += window_mae
-            batch_wall = float(time.perf_counter() - batch_t0)
-            _maybe_print_batch_progress(batch_idx, batch_wall)
+            batch_wall = _rt_dt(batch_t0)
+            epoch_body_time_accum_s += float(batch_wall)
+            avg_body_s = float(epoch_body_time_accum_s / float(max(int(batch_idx) + 1, 1)))
+            _maybe_print_batch_progress(
+                batch_idx,
+                batch_wall,
+                data_wait_s=float(data_wait_s),
+                avg_body_s=avg_body_s,
+            )
             _maybe_print_runtime_mesh_batch_breakdown(
                 batch_idx,
                 batch_wall,
                 t_mesh_predict_s=batch_rt_mesh_predict_s,
                 t_mesh_materialize_s=batch_rt_mesh_materialize_s,
+                t_wedge_clip_s=batch_rt_wedge_clip_s,
                 t_edge_attr_s=batch_rt_edge_attr_s,
                 t_idw_remap_s=batch_rt_idw_remap_s,
                 n_rebuilds=batch_rt_rebuilds,
@@ -9144,11 +9274,18 @@ def train_one_epoch_multi_step(
                 n_rebuilds=batch_rt_rebuilds,
                 predict_parts_s=batch_rt_mesh_predict_parts_s,
             )
+            _maybe_print_runtime_wedge_detail(
+                batch_idx,
+                t_wedge_clip_s=batch_rt_wedge_clip_s,
+                wedge_parts_s=batch_rt_wedge_parts_s,
+                n_rebuilds=batch_rt_rebuilds,
+            )
             _maybe_print_runtime_other_detail(
                 batch_idx,
                 batch_wall,
                 t_mesh_predict_s=batch_rt_mesh_predict_s,
                 t_mesh_materialize_s=batch_rt_mesh_materialize_s,
+                t_wedge_clip_s=batch_rt_wedge_clip_s,
                 t_edge_attr_s=batch_rt_edge_attr_s,
                 t_idw_remap_s=batch_rt_idw_remap_s,
                 other_parts_s={
@@ -9163,6 +9300,10 @@ def train_one_epoch_multi_step(
                     "optimizer_s": float(batch_rt_other_optimizer_s),
                     "zero_grad_s": float(batch_rt_other_zero_grad_s),
                 },
+            )
+            _maybe_print_runtime_outside_detail(
+                batch_idx,
+                data_wait_s=float(data_wait_s),
             )
             _maybe_print_runtime_model_step_detail(
                 batch_idx,
@@ -9181,6 +9322,7 @@ def train_one_epoch_multi_step(
                 xtgt_requested=batch_rt_multires_xtgt_requested,
                 xtgt_missing=batch_rt_multires_xtgt_missing,
             )
+            iter_wait_anchor_t = time.perf_counter()
             if batch_dbg:
                 print(
                     f"[HANG-DBG] batch complete: idx={batch_idx} "
@@ -9442,7 +9584,16 @@ def train_one_epoch_multi_step(
 
         total_loss_accum += window_loss
         mae_accum        += window_mae
-        _maybe_print_batch_progress(batch_idx, float(time.perf_counter() - batch_t0))
+        batch_wall = _rt_dt(batch_t0)
+        epoch_body_time_accum_s += float(batch_wall)
+        avg_body_s = float(epoch_body_time_accum_s / float(max(int(batch_idx) + 1, 1)))
+        _maybe_print_batch_progress(
+            batch_idx,
+            batch_wall,
+            data_wait_s=float(data_wait_s),
+            avg_body_s=avg_body_s,
+        )
+        iter_wait_anchor_t = time.perf_counter()
 
     denom = max(n_steps, 1)
     stats = {
@@ -11408,6 +11559,7 @@ def main(
     debug_cfg.setdefault("print_chunk_stats", False)
     debug_cfg.setdefault("chunk_stats_every_steps", 1)
     debug_cfg.setdefault("chunk_stats_include_rk4", False)
+    debug_cfg.setdefault("sync_runtime_timing", False)
     diag_cfg_main = _resolve_diagnostics_cfg(cfg)
 
     runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))

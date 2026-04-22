@@ -182,7 +182,7 @@
   },
 
   "train": {
-    "precomp_cache_path": "./cache/L3_uniform/64by64-coarse/shock_ramp_precomp_L3_uniform_faceAdj_DEC.h5",
+    "precomp_cache_path": "./cache/first_simulation/64by64-coarse/shock_ramp_precomp_L3_uniform_faceAdj_DEC.h5",
     "precomp_force_recompute": false,
     "precompute_t_start": null,
     "precompute_t_end": null,
@@ -218,9 +218,9 @@
         "append": false
       },
       "mesh_plot": {
-        "enabled": true,
-        "plot_predictor_inputs": true,
-        "plot_gt_features": true,
+        "enabled": false,
+        "plot_predictor_inputs": false,
+        "plot_gt_features": false,
         "out_dir": "./runs_mesh_first/runtime_mesh_plots",
         "split": "train",
         "_comment_split": "train, eval, or both",
