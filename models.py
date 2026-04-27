@@ -14,6 +14,31 @@ import inspect
 from typing import Any, Dict
 
 
+def _make_activation(
+    name: str,
+    *,
+    negative_slope: float = 0.01,
+    elu_alpha: float = 1.0,
+) -> nn.Module:
+    key = str(name).strip().lower()
+    if key in {"relu"}:
+        return nn.ReLU()
+    if key in {"leaky_relu", "leakyrelu", "lrelu", "leaky"}:
+        return nn.LeakyReLU(negative_slope=float(negative_slope))
+    if key in {"silu", "swish"}:
+        return nn.SiLU()
+    if key in {"gelu"}:
+        return nn.GELU()
+    if key in {"elu"}:
+        return nn.ELU(alpha=float(elu_alpha))
+    if key in {"none", "identity", "linear"}:
+        return nn.Identity()
+    raise ValueError(
+        f"Unsupported activation '{name}'. "
+        "Use one of: relu, leaky_relu, silu, gelu, elu, identity."
+    )
+
+
 class LocalEdgeAttention(nn.Module):
     """
     Local (edge-index constrained) multi-head attention with optional edge-feature bias.
@@ -125,6 +150,9 @@ class FeatureNet(nn.Module):
         attention_edge_dim: int | None = 5,
         attention_use_edge_attr: bool = True,
         attention_replace_last: bool = True,
+        activation: str = "relu",
+        activation_negative_slope: float = 0.01,
+        activation_elu_alpha: float = 1.0,
     ):
         super().__init__()
         self.dropout = dropout
@@ -152,6 +180,14 @@ class FeatureNet(nn.Module):
         self.attention_edge_dim = attention_edge_dim
         self.attention_use_edge_attr = bool(attention_use_edge_attr)
         self.attention_replace_last = bool(attention_replace_last)
+        self.activation_name = str(activation).strip().lower()
+        self.activation_negative_slope = float(activation_negative_slope)
+        self.activation_elu_alpha = float(activation_elu_alpha)
+        self.block_activation = _make_activation(
+            self.activation_name,
+            negative_slope=self.activation_negative_slope,
+            elu_alpha=self.activation_elu_alpha,
+        )
 
         dims = [in_channels] + [hidden] * (layers - 1)
         self.convs = nn.ModuleList()
@@ -187,7 +223,11 @@ class FeatureNet(nn.Module):
                         raise ValueError("FeatureNet conv_type='gine' requires edge_dim in config.")
                     mlp = nn.Sequential(
                         nn.Linear(in_ch, out_ch),
-                        nn.ReLU(),
+                        _make_activation(
+                            self.activation_name,
+                            negative_slope=self.activation_negative_slope,
+                            elu_alpha=self.activation_elu_alpha,
+                        ),
                         nn.Linear(out_ch, out_ch),
                     )
                     self.convs.append(GINEConv(mlp, edge_dim=self.edge_dim))
@@ -196,7 +236,11 @@ class FeatureNet(nn.Module):
                         raise ValueError("FeatureNet conv_type='nnconv' requires edge_dim in config.")
                     edge_net = nn.Sequential(
                         nn.Linear(self.edge_dim, int(nnconv_hidden)),
-                        nn.ReLU(),
+                        _make_activation(
+                            self.activation_name,
+                            negative_slope=self.activation_negative_slope,
+                            elu_alpha=self.activation_elu_alpha,
+                        ),
                         nn.Linear(int(nnconv_hidden), in_ch * out_ch),
                     )
                     self.convs.append(NNConv(in_ch, out_ch, nn=edge_net, aggr="mean"))
@@ -226,7 +270,11 @@ class FeatureNet(nn.Module):
 
         self.feat_head = nn.Sequential(
             nn.Linear(hidden, hidden),
-            nn.ReLU(),
+            _make_activation(
+                self.activation_name,
+                negative_slope=self.activation_negative_slope,
+                elu_alpha=self.activation_elu_alpha,
+            ),
             nn.Dropout(dropout),
             nn.Linear(hidden, out_channels)
         )
@@ -234,7 +282,11 @@ class FeatureNet(nn.Module):
         if make_score_head:
             self.score_head = nn.Sequential(
                 nn.Linear(hidden, hidden//2),
-                nn.ReLU(),
+                _make_activation(
+                    self.activation_name,
+                    negative_slope=self.activation_negative_slope,
+                    elu_alpha=self.activation_elu_alpha,
+                ),
                 nn.Dropout(dropout),
                 nn.Linear(hidden//2, 1)  # refine score (logit)
             )
@@ -267,7 +319,8 @@ class FeatureNet(nn.Module):
                 f"use_layernorm={self.use_layernorm} "
                 f"use_attention={self.use_attention} "
                 f"attention_replace_last={self.attention_replace_last} "
-                f"attention_heads={self.attention_heads}",
+                f"attention_heads={self.attention_heads} "
+                f"activation={self.activation_name}",
                 flush=True,
             )
 
@@ -307,7 +360,7 @@ class FeatureNet(nn.Module):
                     f"[HANG-DBG] FeatureNet conv[{li}] done in {time.perf_counter() - t0:.3f}s",
                     flush=True,
                 )
-            h = F.relu(h)
+            h = self.block_activation(h)
             h = F.dropout(h, p=self.dropout, training=self.training)
 
         if self.skip_type in {"input", "both"} and self.input_skip_proj is not None:

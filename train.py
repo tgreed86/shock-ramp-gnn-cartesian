@@ -11279,6 +11279,16 @@ def build_model_from_cfg(cfg, device):
         att_cfg.get("edge_dim", model_cfg.get("edge_dim", 5)),
     )
     attention_edge_dim = None if attention_edge_dim is None else int(attention_edge_dim)
+    activation = str(model_cfg.get("activation", model_cfg.get("nonlinearity", "relu")))
+    activation_negative_slope = float(
+        model_cfg.get(
+            "activation_negative_slope",
+            model_cfg.get("leaky_relu_negative_slope", 0.01),
+        )
+    )
+    activation_elu_alpha = float(
+        model_cfg.get("activation_elu_alpha", model_cfg.get("elu_alpha", 1.0))
+    )
 
     model = FeatureNet(
         in_channels=in_ch,
@@ -11300,6 +11310,9 @@ def build_model_from_cfg(cfg, device):
         attention_edge_dim=attention_edge_dim,
         attention_use_edge_attr=attention_use_edge_attr,
         attention_replace_last=attention_replace_last,
+        activation=activation,
+        activation_negative_slope=activation_negative_slope,
+        activation_elu_alpha=activation_elu_alpha,
     ).to(device)
 
     # -------------------------

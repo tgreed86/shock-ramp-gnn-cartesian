@@ -4511,6 +4511,15 @@ def main():
         ),
     )
     ap.add_argument(
+        "--runtime-multires-dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional override for train.runtime_mesh.multires_gt_lookup.directory "
+            "used by runtime multires GT lookup."
+        ),
+    )
+    ap.add_argument(
         "--infer-only",
         action="store_true",
         help=(
@@ -4652,6 +4661,14 @@ def main():
         log(
             "[RUNTIME-MESH] overriding train.runtime_mesh.update_every_steps with "
             f"--runtime-update-every-steps={int(args.runtime_update_every_steps)}"
+        )
+    if args.runtime_multires_dir is not None:
+        cfg.setdefault("train", {}).setdefault("runtime_mesh", {}).setdefault(
+            "multires_gt_lookup", {}
+        )["directory"] = str(args.runtime_multires_dir)
+        log(
+            "[RUNTIME-MESH] overriding train.runtime_mesh.multires_gt_lookup.directory with "
+            f"--runtime-multires-dir={args.runtime_multires_dir}"
         )
 
     # Model device

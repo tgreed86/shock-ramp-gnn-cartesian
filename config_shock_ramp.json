@@ -93,17 +93,21 @@
   "model": {
     "name": "FeatureNet",
     "hidden": 128,
-    "layers": 4,
+    "layers": 3,
     "dropout": 0.1,
     "predict_type": "rate",
     "_comment_predict_type": "absolute, delta, or rate",
-    "use_skip": true,
+    "use_skip": false,
     "skip_type": "block",
-    "use_layernorm": true,
+    "use_layernorm": false,
     "layernorm_eps": 1e-6,
-    "use_attention": true,
+    "activation": "relu",
+    "_comment_activation": "relu, leaky_relu, silu, gelu, elu, or identity",
+    "activation_negative_slope": 0.01,
+    "activation_elu_alpha": 1.0,
+    "use_attention": false,
     "attention": {
-      "replace_last_layer": true,
+      "replace_last_layer": false,
       "heads": 4,
       "dropout": 0.0,
       "use_edge_attr": true,
@@ -182,7 +186,7 @@
   },
 
   "train": {
-    "precomp_cache_path": "./cache/first_simulation/64by64-coarse/shock_ramp_precomp_L3_uniform_faceAdj_DEC.h5",
+    "precomp_cache_path": "./cache/first_simulation/64by64-coarse/all/max_level_3/shock_ramp_precomp_pLow85_pHigh95_faceAdj_DEC.h5",
     "precomp_force_recompute": false,
     "precompute_t_start": null,
     "precompute_t_end": null,
@@ -237,7 +241,7 @@
         "allow_fallback_to_exact": false
       },
       "multires_gt_lookup": {
-        "enabled": true,
+        "enabled": false,
         "directory": "./cache/first_simulation/64by64-coarse/uniform_mesh/",
         "level_files": {},
         "fallback_to_idw": true,
