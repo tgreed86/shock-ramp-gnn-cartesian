@@ -1,0 +1,90 @@
+{
+  "seed": 1337,
+  "device": "mps",
+  "data": {
+    "pt_path": "./cache/DMR_7_0_45_125x250.h5",
+    "H": 1002,
+    "W": 2002,
+    "bbox": [0.0, 4.0, 0.0, 2.0],
+    "window_size": 5,
+    "stride": 1,
+    "num_workers": 0
+  },
+  "features": {
+    "use_columns": [0, 1, 2, 3, 4],
+    "names": ["U", "V", "RHO", "P", "E"],
+    "normalize": true,
+    "normalization": {
+      "momentum_sigma_mode": "independent"
+    },
+    "build": {
+      "use_dt_hat_fixed": false
+    }
+  },
+  "split": {
+    "train": 0.85,
+    "val": 0.1,
+    "test": 0.05
+  },
+  "policy": {
+    "refine_ratio": 2,
+    "geometry_mode": "starting_mesh"
+  },
+  "loss": {
+    "use_huber": false,
+    "huber_delta": 0.05,
+    "physics_inputs_enabled": false,
+    "physics_backend": "dec",
+    "advection_type": "scalar",
+    "adv_channels": ["U", "V", "RHO", "P", "E"],
+    "diff_channels": ["RHO", "P", "E"],
+    "adv_weight": 1.0,
+    "diff_weight": 1.0,
+    "nu": 0.0001,
+    "blend_weight": 0.0,
+    "residual_weight": 0.0,
+    "rho_floor": 1e-6,
+    "u_clip": 1000.0
+  },
+  "model": {
+    "name": "FeatureNet",
+    "hidden": 128,
+    "layers": 3,
+    "predict_type": "rate"
+  },
+  "train": {
+    "epochs": 100,
+    "batch_size": 1,
+    "lr": 1e-4,
+    "weight_decay": 0.0,
+    "grad_clip": 1.0,
+    "mesh_mode": "uniform",
+    "precomp_force_recompute": false,
+    "save_dir": "./runs_cartesian/100ep",
+    "validation_every_epochs": 5,
+    "checkpoint_every_epochs": 5
+  },
+  "speed": {
+    "amp": false,
+    "interp_chunk": 4096,
+    "knn_k": 8,
+    "cache_interps": true
+  },
+  "scheduler": {
+    "use": false,
+    "mode": "min",
+    "factor": 0.5,
+    "patience": 5,
+    "threshold": 0.001,
+    "threshold_mode": "rel",
+    "cooldown": 0,
+    "min_lr": 1e-6
+  },
+  "debug": {
+    "nan_watch": false,
+    "print_batch_time": false,
+    "print_runtime_mesh_batch_breakdown": false,
+    "progress_every_batches": 10,
+    "sync_runtime_timing": false
+  }
+}
