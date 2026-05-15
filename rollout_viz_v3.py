@@ -35,7 +35,7 @@ Notes:
 - Uses Agg backend to avoid GUI/memory issues on macOS.
 - Assumes these repo imports exist:
     dataset.CellRefineWindowDataset
-    pretrain.precompute_pred_mesh_and_interps_for_rollout, pretrain.CollateWithPrecompute
+    pretrain.CollateWithUniformStaticNoPrecomp
     plots.compute_plot_deltas, plots._recover_parent_mask, plots._unwrap_delta, plots._fidx_or_none, plots._draw_amr_cells
     train.build_model_from_cfg, train.evaluate_one_epoch_multi_step, train._get_bbox
 
@@ -73,9 +73,6 @@ To change figure sizes from command line:
 
         (16 and and 8 are just examples)
 Use:
-        --no-mesh-gif
-    to skip the (often expensive) mesh GIFs and just produce the rasterized feature GIFs.
-Use 
         --truth-zoom-features density, energy, or both
     to produce additional zoomed-in GIFs for the specified features, showing a tight view of the region around the shock.
 Use 
@@ -91,7 +88,6 @@ import json
 import time
 import argparse
 import zipfile
-import inspect
 import re
 from typing import Optional, Tuple
 
@@ -114,10 +110,7 @@ from torch.utils.data import DataLoader, SequentialSampler, Subset
 # Project imports – must exist in your repo.
 from dataset import CellRefineWindowDataset
 from pretrain import (
-    precompute_pred_mesh_and_interps_for_rollout,
-    CollateWithPrecompute,
-    CollateWithDtOnly,
-    _load_wedge_path_from_spec,
+    CollateWithUniformStaticNoPrecomp,
 )
 from plots import (
     compute_plot_deltas,
@@ -130,12 +123,8 @@ from train import (
     build_model_from_cfg,
     evaluate_one_epoch_multi_step,
     _get_bbox,
-    _load_runtime_mesh_policy_from_cfg,
-    _runtime_mesh_domain_mode,
-    _get_runtime_starting_mesh_base,
-    _get_runtime_wedge_constraints,
-    _runtime_build_pred_mesh_from_state,
-    move_precomp_to_device,
+    _physics_inputs_active_from_loss_cfg,
+    _load_series_from_pt_path,
 )
 from models import ParcFeatureAdapter
 from utils_geom import build_idw_map, apply_idw_map
@@ -174,37 +163,27 @@ def set_seed(seed: int = 42):
     np.random.seed(seed)
     torch.manual_seed(seed)
 
+
+def _cfg_bool_strict(value, *, key: str) -> bool:
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        if int(value) in (0, 1):
+            return bool(int(value))
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in ("1", "true", "yes", "y", "on"):
+            return True
+        if raw in ("0", "false", "no", "n", "off"):
+            return False
+    raise ValueError(
+        f"{key} must be a boolean (or 0/1, true/false string). Got: {value!r}"
+    )
+
 def _load_pt_series(pt_path: str):
-    """Load raw list[Data] time series (.pt or .zip containing .pt)."""
-    if pt_path.endswith(".zip"):
-        with zipfile.ZipFile(pt_path, "r") as zf:
-            member = next(m for m in zf.namelist() if m.endswith(".pt") or m.endswith(".pth"))
-            with zf.open(member, "r") as fh:
-                buf = io.BytesIO(fh.read())
-        data_list = torch.load(buf, map_location="cpu")
-    else:
-        data_list = torch.load(pt_path, map_location="cpu")
+    """Load raw time series from .pt/.pth/.zip or uniform-grid .h5/.hdf5."""
+    _resolved_path, data_list = _load_series_from_pt_path(pt_path)
     return data_list
-
-
-def _load_precomp_artifact(precomp_path: str, *, T: int, H: int, W: int):
-    """
-    Load precomp from either:
-      - torch checkpoint artifact (.pt/.pth): torch.load(...)
-      - streaming HDF5 cache (.h5/.hdf5): LazyPrecompH5 via move_precomp_to_device(...)
-    """
-    path = os.path.expanduser(str(precomp_path))
-    low = path.lower()
-    if low.endswith((".h5", ".hdf5")):
-        h5_handle = {
-            "type": "h5",
-            "path": path,
-            "T": int(T),
-            "H": int(H),
-            "W": int(W),
-        }
-        return move_precomp_to_device(h5_handle, device="cpu")
-    return torch.load(path, map_location="cpu", weights_only=False)
 
 def _get_refine_ratio(cfg: dict) -> int:
     pol = cfg.get("policy", {}) or {}
@@ -252,29 +231,6 @@ def _compute_dt_transitions(series):
         return [], None
     dt_ref = float(np.median(np.asarray(dts, dtype=np.float64)))
     return dts, dt_ref
-
-def _build_precomp_collate(precomp, dt_transitions, dt_ref):
-    """Construct CollateWithPrecompute, passing dt metadata when supported."""
-    try:
-        inspect.signature(CollateWithPrecompute)
-    except Exception:
-        pass
-
-    for ctor in (
-        lambda: CollateWithPrecompute(precomp, dt_transitions=dt_transitions, dt_ref=dt_ref),
-        lambda: CollateWithPrecompute(precomp, dt_transitions=dt_transitions),
-        lambda: CollateWithPrecompute(precomp),
-    ):
-        try:
-            return ctor()
-        except TypeError:
-            continue
-    raise RuntimeError("Could not construct CollateWithPrecompute with available arguments.")
-
-
-def _build_dt_only_collate(dt_transitions, dt_ref):
-    """Construct runtime-mesh dt-only collate."""
-    return CollateWithDtOnly(dt_transitions=dt_transitions, dt_ref=dt_ref)
 
 def _maybe_empty_device_cache(device: torch.device):
     if device.type == "cuda":
@@ -1858,387 +1814,6 @@ def _sym_lims_from_abs(a: np.ndarray, abs_q: float, max_n: Optional[int]) -> Tup
     if not np.isfinite(lim) or lim == 0.0:
         lim = 1e-12
     return -lim, lim
-
-
-# ----------------- Mesh GIF helpers (mesh_gif.py style) ----------------- #
-
-def _mesh_segments_from_centers_levels(
-    centers: np.ndarray,  # (N,2)
-    levels: np.ndarray,   # (N,)
-    dx0: float,
-    dy0: float,
-    refine_ratio: int = 2,
-) -> np.ndarray:
-    """Build axis-aligned quad edge segments implied by AMR (center, level)."""
-    c = np.asarray(centers, dtype=np.float32)
-    L = np.asarray(levels, dtype=np.int64)
-    if c.size == 0:
-        return np.empty((0, 2, 2), dtype=np.float32)
-
-    rr = int(refine_ratio)
-    if rr < 2:
-        raise ValueError(f"refine_ratio must be >=2, got {refine_ratio}")
-
-    scale = np.power(float(rr), L.astype(np.float32))
-    hx = (dx0 / scale) * 0.5
-    hy = (dy0 / scale) * 0.5
-
-    x = c[:, 0]
-    y = c[:, 1]
-    x0 = x - hx
-    x1 = x + hx
-    y0 = y - hy
-    y1 = y + hy
-
-    N = c.shape[0]
-    segs = np.empty((4 * N, 2, 2), dtype=np.float32)
-
-    # bottom
-    segs[0 * N:1 * N, 0, 0] = x0
-    segs[0 * N:1 * N, 0, 1] = y0
-    segs[0 * N:1 * N, 1, 0] = x1
-    segs[0 * N:1 * N, 1, 1] = y0
-    # right
-    segs[1 * N:2 * N, 0, 0] = x1
-    segs[1 * N:2 * N, 0, 1] = y0
-    segs[1 * N:2 * N, 1, 0] = x1
-    segs[1 * N:2 * N, 1, 1] = y1
-    # top
-    segs[2 * N:3 * N, 0, 0] = x1
-    segs[2 * N:3 * N, 0, 1] = y1
-    segs[2 * N:3 * N, 1, 0] = x0
-    segs[2 * N:3 * N, 1, 1] = y1
-    # left
-    segs[3 * N:4 * N, 0, 0] = x0
-    segs[3 * N:4 * N, 0, 1] = y1
-    segs[3 * N:4 * N, 1, 0] = x0
-    segs[3 * N:4 * N, 1, 1] = y0
-    return segs
-
-
-def _mesh_sample_cells(
-    centers: np.ndarray,
-    levels: np.ndarray,
-    max_cells: int,
-    seed: int,
-    strategy: str,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Downsample cells for rendering speed; mirrors mesh_gif.py behavior."""
-    N = int(centers.shape[0])
-    if max_cells <= 0 or N <= max_cells:
-        return centers, levels
-
-    rng = np.random.default_rng(seed)
-
-    if strategy == "first":
-        idx = np.arange(max_cells, dtype=np.int64)
-    elif strategy == "random":
-        idx = rng.choice(N, size=max_cells, replace=False)
-    elif strategy == "per_level":
-        L = np.asarray(levels, dtype=np.int64)
-        uniq = np.unique(L)
-        counts = np.array([(L == u).sum() for u in uniq], dtype=np.int64)
-        frac = counts / max(1, counts.sum())
-        alloc = np.maximum(1, np.floor(frac * max_cells).astype(np.int64))
-
-        while alloc.sum() > max_cells:
-            j = int(np.argmax(alloc))
-            if alloc[j] > 1:
-                alloc[j] -= 1
-            else:
-                break
-        while alloc.sum() < max_cells:
-            j = int(np.argmax(counts))
-            alloc[j] += 1
-
-        picks = []
-        for u, a in zip(uniq, alloc):
-            idx_u = np.flatnonzero(L == u)
-            if idx_u.size == 0:
-                continue
-            if idx_u.size <= a:
-                picks.append(idx_u)
-            else:
-                picks.append(rng.choice(idx_u, size=int(a), replace=False))
-
-        idx = np.concatenate(picks, axis=0)
-        if idx.size > max_cells:
-            idx = rng.choice(idx, size=max_cells, replace=False)
-    else:
-        raise ValueError(f"Unknown mesh sample strategy: {strategy}")
-
-    return centers[idx], levels[idx]
-
-
-def _render_mesh_frame(
-    centers: np.ndarray,
-    levels: np.ndarray,
-    *,
-    dx0: float,
-    dy0: float,
-    bbox: Tuple[float, float, float, float],
-    title: str,
-    linewidth: float,
-    color_by_level: bool,
-    fig_w: float,
-    fig_h: float,
-    dpi: int,
-    refine_ratio: int = 2,
-) -> np.ndarray:
-    """Render one mesh-only frame in the same visual style as utils/mesh_gif.py."""
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=int(dpi))
-    segs = _mesh_segments_from_centers_levels(
-        centers, levels, dx0=dx0, dy0=dy0, refine_ratio=refine_ratio
-    )
-
-    if color_by_level:
-        L = np.asarray(levels, dtype=np.int64)
-        Lmin = int(L.min()) if L.size else 0
-        Lmax = int(L.max()) if L.size else 1
-        denom = max(1, (Lmax - Lmin))
-        t = (L - Lmin) / denom
-        cmap = plt.get_cmap("viridis")
-        colors = np.repeat(cmap(t), repeats=4, axis=0)
-        lc = LineCollection(segs, colors=colors, linewidths=linewidth, antialiased=True)
-    else:
-        lc = LineCollection(segs, colors="black", linewidths=linewidth, antialiased=True)
-
-    ax.add_collection(lc)
-    xmin, xmax, ymin, ymax = bbox
-    ax.set_xlim(float(xmin), float(xmax))
-    ax.set_ylim(float(ymin), float(ymax))
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_title(title, fontsize=10)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.set_frame_on(False)
-
-    fig.tight_layout(pad=0.1)
-    fig.canvas.draw()
-    buf = np.asarray(fig.canvas.buffer_rgba())
-    frame = np.ascontiguousarray(buf[..., :3])
-    plt.close(fig)
-    return frame
-
-
-@torch.inference_mode()
-def make_rollout_mesh_gif(
-    examples,
-    out_gif: str,
-    *,
-    fps: float = 4.0,
-    dpi: int = 120,
-    fig_w: float = 6.5,
-    fig_h: float = 6.5,
-    linewidth: float = 0.20,
-    max_cells: int = 200_000,
-    sample_strategy: str = "per_level",
-    seed: int = 0,
-    color_by_level: bool = False,
-    progress_every: int = 1,
-    refine_ratio: int = 2,
-    centers_key: str = "pred_centers",
-    levels_key: str = "pred_levels",
-    mesh_label: str = "Pred",
-):
-    """Write a mesh-only rollout GIF from per-step mesh geometry stored in examples."""
-    if not examples:
-        log("[WARN] make_rollout_mesh_gif: no examples provided; nothing to do.")
-        return
-
-    examples = sorted(examples, key=lambda e: int(e.get("t", 0)))
-    os.makedirs(os.path.dirname(out_gif) or ".", exist_ok=True)
-
-    duration = 1.0 / float(fps) if float(fps) > 0 else 0.1
-    writer = imageio.get_writer(out_gif, mode="I", duration=duration)
-    frames_written = 0
-
-    try:
-        for step, ex in enumerate(examples):
-            centers_t = ex.get(str(centers_key), None)
-            levels_t = ex.get(str(levels_key), None)
-            if centers_t is None or levels_t is None:
-                continue
-
-            centers = torch.as_tensor(centers_t).detach().cpu().to(torch.float32).numpy()
-            levels = torch.as_tensor(levels_t).detach().cpu().to(torch.int64).numpy().reshape(-1)
-            if centers.ndim != 2 or centers.shape[1] != 2 or levels.ndim != 1:
-                continue
-
-            if centers.shape[0] != levels.shape[0]:
-                n = min(int(centers.shape[0]), int(levels.shape[0]))
-                centers = centers[:n]
-                levels = levels[:n]
-
-            H = int(ex.get("H", 64))
-            W = int(ex.get("W", 64))
-            bbox_raw = ex.get("bbox", (0.0, 1.0, 0.0, 1.0))
-            try:
-                bbox = tuple(float(v) for v in bbox_raw)
-                if len(bbox) != 4:
-                    raise ValueError
-            except Exception:
-                bbox = (0.0, 1.0, 0.0, 1.0)
-
-            xmin, xmax, ymin, ymax = bbox
-            if H <= 0 or W <= 0 or xmax <= xmin or ymax <= ymin:
-                continue
-            dx0 = (xmax - xmin) / float(W)
-            dy0 = (ymax - ymin) / float(H)
-
-            centers_s, levels_s = _mesh_sample_cells(
-                centers=centers,
-                levels=levels,
-                max_cells=int(max_cells),
-                seed=int(seed) + int(step),
-                strategy=str(sample_strategy),
-            )
-
-            t_abs = int(ex.get("t", step))
-            lmax = int(levels_s.max()) if levels_s.size else 0
-            title = f"{mesh_label} | t={t_abs} | N={centers_s.shape[0]} | Lmax={lmax}"
-
-            frame = _render_mesh_frame(
-                centers_s,
-                levels_s,
-                dx0=float(dx0),
-                dy0=float(dy0),
-                bbox=bbox,
-                title=title,
-                linewidth=float(linewidth),
-                color_by_level=bool(color_by_level),
-                fig_w=float(fig_w),
-                fig_h=float(fig_h),
-                dpi=int(dpi),
-                refine_ratio=int(refine_ratio),
-            )
-            writer.append_data(frame)
-            frames_written += 1
-
-            if (step + 1) % max(1, int(progress_every)) == 0:
-                log(f"[MESH-GIF] wrote {step + 1}/{len(examples)} frames")
-    finally:
-        writer.close()
-
-    if frames_written == 0:
-        raise RuntimeError(
-            "make_rollout_mesh_gif produced no frames "
-            f"(missing '{centers_key}'/'{levels_key}' in examples)."
-        )
-    log(f"[INFO] wrote {out_gif}")
-
-
-@torch.inference_mode()
-def _build_cnn_on_gt_mesh_examples(
-    *,
-    examples,
-    cfg,
-    device: torch.device,
-    runtime_mesh_policy,
-    H: int,
-    W: int,
-    dx: float,
-    dy: float,
-    dt_transitions,
-    dt_ref: float | None,
-    progress_every: int = 1,
-):
-    """
-    Build rollout examples where mesh geometry is predicted by the runtime CNN
-    from GT state at each step (teacher-forced mesh policy input).
-    """
-    if not examples:
-        return []
-    if runtime_mesh_policy is None or str(runtime_mesh_policy.get("backend", "")).lower() != "cnn":
-        log("[WARN] CNN-on-GT mesh build skipped: runtime CNN policy is not available.")
-        return []
-
-    domain_mode = _runtime_mesh_domain_mode(cfg)
-    mesh_spec_path = cfg.get("mesh", {}).get("starting_mesh_path", None)
-    if not mesh_spec_path:
-        raise RuntimeError(
-            "CNN-on-GT mesh GIF requested, but cfg['mesh']['starting_mesh_path'] is missing."
-        )
-
-    runtime_base_mesh = None
-    runtime_wedge_path = None
-    runtime_wedge_constraints = None
-    if domain_mode == "starting_mesh":
-        runtime_base_mesh = _get_runtime_starting_mesh_base(
-            cfg=cfg,
-            H=int(H),
-            W=int(W),
-            dx=float(dx),
-            dy=float(dy),
-            device=device,
-            mesh_spec_path=str(mesh_spec_path),
-        )
-    else:
-        runtime_wedge_path = _load_wedge_path_from_spec(str(mesh_spec_path), cfg)
-        runtime_wedge_constraints = _get_runtime_wedge_constraints(
-            cfg=cfg,
-            H=int(H),
-            W=int(W),
-            device=device,
-            wedge_path=runtime_wedge_path,
-        )
-
-    out = []
-    ordered = sorted(examples, key=lambda e: int(e.get("t", 0)))
-    for step, ex in enumerate(ordered):
-        centers_t = ex.get("centers_t", None)
-        feat_t = ex.get("feat_t", ex.get("gt_t", None))
-        level_t = ex.get("level_t", None)
-        parents_t = ex.get("parents_t", None)
-        if (centers_t is None) or (feat_t is None) or (level_t is None) or (parents_t is None):
-            continue
-
-        dt_phys = None
-        dt_ref_for_runtime = None
-        if bool(runtime_mesh_policy.get("include_dt", False)):
-            if dt_transitions is None:
-                raise RuntimeError(
-                    "CNN-on-GT mesh build requested with include_dt=true, but dt_transitions are unavailable."
-                )
-            t_src = int(ex.get("t", step))
-            if t_src < 0 or t_src >= int(len(dt_transitions)):
-                raise RuntimeError(
-                    "CNN-on-GT mesh build dt index out of range: "
-                    f"t_src={t_src}, available_dt={int(len(dt_transitions))}"
-                )
-            dt_phys = float(dt_transitions[t_src])
-            dt_ref_for_runtime = (None if dt_ref is None else float(dt_ref))
-
-        pred_centers, pred_levels, pred_parents, _pred_ei, _mask_pred, _pred_ea = _runtime_build_pred_mesh_from_state(
-            centers_t=torch.as_tensor(centers_t, device=device, dtype=torch.float32),
-            feat_t=torch.as_tensor(feat_t, device=device, dtype=torch.float32),
-            level_t=torch.as_tensor(level_t, device=device, dtype=torch.long),
-            parents_t=torch.as_tensor(parents_t, device=device, dtype=torch.long),
-            cfg=cfg,
-            H=int(H),
-            W=int(W),
-            dx=float(dx),
-            dy=float(dy),
-            device=device,
-            wedge_path=runtime_wedge_path,
-            need_edge_attr=False,
-            runtime_mesh_policy=runtime_mesh_policy,
-            runtime_wedge_constraints=runtime_wedge_constraints,
-            runtime_base_mesh=runtime_base_mesh,
-            dt_phys=dt_phys,
-            dt_ref=dt_ref_for_runtime,
-        )
-
-        ex_out = dict(ex)
-        ex_out["pred_centers"] = pred_centers.detach().cpu()
-        ex_out["pred_levels"] = pred_levels.detach().cpu()
-        ex_out["pred_parents"] = pred_parents.detach().cpu()
-        out.append(ex_out)
-
-        if (step + 1) % max(1, int(progress_every)) == 0:
-            log(f"[MESH-GIF][CNN-GT] built {step + 1}/{len(ordered)} frames")
-
-    return out
 
 
 # ----------------- GIF creation (fast + streaming) ----------------- #
@@ -4292,9 +3867,9 @@ def main():
     ap.add_argument("--pt-path", type=str, default=None,
                     help="Optional override for cfg['data']['pt_path'].")
 
-    ap.add_argument("--horizon", type=int, default=20,
+    ap.add_argument("--horizon", type=int, default=27,
                     help="Number of predicted steps to visualize (rollout length).")
-    ap.add_argument("--start-t", type=int, default=48,
+    ap.add_argument("--start-t", type=int, default=0,
                     help="Absolute starting time index t0 for the rollout.")
 
     ap.add_argument("--device", type=str, default=None,
@@ -4411,59 +3986,21 @@ def main():
             "(typically affine/auto). Default is physical-space GT rendering."
         ),
     )
-    ap.add_argument("--no-mesh-gif", action="store_true",
-                    help="Disable mesh-only GIF generation for predicted rollout meshes.")
-    ap.add_argument("--mesh-gif-name", type=str, default="rollout_mesh.gif",
-                    help="Filename (inside out-dir) for the mesh-only GIF.")
-    ap.add_argument(
-        "--mesh-gif-gt",
-        action="store_true",
-        help=(
-            "Also write a mesh-only GIF where the runtime CNN predicts mesh from GT state inputs "
-            "at each step (teacher-forced CNN mesh policy input)."
-        ),
-    )
-    ap.add_argument(
-        "--mesh-gif-gt-name",
-        type=str,
-        default="rollout_mesh_cnn_on_gt.gif",
-        help="Filename (inside out-dir) for the optional CNN-on-GT mesh-only GIF.",
-    )
-    ap.add_argument("--mesh-fps", type=float, default=None,
-                    help="Mesh GIF FPS (defaults to --fps).")
-    ap.add_argument("--mesh-dpi", type=int, default=None,
-                    help="Mesh GIF DPI (defaults to --dpi).")
-    ap.add_argument("--mesh-fig-w", type=float, default=6.5,
-                    help="Mesh GIF figure width in inches.")
-    ap.add_argument("--mesh-fig-h", type=float, default=6.5,
-                    help="Mesh GIF figure height in inches.")
-    ap.add_argument("--mesh-linewidth", type=float, default=0.20,
-                    help="Mesh edge linewidth in the mesh-only GIF.")
-    ap.add_argument("--mesh-max-cells", type=int, default=200000,
-                    help="Max cells rendered per mesh frame (<=0 disables downsampling).")
-    ap.add_argument("--mesh-sample-strategy", type=str, default="per_level",
-                    choices=["first", "random", "per_level"],
-                    help="Cell downsampling strategy for mesh GIF when N is large.")
-    ap.add_argument("--mesh-seed", type=int, default=0,
-                    help="Sampling seed for mesh GIF downsampling.")
-    ap.add_argument("--mesh-color-by-level", action="store_true",
-                    help="Color mesh edges by level in mesh-only GIF (default is black edges).")
-
     # DataLoader
     ap.add_argument("--num-workers", type=int, default=0,
                     help="Number of workers for DataLoader.")
 
     # Precomp controls
     ap.add_argument("--precomp-path", type=str, default=None,
-                    help="Optional precomp artifact path (.pt/.pth via torch.load, or .h5/.hdf5 streaming cache).")
+                    help="Legacy AMR flag (ignored in cartesian static rollout).")
     ap.add_argument("--save-precomp", type=str, default=None,
-                    help="If set and precomp is computed, save it to this path (torch.save).")
+                    help="Legacy AMR flag (ignored in cartesian static rollout).")
     ap.add_argument("--recompute-precomp", action="store_true",
-                    help="Force recompute of precomp instead of using checkpoint precomp.")
+                    help="Legacy AMR flag (ignored in cartesian static rollout).")
     ap.add_argument("--precompute-scope", type=str, default="all", choices=["window", "all"],
-                    help="Compute precomp only for required timesteps ('window') or for all ('all').")
+                    help="Legacy AMR flag (ignored in cartesian static rollout).")
     ap.add_argument("--precompute-device", type=str, default="cpu",
-                    help="Device to use for precompute (typically cpu).")
+                    help="Legacy AMR flag (ignored in cartesian static rollout).")
     ap.add_argument(
         "--runtime-mesh-cnn-ckpt",
         type=str,
@@ -4620,55 +4157,27 @@ def main():
     if "data" not in cfg or "pt_path" not in cfg["data"]:
         raise RuntimeError("cfg['data']['pt_path'] must be set (or use --pt-path).")
 
-    # Optional runtime-mesh CNN checkpoint override (useful when moving runs across machines).
+    runtime_cli_flags = []
     if args.runtime_mesh_cnn_ckpt is not None:
-        cfg.setdefault("train", {}).setdefault("runtime_mesh", {}).setdefault("cnn", {})[
-            "checkpoint_path"
-        ] = str(args.runtime_mesh_cnn_ckpt)
-        log(
-            "[RUNTIME-MESH] overriding train.runtime_mesh.cnn.checkpoint_path with "
-            f"--runtime-mesh-cnn-ckpt={args.runtime_mesh_cnn_ckpt}"
-        )
-
-    # Optional runtime-mesh spec override (useful when moving runs across machines).
+        runtime_cli_flags.append("--runtime-mesh-cnn-ckpt")
     if args.runtime_mesh_spec_path is not None:
-        cfg.setdefault("mesh", {})["starting_mesh_path"] = str(args.runtime_mesh_spec_path)
-        log(
-            "[RUNTIME-MESH] overriding mesh.starting_mesh_path with "
-            f"--runtime-mesh-spec-path={args.runtime_mesh_spec_path}"
-        )
+        runtime_cli_flags.append("--runtime-mesh-spec-path")
     if args.runtime_idw_backend is not None:
-        cfg.setdefault("train", {}).setdefault("runtime_mesh", {}).setdefault("idw", {})[
-            "backend"
-        ] = str(args.runtime_idw_backend)
-        log(
-            "[RUNTIME-MESH] overriding train.runtime_mesh.idw.backend with "
-            f"--runtime-idw-backend={args.runtime_idw_backend}"
-        )
+        runtime_cli_flags.append("--runtime-idw-backend")
     if args.runtime_knn_k is not None:
-        cfg.setdefault("train", {})["knn_k"] = int(args.runtime_knn_k)
-        log(f"[RUNTIME-MESH] overriding train.knn_k with --runtime-knn-k={int(args.runtime_knn_k)}")
+        runtime_cli_flags.append("--runtime-knn-k")
     if args.runtime_interp_chunk is not None:
-        cfg.setdefault("speed", {})["interp_chunk"] = int(args.runtime_interp_chunk)
-        log(
-            "[RUNTIME-MESH] overriding speed.interp_chunk with "
-            f"--runtime-interp-chunk={int(args.runtime_interp_chunk)}"
-        )
+        runtime_cli_flags.append("--runtime-interp-chunk")
     if args.runtime_update_every_steps is not None:
-        cfg.setdefault("train", {}).setdefault("runtime_mesh", {})["update_every_steps"] = int(
-            args.runtime_update_every_steps
-        )
-        log(
-            "[RUNTIME-MESH] overriding train.runtime_mesh.update_every_steps with "
-            f"--runtime-update-every-steps={int(args.runtime_update_every_steps)}"
-        )
+        runtime_cli_flags.append("--runtime-update-every-steps")
     if args.runtime_multires_dir is not None:
-        cfg.setdefault("train", {}).setdefault("runtime_mesh", {}).setdefault(
-            "multires_gt_lookup", {}
-        )["directory"] = str(args.runtime_multires_dir)
-        log(
-            "[RUNTIME-MESH] overriding train.runtime_mesh.multires_gt_lookup.directory with "
-            f"--runtime-multires-dir={args.runtime_multires_dir}"
+        runtime_cli_flags.append("--runtime-multires-dir")
+    if args.infer_only:
+        runtime_cli_flags.append("--infer-only")
+    if runtime_cli_flags:
+        raise RuntimeError(
+            "This cartesian rollout script does not support runtime-mesh overrides. "
+            f"Unsupported flags: {', '.join(runtime_cli_flags)}"
         )
 
     # Model device
@@ -4702,6 +4211,22 @@ def main():
     # ----- Load series -----
     with Timer("Load time series"):
         data_list = _load_pt_series(cfg["data"]["pt_path"])
+
+    # If snapshots carry explicit base resolution (uniform HDF5 path), prefer it.
+    if len(data_list) > 0:
+        h_file, w_file = _extract_hw_from_snapshot(data_list[0])
+        if (h_file is not None) and (w_file is not None) and (h_file > 0) and (w_file > 0):
+            if (h_file != H) or (w_file != W):
+                log(
+                    "[INFO] Overriding cfg data resolution from file metadata: "
+                    f"H,W=({H},{W}) -> ({h_file},{w_file})"
+                )
+            H = int(h_file)
+            W = int(w_file)
+            cfg.setdefault("data", {})["H"] = H
+            cfg["data"]["W"] = W
+            dx = (xmax - xmin) / W
+            dy = (ymax - ymin) / H
     T = len(data_list)
     log(f"[INFO] Series length T={T}")
 
@@ -4715,7 +4240,14 @@ def main():
     dt_transitions, dt_ref = _compute_dt_transitions(data_list)
 
     runtime_mesh_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
-    runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
+    runtime_mesh_enabled = _cfg_bool_strict(
+        runtime_mesh_cfg.get("enabled", False), key="train.runtime_mesh.enabled"
+    )
+    if runtime_mesh_enabled:
+        raise RuntimeError(
+            "Cartesian rollout requires train.runtime_mesh.enabled=false. "
+            "Runtime remeshing paths are disabled in this repo."
+        )
     runtime_backend = str(runtime_mesh_cfg.get("policy_backend", "gradient")).strip().lower()
     if runtime_backend in ("cnn_policy",):
         runtime_backend = "cnn"
@@ -4755,20 +4287,12 @@ def main():
             f"update_every_steps={int(runtime_mesh_cfg.get('update_every_steps', 1))}"
         )
 
-    runtime_warm_start_precomp = bool(runtime_mesh_cfg.get("warm_start_from_precompute", True))
-    use_precomp_collate = (not runtime_mesh_enabled) or runtime_warm_start_precomp
-    runtime_mesh_policy = None
-    if runtime_mesh_enabled:
+    if bool((cfg.get("train", {}) or {}).get("use_precompute", False)):
         log(
-            "[RUNTIME-MESH] rollout mode enabled "
-            f"(warm_start_from_precompute={runtime_warm_start_precomp})"
+            "[WARN] train.use_precompute=true in config, but cartesian rollout enforces "
+            "no-precompute collate (static/uniform path)."
         )
-        runtime_mesh_policy = _load_runtime_mesh_policy_from_cfg(
-            cfg,
-            device=device,
-            H=H,
-            W=W,
-        )
+    runtime_mesh_policy = None
 
     # ----- Build dataset (CPU) -----
     with Timer("Build dataset"):
@@ -4788,57 +4312,23 @@ def main():
         raise ValueError(f"start_t={start_t} maps to window_idx={window_idx}, but len(dataset)={len(full_ds)}")
     test_ds = Subset(full_ds, [window_idx])
 
-    # ----- Precomp -----
-    precomp = None
-    if use_precomp_collate:
-        print("args.precomp_path:", args.precomp_path)
-        if args.precomp_path is not None:
-            log(f"[INFO] Loading precomp from {args.precomp_path}")
-            precomp = _load_precomp_artifact(args.precomp_path, T=T, H=H, W=W)
-        elif (not args.recompute_precomp) and ("precomp" in ckpt):
-            log("[INFO] Using precomp from checkpoint.")
-            precomp = ckpt["precomp"]
-        print("precomp:", precomp)
-
-        if precomp is None:
-            steps = getattr(full_ds, "steps", None)
-            if steps is None:
-                raise RuntimeError("Dataset has no attribute 'steps'; cannot precompute precomp.")
-
-            pre_device = torch.device(str(args.precompute_device))
-            if args.precompute_scope == "window":
-                lo = window_idx
-                hi = window_idx + horizon + 1
-                steps_to_precompute = steps[lo:hi]
-                log(f"[INFO] Precomputing precomp for window steps [{lo}:{hi}] on {pre_device}...")
-            else:
-                steps_to_precompute = steps
-                log(f"[INFO] Precomputing precomp for ALL steps ({len(steps_to_precompute)}) on {pre_device}...")
-
-            with Timer("Precompute predicted meshes + maps"):
-                precomp = precompute_pred_mesh_and_interps_for_rollout(
-                    steps=steps_to_precompute,
-                    cfg=cfg,
-                    H=H, W=W,
-                    dx=dx, dy=dy,
-                    device=pre_device,
-                    progress=True,
-                )
-
-            if args.save_precomp is not None:
-                os.makedirs(os.path.dirname(args.save_precomp) or ".", exist_ok=True)
-                torch.save(precomp, args.save_precomp)
-                log(f"[INFO] Saved precomp to {args.save_precomp}")
-
-        collate = _build_precomp_collate(precomp, dt_transitions, dt_ref)
-    else:
-        log("[RUNTIME-MESH] warm_start_from_precompute=false; using dt-only collate (no precomp).")
-        if (args.precomp_path is not None) or bool(args.recompute_precomp) or (args.save_precomp is not None):
-            log(
-                "[RUNTIME-MESH] ignoring --precomp-path/--recompute-precomp/--save-precomp "
-                "because warm_start_from_precompute=false."
-            )
-        collate = _build_dt_only_collate(dt_transitions, dt_ref)
+    # ----- Collate (uniform/static, no AMR precompute) -----
+    if (args.precomp_path is not None) or bool(args.recompute_precomp) or (args.save_precomp is not None):
+        log(
+            "[INFO] Ignoring --precomp-path/--recompute-precomp/--save-precomp for "
+            "cartesian static rollout (no precompute required)."
+        )
+    log("[PRECOMP] disabled for cartesian rollout: using CollateWithUniformStaticNoPrecomp.")
+    collate = CollateWithUniformStaticNoPrecomp(
+        cfg=cfg,
+        H=H,
+        W=W,
+        dx=dx,
+        dy=dy,
+        dt_transitions=dt_transitions,
+        dt_ref=dt_ref,
+        device="cpu",
+    )
 
     test_loader = DataLoader(
         test_ds,
@@ -4853,9 +4343,9 @@ def main():
     with Timer("Build model"):
         model = build_model_from_cfg(cfg, device)
 
-    # ---- attach ParcFeatureAdapter if PARC is enabled (mirrors training main) ----
+    # ---- attach ParcFeatureAdapter when physics-input channels are enabled ----
     loss_cfg = cfg.get("loss", {}) or {}
-    parc_use = bool(loss_cfg.get("parc", False) or loss_cfg.get("parc_inputs", False))
+    parc_use = _physics_inputs_active_from_loss_cfg(loss_cfg)
     use_adapter = bool(loss_cfg.get("parc_use_adapter", False))
 
     if parc_use and use_adapter:
@@ -5037,72 +4527,6 @@ def main():
                 two_panel_fig_w=float(args.two_panel_fig_w),
                 two_panel_fig_h=float(args.two_panel_fig_h),
             )
-
-    if not bool(args.no_mesh_gif):
-        mesh_gif_path = os.path.join(out_dir, str(args.mesh_gif_name))
-        mesh_fps = float(args.mesh_fps) if args.mesh_fps is not None else float(args.fps)
-        mesh_dpi = int(args.mesh_dpi) if args.mesh_dpi is not None else int(args.dpi)
-
-        log("[INFO] Making rollout mesh GIF (predicted mesh evolution)...")
-        with Timer("make_rollout_mesh_gif"):
-            make_rollout_mesh_gif(
-                examples=examples,
-                out_gif=mesh_gif_path,
-                fps=mesh_fps,
-                dpi=mesh_dpi,
-                fig_w=float(args.mesh_fig_w),
-                fig_h=float(args.mesh_fig_h),
-                linewidth=float(args.mesh_linewidth),
-                max_cells=int(args.mesh_max_cells),
-                sample_strategy=str(args.mesh_sample_strategy),
-                seed=int(args.mesh_seed),
-                color_by_level=bool(args.mesh_color_by_level),
-                progress_every=int(args.progress_every),
-                refine_ratio=int(_get_refine_ratio(cfg)),
-                centers_key="pred_centers",
-                levels_key="pred_levels",
-                mesh_label="Pred",
-            )
-
-        if bool(args.mesh_gif_gt):
-            mesh_gif_gt_path = os.path.join(out_dir, str(args.mesh_gif_gt_name))
-            log("[INFO] Making rollout mesh GIF (CNN predicted from GT inputs)...")
-            with Timer("build_cnn_on_gt_mesh_examples"):
-                cnn_gt_examples = _build_cnn_on_gt_mesh_examples(
-                    examples=examples,
-                    cfg=cfg,
-                    device=device,
-                    runtime_mesh_policy=runtime_mesh_policy,
-                    H=int(H),
-                    W=int(W),
-                    dx=float(dx),
-                    dy=float(dy),
-                    dt_transitions=dt_transitions,
-                    dt_ref=float(dt_ref),
-                    progress_every=int(args.progress_every),
-                )
-            if not cnn_gt_examples:
-                log("[WARN] CNN-on-GT mesh GIF skipped: no derived examples were generated.")
-            else:
-                with Timer("make_rollout_mesh_gif_gt"):
-                    make_rollout_mesh_gif(
-                        examples=cnn_gt_examples,
-                        out_gif=mesh_gif_gt_path,
-                        fps=mesh_fps,
-                        dpi=mesh_dpi,
-                        fig_w=float(args.mesh_fig_w),
-                        fig_h=float(args.mesh_fig_h),
-                        linewidth=float(args.mesh_linewidth),
-                        max_cells=int(args.mesh_max_cells),
-                        sample_strategy=str(args.mesh_sample_strategy),
-                        seed=int(args.mesh_seed),
-                        color_by_level=bool(args.mesh_color_by_level),
-                        progress_every=int(args.progress_every),
-                        refine_ratio=int(_get_refine_ratio(cfg)),
-                        centers_key="pred_centers",
-                        levels_key="pred_levels",
-                        mesh_label="CNN(GT-in)",
-                    )
 
     log(f"[INFO] Done. GIFs are in: {out_dir}")
     

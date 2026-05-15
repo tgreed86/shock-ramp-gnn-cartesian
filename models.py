@@ -1,7 +1,6 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-import time
 import math
 from torch_geometric.nn import GATConv, GraphUNet
 from torch_geometric.nn import SAGEConv, GINEConv, NNConv
@@ -301,28 +300,6 @@ class FeatureNet(nn.Module):
         return_hidden: bool = True,
     ):
         h = X
-        hang_dbg_once = not hasattr(self, "_hang_dbg_once")
-        if hang_dbg_once:
-            try:
-                ei_shape = tuple(edge_index.shape) if torch.is_tensor(edge_index) else None
-            except Exception:
-                ei_shape = None
-            try:
-                ea_shape = tuple(edge_attr.shape) if torch.is_tensor(edge_attr) else None
-            except Exception:
-                ea_shape = None
-            print(
-                f"[HANG-DBG] FeatureNet.forward start: X={tuple(X.shape)} "
-                f"dtype={X.dtype} dev={X.device} edge_index={ei_shape} "
-                f"edge_attr={ea_shape} conv_type={self.conv_type} "
-                f"use_skip={self.use_skip} skip_type={self.skip_type} "
-                f"use_layernorm={self.use_layernorm} "
-                f"use_attention={self.use_attention} "
-                f"attention_replace_last={self.attention_replace_last} "
-                f"attention_heads={self.attention_heads} "
-                f"activation={self.activation_name}",
-                flush=True,
-            )
 
         edge_attr_use = None
         need_edge_attr_base = (self.conv_type != "sage")
@@ -338,9 +315,6 @@ class FeatureNet(nn.Module):
 
         for li, conv in enumerate(self.convs):
             h_res = h
-            t0 = time.perf_counter() if hang_dbg_once else None
-            if hang_dbg_once:
-                print(f"[HANG-DBG] FeatureNet conv[{li}] begin", flush=True)
             if self.layer_types[li] == "attention":
                 h = conv(h, edge_index, edge_attr=edge_attr_use)
             else:
@@ -355,11 +329,6 @@ class FeatureNet(nn.Module):
             if self.use_layernorm:
                 h = self.block_norms[li](h)
 
-            if hang_dbg_once:
-                print(
-                    f"[HANG-DBG] FeatureNet conv[{li}] done in {time.perf_counter() - t0:.3f}s",
-                    flush=True,
-                )
             h = self.block_activation(h)
             h = F.dropout(h, p=self.dropout, training=self.training)
 
@@ -368,13 +337,6 @@ class FeatureNet(nn.Module):
 
         y_feat = self.feat_head(h)
         y_score = self.score_head(h) if (return_score and self.score_head is not None) else None
-        if hang_dbg_once:
-            print(
-                f"[HANG-DBG] FeatureNet heads done: y_feat={tuple(y_feat.shape)} "
-                f"y_score={None if y_score is None else tuple(y_score.shape)}",
-                flush=True,
-            )
-            self._hang_dbg_once = True
         if return_score or return_hidden:
             return y_feat, y_score, (h if return_hidden else None)
         return y_feat

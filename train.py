@@ -22,7 +22,7 @@ print("[train.py] module import started", flush=True)
 from typing import Dict, Any, List, Tuple, Optional, Sequence
 from collections import OrderedDict
 import inspect
-import os, io, json, time, zipfile, random, sys, csv, datetime, hashlib, re
+import os, io, json, time, zipfile, random, sys, csv, datetime, re
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler, Subset
@@ -39,18 +39,13 @@ from plots import plot_loss_curves, amr_composite_to_finest_grid
 from utils_geom import build_idw_map, apply_idw_map, apply_precomputed_idw_map, dynamic_cells_from_parent_masks
 
 from pretrain import (
-    precompute_pred_mesh_and_interps_for_rollout,
     precompute_uniform_mesh_in_memory,
     CollateWithPrecompute,
-    CollateWithDtOnly,
-    _build_starting_mesh_from_spec,
+    CollateWithUniformStaticNoPrecomp,
     build_amr_face_adjacency_edges,
     build_amr_local_knn_edges,
     dec_edge_attr_for_dyadic_quads,
     _clip_pred_mesh_to_wedge,
-    _load_wedge_path_from_spec,
-    _get_wedge_clip_level_lookup,
-    _lookup_level_masks_on_device,
 )
 
 from utils.precomp_h5 import LazyPrecompH5
@@ -76,6 +71,66 @@ def _get_refine_ratio(cfg: dict) -> int:
     if rr < 2:
         raise ValueError(f"refine_ratio must be >=2, got {rr}")
     return rr
+
+
+def _cfg_bool_strict(value: Any, *, key: str) -> bool:
+    """
+    Parse a config bool safely.
+    Accepts bool, 0/1, and common true/false strings.
+    """
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        if int(value) in (0, 1):
+            return bool(int(value))
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in ("1", "true", "yes", "y", "on"):
+            return True
+        if raw in ("0", "false", "no", "n", "off"):
+            return False
+    raise ValueError(
+        f"{key} must be a boolean (or 0/1, true/false string). Got: {value!r}"
+    )
+
+
+def _runtime_mesh_enabled_from_cfg(cfg: Dict[str, Any]) -> bool:
+    rt_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
+    return _cfg_bool_strict(rt_cfg.get("enabled", False), key="train.runtime_mesh.enabled")
+
+
+def _physics_inputs_enabled_from_loss_cfg(loss_cfg: Dict[str, Any] | None) -> bool:
+    loss = loss_cfg or {}
+    raw = loss.get("physics_inputs_enabled", True)
+    return _cfg_bool_strict(raw, key="loss.physics_inputs_enabled")
+
+
+def _physics_inputs_active_from_loss_cfg(loss_cfg: Dict[str, Any] | None) -> bool:
+    return _physics_inputs_enabled_from_loss_cfg(loss_cfg)
+
+
+def _enforce_cartesian_project_contract(cfg: Dict[str, Any]) -> None:
+    """
+    Physics-Aware-cartesian is intentionally fixed-mesh:
+      - train.mesh_mode must be 'uniform'
+      - train.runtime_mesh.enabled must be false
+    """
+    train_cfg = cfg.setdefault("train", {})
+    mesh_mode = str(train_cfg.get("mesh_mode", "uniform")).strip().lower()
+    if mesh_mode != "uniform":
+        raise RuntimeError(
+            "Cartesian project contract violation: train.mesh_mode must be 'uniform'. "
+            f"Got {mesh_mode!r}."
+        )
+    rt_cfg = train_cfg.setdefault("runtime_mesh", {})
+    rt_enabled = _runtime_mesh_enabled_from_cfg(cfg)
+    if rt_enabled:
+        raise RuntimeError(
+            "Cartesian project contract violation: train.runtime_mesh.enabled must be false. "
+            "Runtime remeshing paths are disabled in this repo."
+        )
+    # Normalize value so downstream code never sees string-like booleans.
+    rt_cfg["enabled"] = False
 
 def _resolve_momentum_sigma_mode(cfg: dict) -> str:
     """
@@ -353,12 +408,8 @@ def mls_advdiff_terms_abs_faceadj(
 
     data = Data(pos=pos_ops, edge_index=ei_ops)
 
-    # velocity from conservative state (assumes [rho,mx,my,E])
-    idx = dec.infer_feature_indices(cfg, x_ops.size(1))
-    rho = x_ops[:, idx["rho"]].abs().clamp_min(rho_floor)
-    mx  = x_ops[:, idx["mx"]]
-    my  = x_ops[:, idx["my"]]
-    vel = torch.stack([mx / rho, my / rho], dim=1).clamp(-u_clip, u_clip)  # (N,2)
+    # velocity from whichever state representation is configured
+    vel = dec.compute_velocity_from_state(x_ops, cfg, eps=rho_floor).clamp(-u_clip, u_clip)  # (N,2)
 
     mls_adv, mls_diff = _get_mls_ops(cfg)
 
@@ -500,19 +551,8 @@ def stepA_check_ops_vs_gt_delta(
     else:
         area = torch.ones((N,), device=device, dtype=torch.float32)
 
-    # -------- sanitize state for ops (IMPORTANT: ops should not see insane mx/rho) --------
-    # Use your sanitizer if you prefer; this is a momentum-by-rho limiter that matches u_max.
-    idx_map = dec.infer_feature_indices(cfg, Fdim)
-    rho_i, mx_i, my_i, E_i = idx_map["rho"], idx_map["mx"], idx_map["my"], idx_map["E"]
-
-    x_ops = x_in_abs.clone()
-    rho = x_ops[:, rho_i].clamp_min(rho_floor)
-    x_ops[:, rho_i] = rho
-    x_ops[:, E_i]   = x_ops[:, E_i].clamp_min(E_floor)
-
-    mmax = (u_max * rho).to(dtype=x_ops.dtype)
-    x_ops[:, mx_i] = x_ops[:, mx_i].clamp(-mmax, mmax)
-    x_ops[:, my_i] = x_ops[:, my_i].clamp(-mmax, mmax)
+    # -------- sanitize state for ops --------
+    x_ops = sanitize_state_for_ops(x_in_abs.clone(), cfg, rho_floor=rho_floor, E_floor=E_floor)
 
     # -------- compute DEC operator terms (absolute units) --------
     loss_cfg = cfg.get("loss", {}) or {}
@@ -631,18 +671,8 @@ def stepA_check_given_state_vs_gt(
         refine_ratio=_get_refine_ratio(cfg),
     ).view(-1)
 
-    # sanitize state for ops (same limiter style as before)
-    idx_map = dec.infer_feature_indices(cfg, Fdim)
-    rho_i, mx_i, my_i, E_i = idx_map["rho"], idx_map["mx"], idx_map["my"], idx_map["E"]
-
-    x_ops = x_in_abs.clone()
-    rho = x_ops[:, rho_i].clamp_min(rho_floor)
-    x_ops[:, rho_i] = rho
-    x_ops[:, E_i]   = x_ops[:, E_i].clamp_min(E_floor)
-
-    mmax = (u_max * rho).to(dtype=x_ops.dtype)
-    x_ops[:, mx_i] = x_ops[:, mx_i].clamp(-mmax, mmax)
-    x_ops[:, my_i] = x_ops[:, my_i].clamp(-mmax, mmax)
+    # sanitize state for ops
+    x_ops = sanitize_state_for_ops(x_in_abs.clone(), cfg, rho_floor=rho_floor, E_floor=E_floor)
 
     loss_cfg = cfg.get("loss", {}) or {}
     adv_w  = float(loss_cfg.get("adv_weight", 1.0))
@@ -863,12 +893,6 @@ def norm_to_abs(x_norm: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor) -> 
     mu_ = _as_feature_vec(mu, F, device=x_norm.device, dtype=x_norm.dtype)
     sg_ = _as_feature_vec(sigma, F, device=x_norm.device, dtype=x_norm.dtype)
     return mu_ + sg_ * x_norm
-
-def abs_to_norm(x_abs: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-    F = x_abs.size(-1)
-    mu_ = _as_feature_vec(mu, F, device=x_abs.device, dtype=x_abs.dtype)
-    sg_ = _as_feature_vec(sigma, F, device=x_abs.device, dtype=x_abs.dtype)
-    return (x_abs - mu_) / sg_
 
 @torch.no_grad()
 def quantile_cpu(x: torch.Tensor, q: float, dim: int = 0) -> torch.Tensor:
@@ -1116,11 +1140,108 @@ def move_precomp_to_device(precomp, device):
 
     return out
 
-def _budget_feature_indices(cfg: dict, Fdim: int):
-    # Use your existing helper (same one used in dec_ops ensures correct mapping)
-    return dec.infer_feature_indices(cfg, Fdim)
 
-def _compute_budget_row(*, x_abs: torch.Tensor, levels: torch.Tensor, dx0: float, dy0: float, cfg: dict):
+class _SegmentedPrecompSeq:
+    def __init__(self, owner: "SegmentedPrecompView", key: str):
+        self.owner = owner
+        self.key = key
+
+    def __len__(self):
+        return int(self.owner.T)
+
+    def __getitem__(self, t: int):
+        return self.owner._get(self.key, t)
+
+
+class SegmentedPrecompView(dict):
+    """
+    Dict-like precomp view that stitches multiple source-specific precomp objects
+    into one global-timeline precomp for CollateWithPrecompute.
+    """
+
+    _SEQ_KEYS = (
+        "pred_centers",
+        "pred_levels",
+        "pred_parents",
+        "pred_ei",
+        "pred_edge_attr",
+        "mask_pred",
+        "feat_t_on_pred",
+        "feat_tp1_on_pred",
+        "pred2pred_idx",
+        "pred2pred_w",
+    )
+
+    def __init__(self, *, segments: List[Dict[str, Any]], T: int, H: int, W: int):
+        super().__init__()
+        self.T = int(T)
+        self.H = int(H)
+        self.W = int(W)
+        self._segments = sorted(list(segments), key=lambda s: int(s["t_start"]))
+        self._starts = [int(s["t_start"]) for s in self._segments]
+        self._ends = [int(s["t_end"]) for s in self._segments]
+
+        for k in self._SEQ_KEYS:
+            super().__setitem__(k, _SegmentedPrecompSeq(self, k))
+
+        # Optional scalar metadata passthrough (best effort).
+        layout_val = None
+        for seg in self._segments:
+            pre = seg.get("precomp", None)
+            if pre is None:
+                continue
+            v = pre.get("pred_edge_attr_layout", None) if isinstance(pre, dict) else None
+            if callable(v):
+                try:
+                    v = v()
+                except Exception:
+                    v = None
+            if hasattr(v, "get"):
+                try:
+                    v = v.get()
+                except Exception:
+                    pass
+            if isinstance(v, str) and v != "":
+                layout_val = v
+                break
+        super().__setitem__("pred_edge_attr_layout", layout_val)
+
+    def _locate_segment(self, t: int) -> Dict[str, Any] | None:
+        if t < 0 or t >= self.T:
+            return None
+        # Linear scan is fine here (small #sources). Keep it explicit.
+        for i, (s, e) in enumerate(zip(self._starts, self._ends)):
+            if s <= t <= e:
+                return self._segments[i]
+        return None
+
+    def _get(self, key: str, t: int):
+        seg = self._locate_segment(int(t))
+        if seg is None:
+            return None
+        pre = seg.get("precomp", None)
+        if pre is None:
+            return None
+        t_local = int(t) - int(seg["t_start"])
+        seq = pre.get(key, None) if isinstance(pre, dict) else None
+        if seq is None:
+            return None
+        try:
+            return seq[t_local]
+        except Exception:
+            return None
+
+    def close(self):
+        for seg in self._segments:
+            pre = seg.get("precomp", None)
+            close_fn = getattr(pre, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+
+def _compute_budget_row(*, x_abs: torch.Tensor, levels: torch.Tensor | None, dx0: float, dy0: float, cfg: dict):
     """
     Compute global integrals on the mesh defined by `levels`.
     x_abs: (N,F) absolute conserved variables on THAT mesh.
@@ -1129,22 +1250,24 @@ def _compute_budget_row(*, x_abs: torch.Tensor, levels: torch.Tensor, dx0: float
     """
     # Keep everything in float32 for MPS safety
     x = x_abs.detach().to(device="cpu", dtype=torch.float32)
-    lev = levels.detach().to(device="cpu", dtype=torch.int64).view(-1)
+    if levels is None:
+        w = x.new_full((x.size(0),), float(dx0) * float(dy0))
+    else:
+        lev = levels.detach().to(device="cpu", dtype=torch.int64).view(-1)
+        w = dec.cell_area_from_levels(
+            lev,
+            dx0=float(dx0),
+            dy0=float(dy0),
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            refine_ratio=_get_refine_ratio(cfg),
+        )  # (N,)
 
-    w = dec.cell_area_from_levels(
-        lev,
-        dx0=float(dx0),
-        dy0=float(dy0),
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-        refine_ratio=_get_refine_ratio(cfg),
-    )  # (N,)
-
-    idx = _budget_feature_indices(cfg, int(x.shape[1]))
-    rho = x[:, idx["rho"]]
-    mx  = x[:, idx["mx"]]
-    my  = x[:, idx["my"]]
-    E   = x[:, idx["E"]]
+    state = dec.state_views(x, cfg)
+    rho = state["rho"]
+    mx = state["mx"]
+    my = state["my"]
+    E = state["E_tot"]
 
     area   = float(w.sum().item())
     mass   = float((w * rho).sum().item())
@@ -1152,45 +1275,6 @@ def _compute_budget_row(*, x_abs: torch.Tensor, levels: torch.Tensor, dx0: float
     mom_y  = float((w * my ).sum().item())
     energy = float((w * E  ).sum().item())
     return area, mass, mom_x, mom_y, energy
-
-def _global_integrals_on_mesh(x_abs: torch.Tensor, area: torch.Tensor, cfg: dict):
-    """
-    x_abs: [N,F] absolute units (rho, mx, my, E assumed by infer_feature_indices)
-    area:  [N]   cell area in physical units
-    Returns python floats computed on CPU in float64 for stability (works on MPS).
-    """
-    idx = dec.infer_feature_indices(cfg, x_abs.size(1))
-    rho = x_abs[:, idx["rho"]]
-    mx  = x_abs[:, idx["mx"]]
-    my  = x_abs[:, idx["my"]]
-    E   = x_abs[:, idx["E"]]
-
-    # compute on CPU/float64 to avoid MPS float64 limitations on-tensor ops
-    a_cpu   = area.detach().cpu().double()
-    rho_cpu = rho.detach().cpu().double()
-    mx_cpu  = mx.detach().cpu().double()
-    my_cpu  = my.detach().cpu().double()
-    E_cpu   = E.detach().cpu().double()
-
-    M  = (rho_cpu * a_cpu).sum().item()
-    Px = (mx_cpu  * a_cpu).sum().item()
-    Py = (my_cpu  * a_cpu).sum().item()
-    Et = (E_cpu   * a_cpu).sum().item()
-
-    return {"M": M, "Px": Px, "Py": Py, "E": Et}
-
-
-def _budget_row(tag: str, step_k: int, dt_phys: float, budgets: dict):
-    # flatten into a simple dict suitable for logging / CSV
-    return {
-        "tag": tag,
-        "step_k": int(step_k),
-        "dt_phys": float(dt_phys),
-        "M": float(budgets["M"]),
-        "Px": float(budgets["Px"]),
-        "Py": float(budgets["Py"]),
-        "E": float(budgets["E"]),
-    }
 
 # -------------------- Fast kNN‑IDW interpolation (vectorized) --------------------
 # This replaces expensive Python loops and can be cached per sample.
@@ -1256,10 +1340,6 @@ def _canonical_feature_norm_mode(raw: str) -> str:
     )
 
 
-def _feature_norm_requires_stats(mode: str) -> bool:
-    return _canonical_feature_norm_mode(mode) in ("zscore",)
-
-
 def _parse_feature_norm_stats(
     raw,
     *,
@@ -1315,10 +1395,6 @@ def _apply_feature_norm_chw(
     mean_t = torch.as_tensor(parsed["mean"], dtype=torch.float32, device=x.device).view(-1, 1, 1)
     std_t = torch.as_tensor(parsed["std"], dtype=torch.float32, device=x.device).view(-1, 1, 1)
     return ((x - mean_t) / std_t).contiguous()
-
-
-def _gradient_norm_requires_stats(mode: str) -> bool:
-    return _canonical_gradient_norm_mode(mode) in ("zscore", "log1p_zscore")
 
 
 def _parse_gradient_norm_stats(raw) -> Dict[str, Dict[str, float]] | None:
@@ -1439,64 +1515,6 @@ def _loss_comp_print(
     )
 
 
-@torch.no_grad()
-def predict_mask_from_gt_features(batch: Dict[str, torch.Tensor], cfg: Dict[str, Any], H: int, W: int, dx: float, dy: float):
-    """Multi‑feature refinement support with hysteresis thresholds.
-    Returns: mask_pred (H,W,bool), combined_score (H,W), per_feature_scores dict.
-    """
-    pol = cfg.get("policy", {})
-    p_pow     = float(pol.get("p", 1.0))
-    tau_low   = float(pol.get("tau_low", 0.02))
-    tau_high  = float(pol.get("tau_high", 0.03))
-    combine   = str(pol.get("combine", "l2")).lower()
-    weights   = pol.get("refine_weights", None)
-
-    idxs = _resolve_channel_indices(cfg)
-    #print("idxs for refinement:", idxs)
-
-    gt_dyn_tp1 = batch["dyn_feat_t"].to(torch.float32)
-    parents    = batch["dyn_parents"]
-    prev_mask  = batch["mask_t"]
-
-    coarse_tp1 = coarse_aggregate_from_dynamic(gt_dyn_tp1, parents, H, W)  # (H*W, F)
-
-    names = cfg.get("features", {}).get("dataset_order") or [f"ch{i}" for i in range(coarse_tp1.size(1))]
-    score_list = []
-    per_name_scores = {}
-    for col in idxs:
-        if 0 <= col < coarse_tp1.size(1):
-            s = _coarse_grad_mag(coarse_tp1[:, col], H, W, dx, dy, p=p_pow)
-            score_list.append(s)
-            nm = names[col] if col < len(names) else f"ch{col}"
-            per_name_scores[nm] = s
-    if not score_list:
-        score_list = [_coarse_grad_mag(coarse_tp1[:, 0], H, W, dx, dy, p=p_pow)]
-
-    S = torch.stack(score_list, dim=0)  # (C, K)
-    if weights is not None:
-        w = torch.as_tensor(weights, device=S.device, dtype=S.dtype)
-        if w.numel() != S.size(0):
-            if w.numel() < S.size(0):
-                w = torch.cat([w, w.new_ones(S.size(0)-w.numel())])
-            else:
-                w = w[:S.size(0)]
-    else:
-        w = torch.ones(S.size(0), device=S.device, dtype=S.dtype)
-
-    if combine == "max":
-        s_ref = S.max(dim=0).values
-    elif combine in ("sum", "weighted_sum"):
-        s_ref = (w.view(-1,1) * S).sum(dim=0)
-    else:  # l2 or weighted_l2
-        s_ref = torch.sqrt(((w.view(-1,1) * S)**2).sum(dim=0))
-
-    prev = prev_mask.view(-1).bool()
-    keep = prev & (s_ref > tau_low)
-    newr = (~prev) & (s_ref > tau_high)
-    mask_pred = (keep | newr).view(H, W)
-    return mask_pred, s_ref.view(H, W), per_name_scores
-
-
 # -------------------- Training / Evaluation (mesh‑first) --------------------
 
 def _dt_hat_feature_column(
@@ -1524,8 +1542,559 @@ def _dt_hat_feature_column(
         f"Expected scalar or (N,) / (N,1), got shape={tuple(dt.shape)} with N={n_nodes}."
     )
 
+def _to_scalar_float(v: Any) -> float | None:
+    if v is None:
+        return None
+    if torch.is_tensor(v):
+        if v.numel() != 1:
+            return None
+        return float(v.detach().cpu().item())
+    try:
+        return float(v)
+    except Exception:
+        return None
 
-def _build_X(feat, centers, levels, cfg, dt_hat=None):
+
+def _extract_angle_from_mapping(d: Dict[str, Any]) -> float | None:
+    if not isinstance(d, dict):
+        return None
+    angle_keys = (
+        "ramp_angle_deg",
+        "ramp_angle",
+        "angle_deg",
+        "angle",
+        "theta_deg",
+        "theta",
+    )
+    for k in angle_keys:
+        if k in d:
+            val = _to_scalar_float(d.get(k))
+            if val is not None:
+                return float(val)
+
+    # Nested metadata dicts are common in data payloads.
+    for mk in ("meta", "metadata", "attrs", "info"):
+        mv = d.get(mk, None)
+        if isinstance(mv, dict):
+            val = _extract_angle_from_mapping(mv)
+            if val is not None:
+                return float(val)
+    return None
+
+
+def _extract_angle_from_data_obj(data_obj: Any) -> float | None:
+    """
+    Try to read a ramp-angle-like scalar from a loaded .pt payload.
+    Returns degrees when found.
+    """
+    if isinstance(data_obj, dict):
+        val = _extract_angle_from_mapping(data_obj)
+        if val is not None:
+            return float(val)
+        for k in ("snapshots", "steps", "time_steps", "sequence", "data_list"):
+            if k in data_obj and isinstance(data_obj[k], list) and len(data_obj[k]) > 0:
+                return _extract_angle_from_data_obj(data_obj[k][0])
+        return None
+
+    if isinstance(data_obj, (list, tuple)):
+        if len(data_obj) == 0:
+            return None
+        return _extract_angle_from_data_obj(data_obj[0])
+
+    # PyG Data / custom objects
+    for k in ("ramp_angle_deg", "ramp_angle", "angle_deg", "angle", "theta_deg", "theta"):
+        if hasattr(data_obj, k):
+            val = _to_scalar_float(getattr(data_obj, k))
+            if val is not None:
+                return float(val)
+    if hasattr(data_obj, "meta"):
+        meta = getattr(data_obj, "meta")
+        if isinstance(meta, dict):
+            return _extract_angle_from_mapping(meta)
+    return None
+
+
+def _extract_angle_from_path(path_like: str | None) -> float | None:
+    if not path_like:
+        return None
+    # Parse from filename only (not parent directories).
+    s = os.path.basename(str(path_like))
+    patterns = (
+        r"(?:^|[_\-])ramp[-_]?angle[-_]?(-?\d+(?:\.\d+)?)",
+        r"(?:^|[_\-])angle[-_]?(-?\d+(?:\.\d+)?)",
+    )
+    for pat in patterns:
+        m = re.search(pat, s, flags=re.IGNORECASE)
+        if m is not None:
+            try:
+                return float(m.group(1))
+            except Exception:
+                continue
+    return None
+
+
+def _parse_compact_decimal_token(tok: str | None) -> float | None:
+    if tok is None:
+        return None
+    s = str(tok).strip()
+    if s == "":
+        return None
+    # Support compact decimal style used in folder names: "5p5" -> 5.5
+    if ("p" in s.lower()) and ("." not in s):
+        # Keep a possible leading sign untouched.
+        if s[0] in "+-":
+            s = s[0] + s[1:].replace("p", ".").replace("P", ".")
+        else:
+            s = s.replace("p", ".").replace("P", ".")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _extract_pressure_from_path(path_like: str | None) -> float | None:
+    if not path_like:
+        return None
+    # Parse from filename only (not parent directories), matching user request.
+    s = os.path.basename(str(path_like))
+    patterns = (
+        r"(?:^|[_\-])p[-_]?(-?\d+(?:[pP]\d+|\.\d+)?)",
+        r"(?:^|[_\-])pressure[-_]?(-?\d+(?:[pP]\d+|\.\d+)?)",
+    )
+    for pat in patterns:
+        m = re.search(pat, s, flags=re.IGNORECASE)
+        if m is not None:
+            v = _parse_compact_decimal_token(m.group(1))
+            if v is not None:
+                return float(v)
+    return None
+
+def _load_series_from_h5_path(h5_path: str):
+    """
+    Load a uniform-grid snapshot sequence from an HDF5 file with datasets:
+      - snapshots: [T,H,W,C]
+      - time: [T]
+      - xy: [H,W,2]
+      - channel_names: [C]
+    Returns list[dict] snapshots compatible with CellRefineWindowDataset raw-series path.
+    """
+    if h5py is None:
+        raise RuntimeError(
+            "Input file is HDF5, but h5py is not available in this environment."
+        )
+
+    p = os.path.abspath(os.path.expanduser(str(h5_path)))
+    with h5py.File(p, "r") as f:
+        required = ("snapshots", "time", "xy", "channel_names")
+        missing = [k for k in required if k not in f]
+        if missing:
+            raise RuntimeError(
+                f"HDF5 file '{p}' is missing required datasets: {missing}"
+            )
+
+        d_snap = f["snapshots"]
+        d_time = f["time"]
+        d_xy = f["xy"]
+        d_names = f["channel_names"]
+
+        if d_snap.ndim != 4:
+            raise RuntimeError(
+                f"Expected snapshots to be rank-4 [T,H,W,C], got shape={tuple(d_snap.shape)}"
+            )
+        if d_xy.ndim != 3 or int(d_xy.shape[-1]) < 2:
+            raise RuntimeError(
+                f"Expected xy to be [H,W,2], got shape={tuple(d_xy.shape)}"
+            )
+
+        T, Hf, Wf, C = [int(v) for v in d_snap.shape]
+        if int(d_time.shape[0]) != T:
+            raise RuntimeError(
+                f"time length ({int(d_time.shape[0])}) does not match snapshots T ({T})"
+            )
+        if int(d_xy.shape[0]) != Hf or int(d_xy.shape[1]) != Wf:
+            raise RuntimeError(
+                "xy shape does not match snapshots spatial shape: "
+                f"xy={tuple(d_xy.shape)} vs snapshots[H,W]=({Hf},{Wf})"
+            )
+        if int(d_names.shape[0]) != C:
+            raise RuntimeError(
+                f"channel_names length ({int(d_names.shape[0])}) does not match snapshots C ({C})"
+            )
+        if T < 2:
+            raise RuntimeError(f"Need at least 2 snapshots in '{p}', got {T}.")
+
+        channel_names: List[str] = []
+        for raw in d_names[()]:
+            if isinstance(raw, (bytes, np.bytes_)):
+                channel_names.append(raw.decode("utf-8"))
+            else:
+                channel_names.append(str(raw))
+
+        xy_np = np.asarray(d_xy[..., :2], dtype=np.float32)
+        pos_shared = torch.from_numpy(xy_np.reshape(-1, 2))
+        row_idx, col_idx = np.indices((Hf, Wf), dtype=np.int64)
+        ij_shared = torch.from_numpy(
+            np.stack([row_idx, col_idx], axis=-1).reshape(-1, 2)
+        )
+        times_np = np.asarray(d_time[()], dtype=np.float64).reshape(-1)
+
+        seq: List[Dict[str, Any]] = []
+        for t in range(T):
+            snap_np = np.asarray(d_snap[t], dtype=np.float32).reshape(-1, C)
+            x_t = torch.from_numpy(snap_np)
+            snap: Dict[str, Any] = {
+                "x": x_t,
+                "pos": pos_shared,
+                "ij": ij_shared,
+                "time": float(times_np[t]),
+                "channel_names": channel_names,
+                "H": int(Hf),
+                "W": int(Wf),
+            }
+            seq.append(snap)
+
+    return p, seq
+
+
+def _load_series_from_pt_path(pt_path: str):
+    """
+    Load a snapshot sequence from:
+      - .pt/.pth
+      - .zip containing .pt/.pth
+      - .h5/.hdf5 (uniform grid snapshots)
+    """
+    p = os.path.abspath(os.path.expanduser(str(pt_path)))
+    if not os.path.exists(p):
+        raise FileNotFoundError(f"Input data path not found: {p}")
+
+    if p.lower().endswith((".h5", ".hdf5")):
+        return _load_series_from_h5_path(p)
+
+    if p.endswith(".zip"):
+        with zipfile.ZipFile(p, "r") as zf:
+            member = next(m for m in zf.namelist() if m.endswith(".pt") or m.endswith(".pth"))
+            with zf.open(member, "r") as fh:
+                buf = io.BytesIO(fh.read())
+        obj = torch.load(buf, weights_only=False)
+    else:
+        obj = torch.load(p, weights_only=False)
+
+    if not isinstance(obj, list):
+        raise RuntimeError(
+            f"Expected loaded data at '{p}' to be a list of snapshots; got {type(obj)}."
+        )
+    if len(obj) < 2:
+        raise RuntimeError(f"Need at least 2 snapshots in '{p}', got {len(obj)}.")
+    return p, obj
+
+
+def _resolve_pt_path_list(cfg: Dict[str, Any]) -> List[str]:
+    data_cfg = cfg.get("data", {}) or {}
+    raw_multi = data_cfg.get("pt_paths", None)
+    raw_single = data_cfg.get("pt_path", None)
+
+    paths_raw: List[Any]
+    if isinstance(raw_multi, (list, tuple)) and len(raw_multi) > 0:
+        paths_raw = list(raw_multi)
+    elif isinstance(raw_single, (list, tuple)) and len(raw_single) > 0:
+        paths_raw = list(raw_single)
+    elif raw_single is not None:
+        paths_raw = [raw_single]
+    else:
+        raise RuntimeError("cfg['data']['pt_path'] (or data.pt_paths) must be provided.")
+
+    out: List[str] = []
+    for pr in paths_raw:
+        if pr is None:
+            continue
+        p = os.path.abspath(os.path.expanduser(str(pr)))
+        out.append(p)
+    if len(out) == 0:
+        raise RuntimeError("No valid entries found in data.pt_path / data.pt_paths.")
+    return out
+
+
+def _resolve_mesh_spec_path_for_input(
+    mesh_spec_root_or_file: str | None,
+    *,
+    input_pt_path: str,
+) -> str | None:
+    """
+    Resolve angle-specific mesh spec:
+      - if mesh path points to a file -> return that file
+      - if mesh path points to a directory -> choose .pt file whose filename angle
+        matches the input filename angle
+    """
+    if mesh_spec_root_or_file is None:
+        return None
+
+    root = os.path.abspath(os.path.expanduser(str(mesh_spec_root_or_file)))
+    if os.path.isfile(root):
+        return root
+    if not os.path.isdir(root):
+        raise FileNotFoundError(
+            f"mesh.starting_mesh_path must be an existing file or directory, got: {root}"
+        )
+
+    spec_files = sorted(
+        os.path.join(root, fn)
+        for fn in os.listdir(root)
+        if fn.lower().endswith((".pt", ".pth"))
+    )
+    if len(spec_files) == 0:
+        raise RuntimeError(f"No .pt/.pth wedge mesh spec files found in directory: {root}")
+    if len(spec_files) == 1:
+        return spec_files[0]
+
+    src_angle = _extract_angle_from_path(input_pt_path)
+    if src_angle is None:
+        raise RuntimeError(
+            "Could not infer input ramp angle from input filename for mesh-spec directory matching: "
+            f"{os.path.basename(str(input_pt_path))}. "
+            "Use filenames containing 'angle-XX' / 'angle_XX', or set mesh.starting_mesh_path to a file."
+        )
+
+    tol = 1e-6
+    exact = []
+    for sp in spec_files:
+        a = _extract_angle_from_path(sp)
+        if (a is not None) and (abs(float(a) - float(src_angle)) <= tol):
+            exact.append(sp)
+
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        raise RuntimeError(
+            "Ambiguous wedge mesh spec match in directory "
+            f"{root} for input angle={src_angle:g}: {exact}"
+        )
+
+    available = sorted(
+        {
+            float(a)
+            for a in (_extract_angle_from_path(sp) for sp in spec_files)
+            if a is not None
+        }
+    )
+    raise RuntimeError(
+        f"No wedge mesh spec filename in '{root}' matches input angle={src_angle:g} "
+        f"(from {os.path.basename(str(input_pt_path))}). "
+        f"Available spec angles: {available if len(available) > 0 else 'none'}."
+    )
+
+
+def _extract_xy_from_snapshot_like(snapshot: Any) -> torch.Tensor | None:
+    """
+    Return centers (N,2) from a snapshot-like object when available.
+    """
+    keys = ("pos", "xy", "centers", "pos_phys")
+    if isinstance(snapshot, dict):
+        for k in keys:
+            if k in snapshot:
+                v = snapshot.get(k)
+                t = torch.as_tensor(v) if v is not None else None
+                if torch.is_tensor(t) and t.ndim == 2 and t.size(1) >= 2 and t.numel() > 0:
+                    return t[:, :2].to(torch.float32)
+        return None
+
+    for k in keys:
+        if hasattr(snapshot, k):
+            v = getattr(snapshot, k)
+            t = torch.as_tensor(v) if v is not None else None
+            if torch.is_tensor(t) and t.ndim == 2 and t.size(1) >= 2 and t.numel() > 0:
+                return t[:, :2].to(torch.float32)
+    return None
+
+
+def _fit_ramp_line_from_centers(
+    centers_xy: torch.Tensor,
+    *,
+    low_y_quantile: float = 0.12,
+    min_points: int = 32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fit a line from near-bottom boundary points:
+      - point p0 on line (2,)
+      - unit normal n (2,), oriented so median signed distance over all points is positive
+    """
+    if (not torch.is_tensor(centers_xy)) or centers_xy.ndim != 2 or centers_xy.size(1) < 2:
+        raise RuntimeError(
+            f"Cannot fit ramp line: expected centers (N,2), got "
+            f"{None if not torch.is_tensor(centers_xy) else tuple(centers_xy.shape)}."
+        )
+    pts = centers_xy[:, :2].detach().to(device="cpu", dtype=torch.float64)
+    n_all = int(pts.size(0))
+    if n_all < 4:
+        raise RuntimeError(f"Cannot fit ramp line: need >=4 centers, got {n_all}.")
+
+    q = float(low_y_quantile)
+    q = min(max(q, 0.01), 0.49)
+    y = pts[:, 1]
+    y_thr = torch.quantile(y, q)
+    sel = (y <= y_thr)
+    if int(sel.sum().item()) < int(max(4, min_points)):
+        k = int(min(max(4, min_points), n_all))
+        idx = torch.argsort(y)[:k]
+        fit_pts = pts.index_select(0, idx)
+    else:
+        fit_pts = pts[sel]
+
+    p0 = fit_pts.mean(dim=0)  # (2,)
+    centered = fit_pts - p0
+    # principal direction
+    _, _, vh = torch.linalg.svd(centered, full_matrices=False)
+    tang = vh[0]
+    tang = tang / tang.norm().clamp_min(1e-12)
+    n = torch.stack([-tang[1], tang[0]], dim=0)
+    n = n / n.norm().clamp_min(1e-12)
+
+    # orient sign so bulk of cells lie on positive side
+    signed_all = (pts - p0.view(1, 2)) @ n.view(2, 1)
+    med = torch.median(signed_all.view(-1))
+    if float(med.item()) < 0.0:
+        n = -n
+
+    return p0.to(torch.float32), n.to(torch.float32)
+
+
+def _build_ramp_feature_context(
+    cfg: Dict[str, Any],
+    *,
+    data_obj: Any,
+    pt_path: str | None,
+    mesh_spec_path: str | None,
+) -> Dict[str, Any]:
+    build_cfg = cfg.get("features", {}).get("build", {}) or {}
+    include_ramp_angle = bool(build_cfg.get("include_ramp_angle", False))
+    include_signed_dist = bool(build_cfg.get("include_signed_distance_to_ramp", False))
+
+    ctx: Dict[str, Any] = {
+        "include_ramp_angle": include_ramp_angle,
+        "include_signed_distance_to_ramp": include_signed_dist,
+    }
+    if not (include_ramp_angle or include_signed_dist):
+        return ctx
+
+    # 1) angle (degrees): explicit config -> data payload -> file path -> mesh path
+    angle_deg = _to_scalar_float(
+        build_cfg.get("ramp_angle_deg", build_cfg.get("ramp_angle_degrees", None))
+    )
+    if angle_deg is None:
+        angle_deg = _extract_angle_from_data_obj(data_obj)
+    if angle_deg is None:
+        angle_deg = _extract_angle_from_path(pt_path)
+    if angle_deg is None:
+        angle_deg = _extract_angle_from_path(mesh_spec_path)
+    if angle_deg is not None:
+        angle_deg = float(angle_deg)
+        ctx["angle_deg"] = angle_deg
+
+    # 2) signed-distance line fit from centers in first snapshot
+    if include_signed_dist:
+        first_snapshot = None
+        if isinstance(data_obj, list) and len(data_obj) > 0:
+            first_snapshot = data_obj[0]
+        elif isinstance(data_obj, dict):
+            for k in ("snapshots", "steps", "time_steps", "sequence", "data_list"):
+                vv = data_obj.get(k, None)
+                if isinstance(vv, list) and len(vv) > 0:
+                    first_snapshot = vv[0]
+                    break
+            if first_snapshot is None:
+                first_snapshot = data_obj
+        else:
+            first_snapshot = data_obj
+
+        xy0 = _extract_xy_from_snapshot_like(first_snapshot)
+        if xy0 is None:
+            raise RuntimeError(
+                "features.build.include_signed_distance_to_ramp=true but could not find centers "
+                "(pos/xy/centers) in loaded data to fit ramp line."
+            )
+
+        q = float(build_cfg.get("signed_distance_low_y_quantile", 0.12))
+        mpts = int(build_cfg.get("signed_distance_min_points", 32))
+        p0, n = _fit_ramp_line_from_centers(
+            xy0,
+            low_y_quantile=q,
+            min_points=mpts,
+        )
+        ctx["distance_point"] = p0
+        ctx["distance_normal"] = n
+
+        # Optional scaling for O(1) feature values
+        normalize_dist = bool(build_cfg.get("signed_distance_normalize", True))
+        dist_scale = 1.0
+        if normalize_dist:
+            bbox = cfg.get("data", {}).get("bbox", None)
+            if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                x0, x1, y0, y1 = map(float, bbox)
+                dist_scale = float(np.hypot(x1 - x0, y1 - y0))
+            else:
+                xy_cpu = xy0.detach().to(torch.float64).cpu()
+                x0 = float(xy_cpu[:, 0].min().item()); x1 = float(xy_cpu[:, 0].max().item())
+                y0 = float(xy_cpu[:, 1].min().item()); y1 = float(xy_cpu[:, 1].max().item())
+                dist_scale = float(np.hypot(x1 - x0, y1 - y0))
+            if dist_scale <= 0.0:
+                dist_scale = 1.0
+        ctx["distance_scale"] = float(dist_scale)
+
+    # 3) ramp-angle feature value
+    if include_ramp_angle:
+        units = str(build_cfg.get("ramp_angle_units", "radians")).strip().lower()
+        if units not in ("degrees", "degree", "deg", "radians", "radian", "rad"):
+            raise ValueError(
+                "features.build.ramp_angle_units must be one of "
+                "{radians, degrees} (aliases allowed)."
+            )
+        if angle_deg is None:
+            raise RuntimeError(
+                "features.build.include_ramp_angle=true but no ramp angle could be inferred. "
+                "Set features.build.ramp_angle_deg explicitly or ensure the data/paths include angle metadata."
+            )
+        angle_feature = float(angle_deg)
+        if units in ("radians", "radian", "rad"):
+            angle_feature = float(np.deg2rad(angle_feature))
+        ctx["angle_feature_value"] = float(angle_feature)
+        ctx["angle_units"] = "radians" if units in ("radians", "radian", "rad") else "degrees"
+
+    return ctx
+
+
+def _ramp_feature_source_id_for_t(
+    ramp_feature_ctx: Dict[str, Any] | None,
+    step_t_abs: int | None,
+) -> int | None:
+    if ramp_feature_ctx is None or step_t_abs is None:
+        return None
+    src_by_t = ramp_feature_ctx.get("source_id_by_t", None)
+    if src_by_t is None:
+        return None
+    try:
+        ti = int(step_t_abs)
+        if isinstance(src_by_t, (list, tuple)):
+            if 0 <= ti < len(src_by_t):
+                return int(src_by_t[ti])
+            return None
+        if isinstance(src_by_t, dict):
+            if ti in src_by_t:
+                return int(src_by_t[ti])
+            ks = str(ti)
+            return int(src_by_t[ks]) if ks in src_by_t else None
+    except Exception:
+        return None
+    return None
+
+
+def _build_X(
+    feat,
+    centers,
+    levels,
+    cfg,
+    dt_hat=None,
+    ramp_feature_ctx: Dict[str, Any] | None = None,
+    step_t_abs: int | None = None,
+):
     """
     Build node features for FeatureNet:
       [ physics_feat ] (+ [x,y] if use_pos) (+ [level] if use_level)
@@ -1539,6 +2108,8 @@ def _build_X(feat, centers, levels, cfg, dt_hat=None):
     use_pos   = build_cfg.get("use_pos", True)
     use_level = build_cfg.get("use_level", True)
     use_dt_hat_fixed = bool(build_cfg.get("use_dt_hat_fixed", False))
+    include_ramp_angle = bool(build_cfg.get("include_ramp_angle", False))
+    include_signed_dist = bool(build_cfg.get("include_signed_distance_to_ramp", False))
 
     dev = feat.device
     Xs = [feat]  # already on dev
@@ -1565,6 +2136,72 @@ def _build_X(feat, centers, levels, cfg, dt_hat=None):
                 dtype=feat.dtype,
             )
         )
+
+    if include_ramp_angle:
+        if ramp_feature_ctx is None:
+            raise RuntimeError(
+                "features.build.include_ramp_angle=true but ramp_feature_ctx was not provided."
+            )
+        aval = None
+        sid = _ramp_feature_source_id_for_t(ramp_feature_ctx, step_t_abs)
+        by_source = ramp_feature_ctx.get("angle_feature_by_source", None)
+        if (sid is not None) and isinstance(by_source, dict):
+            aval = by_source.get(int(sid), None)
+            if aval is None:
+                aval = by_source.get(str(int(sid)), None)
+        if aval is None:
+            by_t = ramp_feature_ctx.get("angle_feature_by_t", None)
+            if isinstance(by_t, (list, tuple)) and (step_t_abs is not None):
+                ti = int(step_t_abs)
+                if 0 <= ti < len(by_t):
+                    aval = by_t[ti]
+            elif isinstance(by_t, dict) and (step_t_abs is not None):
+                ti = int(step_t_abs)
+                aval = by_t.get(ti, by_t.get(str(ti), None))
+        if aval is None:
+            aval = ramp_feature_ctx.get("angle_feature_value", None)
+        if aval is None:
+            raise RuntimeError(
+                "features.build.include_ramp_angle=true but angle_feature_value is missing. "
+                "Set features.build.ramp_angle_deg or provide angle metadata in data/path."
+            )
+        a = torch.tensor(float(aval), device=dev, dtype=feat.dtype).view(1, 1)
+        Xs.append(a.expand(int(feat.size(0)), 1))
+
+    if include_signed_dist:
+        if centers is None or (not torch.is_tensor(centers)) or centers.ndim != 2 or centers.size(1) < 2:
+            raise RuntimeError(
+                "features.build.include_signed_distance_to_ramp=true requires centers tensor with shape (N,2)."
+            )
+        if ramp_feature_ctx is None:
+            ramp_feature_ctx = {}
+        p0 = ramp_feature_ctx.get("distance_point", None)
+        n = ramp_feature_ctx.get("distance_normal", None)
+        dscale = float(ramp_feature_ctx.get("distance_scale", 1.0))
+        sid = _ramp_feature_source_id_for_t(ramp_feature_ctx, step_t_abs)
+        by_source = ramp_feature_ctx.get("distance_by_source", None)
+        if (sid is not None) and isinstance(by_source, dict):
+            src_pack = by_source.get(int(sid), by_source.get(str(int(sid)), None))
+            if isinstance(src_pack, dict):
+                p0 = src_pack.get("point", p0)
+                n = src_pack.get("normal", n)
+                dscale = float(src_pack.get("scale", dscale))
+        if (p0 is None) or (n is None):
+            # Last-resort fallback: fit from this step's centers.
+            p0, n = _fit_ramp_line_from_centers(
+                centers.detach().to(device="cpu", dtype=torch.float32),
+                low_y_quantile=float(build_cfg.get("signed_distance_low_y_quantile", 0.12)),
+                min_points=int(build_cfg.get("signed_distance_min_points", 32)),
+            )
+        p0_t = torch.as_tensor(p0, dtype=feat.dtype, device=dev).view(1, 2)
+        n_t = torch.as_tensor(n, dtype=feat.dtype, device=dev).view(2, 1)
+        signed = (centers[:, :2].to(device=dev, dtype=feat.dtype) - p0_t) @ n_t
+        signed = signed.view(-1, 1)
+        if dscale <= 0.0:
+            dscale = 1.0
+        if bool(build_cfg.get("signed_distance_normalize", True)):
+            signed = signed / float(dscale)
+        Xs.append(signed)
 
     return torch.cat(Xs, dim=-1)
 
@@ -1612,27 +2249,6 @@ def _forward_main_head_with_edge_attr(model, x_in, edge_index, edge_attr=None, *
       - If model ignores edge_attr, it still works.
       - If force_fp32=True, we run THIS forward in fp32 (autocast disabled) to avoid fp16 NaNs.
     """
-    if edge_attr is not None and not hasattr(_forward_main_head_with_edge_attr, "_printed"):
-        _forward_main_head_with_edge_attr._printed = True
-        print("[DEC-CHK] Forward called with edge_attr present.", flush=True)
-
-    hang_dbg_once = not hasattr(_forward_main_head_with_edge_attr, "_hang_dbg_once")
-    if hang_dbg_once:
-        try:
-            ei_shape = tuple(edge_index.shape) if torch.is_tensor(edge_index) else None
-        except Exception:
-            ei_shape = None
-        try:
-            ea_shape = tuple(edge_attr.shape) if torch.is_tensor(edge_attr) else None
-        except Exception:
-            ea_shape = None
-        print(
-            f"[HANG-DBG] entering _forward_main_head_with_edge_attr: "
-            f"x_in={tuple(x_in.shape)} dtype={x_in.dtype} dev={x_in.device} "
-            f"edge_index={ei_shape} edge_attr={ea_shape} force_fp32={bool(force_fp32)}",
-            flush=True,
-        )
-
     # --- choose autocast-off context safely ---
     if force_fp32:
         if x_in.is_cuda:
@@ -1649,10 +2265,6 @@ def _forward_main_head_with_edge_attr(model, x_in, edge_index, edge_attr=None, *
         X = x_in.float() if force_fp32 else x_in
         EA = (edge_attr.float() if (force_fp32 and edge_attr is not None) else edge_attr)
 
-        t_fwd0 = time.perf_counter() if hang_dbg_once else None
-        if hang_dbg_once:
-            print("[HANG-DBG] calling model forward...", flush=True)
-
         if EA is None:
             y = _forward_main_head(model, X, edge_index)
         else:
@@ -1661,14 +2273,7 @@ def _forward_main_head_with_edge_attr(model, x_in, edge_index, edge_attr=None, *
                 y = _forward_main_head(model, X, edge_index, edge_attr=EA)
             except TypeError:
                 # model doesn’t accept edge_attr yet
-                if hang_dbg_once:
-                    print("[HANG-DBG] model forward rejected edge_attr; retrying without edge_attr.", flush=True)
                 y = _forward_main_head(model, X, edge_index)
-
-        if hang_dbg_once:
-            dt_fwd = time.perf_counter() - t_fwd0
-            print(f"[HANG-DBG] model forward returned in {dt_fwd:.3f}s", flush=True)
-            _forward_main_head_with_edge_attr._hang_dbg_once = True
 
     # If you want to keep downstream memory low / match dtype expectations, cast back.
     # (Optionally clamp before casting if you ever see fp16 overflow.)
@@ -3162,56 +3767,6 @@ def _diagnostics_csv_fields(diag_cfg: Dict[str, Dict[str, Any]]) -> List[str]:
     return fields
 
 
-def _format_diag_float(v: float) -> str:
-    return f"{float(v):.3e}" if np.isfinite(v) else str(float(v))
-
-
-def _format_split_diagnostic_summary(
-    split: str,
-    stats: Dict[str, Any] | None,
-    diag_cfg: Dict[str, Dict[str, Any]],
-) -> str | None:
-    if stats is None:
-        return None
-
-    parts: List[str] = []
-    if diag_cfg["entropy"]["enabled"]:
-        s_pred = float(stats.get("entropy_pred_specific_mean", float("nan")))
-        s_gt = float(stats.get("entropy_gt_specific_mean", float("nan")))
-        s_gap = float(stats.get("entropy_specific_mean_gap", float("nan")))
-        parts.append(
-            f"Sent(mean)={_format_diag_float(s_pred)}/{_format_diag_float(s_gt)} (d={_format_diag_float(s_gap)})"
-        )
-
-    if diag_cfg["admissibility"]["enabled"]:
-        admiss_parts: List[str] = []
-        for prefix in _admissibility_prefixes(diag_cfg["admissibility"]):
-            rho_v = float(stats.get(f"{prefix}_rho_violation_frac", float("nan")))
-            eint_v = float(stats.get(f"{prefix}_eint_violation_frac", float("nan")))
-            p_v = float(stats.get(f"{prefix}_p_violation_frac", float("nan")))
-            label = "pre" if prefix.endswith("pre") else "post"
-            admiss_parts.append(
-                f"{label} rho/e/p={_format_diag_float(rho_v)}/{_format_diag_float(eint_v)}/{_format_diag_float(p_v)}"
-            )
-        if admiss_parts:
-            parts.append("Adm(" + "; ".join(admiss_parts) + ")")
-
-    if diag_cfg["shock_masked_entropy"]["enabled"]:
-        shock_mae = float(stats.get("shock_entropy_specific_mae", float("nan")))
-        shock_bias = float(stats.get("shock_entropy_specific_bias", float("nan")))
-        shock_area = float(stats.get("shock_entropy_mask_area_frac", float("nan")))
-        parts.append(
-            "ShockS("
-            f"mae={_format_diag_float(shock_mae)}, "
-            f"bias={_format_diag_float(shock_bias)}, "
-            f"area={_format_diag_float(shock_area)})"
-        )
-
-    if not parts:
-        return None
-    return f"[DIAG] {split}: " + " | ".join(parts)
-
-
 def _cell_level_ij_from_centers(
     *,
     centers: torch.Tensor,
@@ -3308,47 +3863,6 @@ def _runtime_multires_lookup_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     out.setdefault("fallback_to_idw", True)
     out.setdefault("max_cached_feature_steps", 16)
     return out
-
-
-def _resolve_runtime_multires_level_files(multires_cfg: Dict[str, Any]) -> Dict[int, str]:
-    level_files: Dict[int, str] = {}
-
-    raw_map = multires_cfg.get("level_files", {}) or {}
-    if raw_map and (not isinstance(raw_map, dict)):
-        raise ValueError("train.runtime_mesh.multires_gt_lookup.level_files must be a JSON object.")
-    for k, v in raw_map.items():
-        if v is None:
-            continue
-        p = str(v).strip()
-        if p == "":
-            continue
-        lvl = int(k)
-        level_files[lvl] = os.path.abspath(os.path.expanduser(p))
-
-    dir_raw = str(multires_cfg.get("directory", "") or "").strip()
-    if dir_raw != "":
-        dir_abs = os.path.abspath(os.path.expanduser(dir_raw))
-        if not os.path.isdir(dir_abs):
-            raise FileNotFoundError(
-                "train.runtime_mesh.multires_gt_lookup.directory does not exist: "
-                f"{dir_abs}"
-            )
-        patt = re.compile(r"_L(\d+)_uniform_refine\.h5$")
-        for fn in sorted(os.listdir(dir_abs)):
-            m = patt.search(fn)
-            if m is None:
-                continue
-            lvl = int(m.group(1))
-            level_files.setdefault(lvl, os.path.join(dir_abs, fn))
-
-    for lvl, path in sorted(level_files.items()):
-        if not os.path.exists(path):
-            raise FileNotFoundError(
-                "Multi-resolution lookup file for level "
-                f"{lvl} was not found: {path}"
-            )
-
-    return dict(sorted(level_files.items()))
 
 
 class _RuntimeMultiResGtLookup:
@@ -3890,97 +4404,6 @@ def _runtime_lookup_mask_values_by_level(
     return out
 
 
-def _runtime_wedge_constraints_cache_key(
-    *,
-    wedge_path,
-    cfg: Dict[str, Any],
-    H: int,
-    W: int,
-    device: torch.device,
-) -> str:
-    verts = np.asarray(wedge_path.vertices, dtype=np.float64)
-    vhash = hashlib.sha1(verts.tobytes()).hexdigest()[:20]
-    bbox = _get_bbox(cfg)
-    xmin, xmax, ymin, ymax = [float(v) for v in bbox]
-    rr = _get_refine_ratio(cfg)
-    Lmax = int((cfg.get("policy", {}) or {}).get("max_level", 3))
-    dev = torch.device(device)
-    dkey = f"{dev.type}:{dev.index if dev.index is not None else -1}"
-    return (
-        f"v={vhash}|H={int(H)}|W={int(W)}|Lmax={int(Lmax)}|rr={int(rr)}|"
-        f"bbox={xmin:.16g},{xmax:.16g},{ymin:.16g},{ymax:.16g}|dev={dkey}"
-    )
-
-
-def _get_runtime_wedge_constraints(
-    *,
-    cfg: Dict[str, Any],
-    H: int,
-    W: int,
-    device: torch.device,
-    wedge_path,
-) -> Dict[str, Any]:
-    key = _runtime_wedge_constraints_cache_key(
-        wedge_path=wedge_path,
-        cfg=cfg,
-        H=H,
-        W=W,
-        device=device,
-    )
-    got = _RUNTIME_WEDGE_CONSTRAINTS_CACHE.get(key, None)
-    if got is not None:
-        return got
-
-    pol = cfg.get("policy", {}) or {}
-    Lmax = int(pol.get("max_level", 3))
-    rr = _get_refine_ratio(cfg)
-    bbox = _get_bbox(cfg)
-    xspan = float(bbox[1] - bbox[0])
-    yspan = float(bbox[3] - bbox[2])
-    radius = float(pol.get("wedge_clip_radius", 1e-9 * max(xspan, yspan)))
-    dev = torch.device(device)
-
-    lookup = _get_wedge_clip_level_lookup(
-        wedge_path=wedge_path,
-        H=H,
-        W=W,
-        Lmax=Lmax,
-        refine_ratio=rr,
-        bbox=bbox,
-        radius=radius,
-    )
-    full_by_level, intersect_by_level = _lookup_level_masks_on_device(lookup, dev)
-
-    leaf_full: Dict[int, torch.Tensor] = {}
-    parent_intersect: Dict[int, torch.Tensor] = {}
-    parent_boundary: Dict[int, torch.Tensor] = {}
-
-    for l in range(0, Lmax + 1):
-        leaf_full[l] = full_by_level[l].to(device=dev, dtype=torch.bool)
-    for L in range(1, Lmax + 1):
-        l = L - 1
-        inter = intersect_by_level[l].to(device=dev, dtype=torch.bool)
-        full = full_by_level[l].to(device=dev, dtype=torch.bool)
-        parent_intersect[L] = inter
-        # Cells that intersect but are not fully inside are always refined.
-        parent_boundary[L] = inter & (~full)
-
-    out = {
-        "max_level": int(Lmax),
-        "refine_ratio": int(rr),
-        "bbox": tuple(float(v) for v in bbox),
-        "leaf_full": leaf_full,
-        "parent_intersect": parent_intersect,
-        "parent_boundary": parent_boundary,
-    }
-    _RUNTIME_WEDGE_CONSTRAINTS_CACHE[key] = out
-    print(
-        f"[RUNTIME-WEDGE] built static constraints (H={int(H)} W={int(W)} Lmax={int(Lmax)} rr={int(rr)})",
-        flush=True,
-    )
-    return out
-
-
 def _runtime_apply_wedge_constraints_to_masks(
     *,
     masks_by_level: Dict[int, torch.Tensor],
@@ -4094,28 +4517,6 @@ def _runtime_filter_mesh_with_wedge_constraints(
     return pred_centers, pred_levels, parent_flat, pred_ei, mask_pred_parent
 
 
-def _runtime_base_mesh_cache_key(
-    *,
-    mesh_spec_path: str,
-    cfg: Dict[str, Any],
-    H: int,
-    W: int,
-    device: torch.device,
-) -> str:
-    st = os.stat(mesh_spec_path)
-    bbox = _get_bbox(cfg)
-    xmin, xmax, ymin, ymax = [float(v) for v in bbox]
-    rr = _get_refine_ratio(cfg)
-    Lmax = int((cfg.get("policy", {}) or {}).get("max_level", 3))
-    dev = torch.device(device)
-    dkey = f"{dev.type}:{dev.index if dev.index is not None else -1}"
-    return (
-        f"path={os.path.abspath(mesh_spec_path)}|mtime_ns={int(st.st_mtime_ns)}|size={int(st.st_size)}|"
-        f"H={int(H)}|W={int(W)}|Lmax={int(Lmax)}|rr={int(rr)}|"
-        f"bbox={xmin:.16g},{xmax:.16g},{ymin:.16g},{ymax:.16g}|dev={dkey}"
-    )
-
-
 def _runtime_centers_from_level_ij(
     *,
     levels: torch.Tensor,
@@ -4164,40 +4565,6 @@ def _runtime_parents_from_level_ij(
     i0 = torch.div(col.view(-1).long(), scale, rounding_mode="floor")
     j0 = torch.div(row.view(-1).long(), scale, rounding_mode="floor")
     return (j0 * int(W) + i0).to(torch.long)
-
-
-def _runtime_base_refine_masks_from_leaf_set(
-    *,
-    levels: torch.Tensor,
-    row: torch.Tensor,
-    col: torch.Tensor,
-    H: int,
-    W: int,
-    refine_ratio: int,
-    L_max: int,
-) -> Dict[int, torch.Tensor]:
-    rr = int(refine_ratio)
-    lv = levels.view(-1).long()
-    rv = row.view(-1).long()
-    cv = col.view(-1).long()
-    out: Dict[int, torch.Tensor] = {}
-
-    for L in range(1, int(L_max) + 1):
-        hL = int(H) * (rr ** (L - 1))
-        wL = int(W) * (rr ** (L - 1))
-        m = torch.zeros((hL, wL), dtype=torch.bool, device=lv.device)
-        sel = (lv >= int(L))
-        if bool(sel.any()):
-            scale_pow = lv[sel] - int(L - 1)
-            scale = torch.pow(
-                torch.tensor(int(rr), dtype=torch.long, device=lv.device),
-                scale_pow,
-            )
-            pr = torch.div(rv[sel], scale, rounding_mode="floor").clamp_(0, hL - 1)
-            pc = torch.div(cv[sel], scale, rounding_mode="floor").clamp_(0, wL - 1)
-            m[pr, pc] = True
-        out[L] = m.to(torch.bool)
-    return out
 
 
 def _runtime_sort_unique_leaf_ij(
@@ -4367,102 +4734,6 @@ def _runtime_build_edges_from_mesh(
     if pred_ei.numel() == 0 or int(pred_ei.shape[1]) == 0:
         raise RuntimeError("Empty edge_index for runtime mesh.")
     return pred_ei
-
-
-def _get_runtime_starting_mesh_base(
-    *,
-    cfg: Dict[str, Any],
-    H: int,
-    W: int,
-    dx: float,
-    dy: float,
-    device: torch.device,
-    mesh_spec_path: str,
-) -> Dict[str, Any]:
-    key = _runtime_base_mesh_cache_key(
-        mesh_spec_path=mesh_spec_path,
-        cfg=cfg,
-        H=H,
-        W=W,
-        device=device,
-    )
-    got = _RUNTIME_BASE_MESH_CACHE.get(key, None)
-    if got is not None:
-        return got
-
-    dev = torch.device(device)
-    rr = _get_refine_ratio(cfg)
-    Lmax = int((cfg.get("policy", {}) or {}).get("max_level", 3))
-    bbox = _get_bbox(cfg)
-
-    centers, levels, _parents, _ei, _mask_parent = _build_starting_mesh_from_spec(
-        mesh_spec_path,
-        cfg,
-        H,
-        W,
-        float(dx),
-        float(dy),
-        device=dev,
-    )
-    centers = centers.to(device=dev, dtype=torch.float32)
-    levels = levels.to(device=dev, dtype=torch.long).view(-1)
-
-    row, col = _cell_level_ij_from_centers(
-        centers=centers,
-        levels=levels,
-        H=H,
-        W=W,
-        bbox=bbox,
-        refine_ratio=rr,
-    )
-    levels, row, col = _runtime_sort_unique_leaf_ij(
-        levels=levels,
-        row=row,
-        col=col,
-        H=H,
-        W=W,
-        refine_ratio=rr,
-    )
-    parents = _runtime_parents_from_level_ij(
-        levels=levels,
-        row=row,
-        col=col,
-        H=H,
-        W=W,
-        refine_ratio=rr,
-    )
-    mask_parent = _mask_from_parent_indices(parents, H, W, dev)
-    base_refine_by_level = _runtime_base_refine_masks_from_leaf_set(
-        levels=levels,
-        row=row,
-        col=col,
-        H=H,
-        W=W,
-        refine_ratio=rr,
-        L_max=Lmax,
-    )
-
-    out = {
-        "levels": levels,
-        "row": row,
-        "col": col,
-        "parents": parents,
-        "parent_mask": mask_parent,
-        "base_refine_by_level": {int(k): v.to(device=dev, dtype=torch.bool) for k, v in base_refine_by_level.items()},
-    }
-    _RUNTIME_BASE_MESH_CACHE[key] = out
-
-    lv_cpu = levels.detach().cpu()
-    if lv_cpu.numel() > 0:
-        uniq, cnt = torch.unique(lv_cpu, return_counts=True)
-        lv_summary = ", ".join([f"L{int(u)}={int(c)}" for u, c in zip(uniq.tolist(), cnt.tolist())])
-    else:
-        lv_summary = "empty"
-    print(
-        f"[RUNTIME-BASE-MESH] loaded from spec: cells={int(levels.numel())} ({lv_summary})",
-        flush=True,
-    )
-    return out
 
 
 def _runtime_build_mesh_from_starting_leaf_base(
@@ -4743,340 +5014,6 @@ def _runtime_mesh_domain_mode(cfg: Dict[str, Any]) -> str:
             f"train.runtime_mesh.domain_mode must be 'wedge_lookup' or 'starting_mesh', got '{raw}'"
         )
     return raw
-
-
-def _runtime_mesh_cnn_thresholds(
-    cfg: Dict[str, Any],
-    *,
-    ckpt: Dict[str, Any] | None = None,
-    cfg_Lmax: int | None = None,
-    ckpt_path: str | None = None,
-) -> tuple[float, Dict[int, float], str]:
-    rt_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
-    cnn_cfg = rt_cfg.get("cnn", {}) or {}
-    use_saved = bool(cnn_cfg.get("use_saved_thresholds", False))
-
-    if not use_saved:
-        thr_default = float(cnn_cfg.get("threshold_default", 0.5))
-        raw_map = cnn_cfg.get("threshold_by_level", {}) or {}
-        if not isinstance(raw_map, dict):
-            raise ValueError("train.runtime_mesh.cnn.threshold_by_level must be a JSON object.")
-        thr_by_level: Dict[int, float] = {}
-        for k, v in raw_map.items():
-            try:
-                L = int(k)
-            except Exception as e:
-                raise ValueError(
-                    f"Invalid level key in train.runtime_mesh.cnn.threshold_by_level: {k!r}"
-                ) from e
-            thr_by_level[L] = float(v)
-        return thr_default, thr_by_level, "config"
-
-    if not isinstance(ckpt, dict):
-        raise RuntimeError(
-            "train.runtime_mesh.cnn.use_saved_thresholds=true, but CNN checkpoint payload "
-            "is missing or invalid."
-        )
-
-    meta = ckpt.get("train_meta", {})
-    if not isinstance(meta, dict):
-        meta = {}
-
-    raw_saved_map = meta.get("sweep_best_threshold_by_level", None)
-
-    saved_by_level: Dict[int, float] = {}
-    if raw_saved_map is None:
-        where = f" ({ckpt_path})" if ckpt_path else ""
-        raise RuntimeError(
-            "train.runtime_mesh.cnn.use_saved_thresholds=true, but checkpoint is missing "
-            f"'train_meta.sweep_best_threshold_by_level'{where}."
-        )
-    if not isinstance(raw_saved_map, dict):
-        raise RuntimeError(
-            "train.runtime_mesh.cnn.use_saved_thresholds=true, but checkpoint field "
-            "'train_meta.sweep_best_threshold_by_level' is not a dict."
-        )
-    for k, v in raw_saved_map.items():
-        try:
-            L = int(k)
-        except Exception as e:
-            raise RuntimeError(
-                "train.runtime_mesh.cnn.use_saved_thresholds=true, but checkpoint has "
-                f"invalid sweep threshold level key: {k!r}"
-            ) from e
-        saved_by_level[L] = float(v)
-
-    if len(saved_by_level) == 0:
-        where = f" ({ckpt_path})" if ckpt_path else ""
-        raise RuntimeError(
-            "train.runtime_mesh.cnn.use_saved_thresholds=true, but "
-            f"'train_meta.sweep_best_threshold_by_level' is empty{where}."
-        )
-
-    if cfg_Lmax is None:
-        cfg_Lmax = int(cfg.get("policy", {}).get("max_level", cfg.get("data", {}).get("L_max", 3)))
-    missing = [int(L) for L in range(1, int(cfg_Lmax) + 1) if int(L) not in saved_by_level]
-    if missing:
-        where = f" ({ckpt_path})" if ckpt_path else ""
-        raise RuntimeError(
-            "train.runtime_mesh.cnn.use_saved_thresholds=true, but saved sweep thresholds do not "
-            f"cover all levels 1..{int(cfg_Lmax)}. Missing levels: {missing}{where}."
-        )
-
-    # All levels are explicitly provided by sweep_best_threshold_by_level.
-    # Keep a scalar for fallback path; it should not be used in normal operation.
-    thr_default = float(saved_by_level.get(1, 0.5))
-    return thr_default, saved_by_level, "checkpoint_sweep"
-
-
-def _load_runtime_mesh_policy_from_cfg(
-    cfg: Dict[str, Any],
-    *,
-    device: torch.device,
-    H: int,
-    W: int,
-):
-    backend = _runtime_mesh_backend(cfg)
-    if backend != "cnn":
-        return None
-
-    rt_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
-    cnn_cfg = rt_cfg.get("cnn", {}) or {}
-
-    ckpt_raw = cnn_cfg.get("checkpoint_path", None)
-    if not ckpt_raw:
-        raise RuntimeError(
-            "Runtime mesh backend is 'cnn' but train.runtime_mesh.cnn.checkpoint_path is empty."
-        )
-    ckpt_path = os.path.abspath(os.path.expanduser(str(ckpt_raw)))
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"Runtime mesh CNN checkpoint not found: {ckpt_path}")
-
-    dev_spec = str(cnn_cfg.get("device", "same")).strip().lower()
-    if dev_spec in ("", "same", "auto", "none"):
-        policy_device = torch.device(device)
-    else:
-        policy_device = torch.device(dev_spec)
-
-    try:
-        from mesh_policy_cnn import MeshPolicyCNN
-    except Exception as e:
-        raise RuntimeError(
-            "Runtime mesh backend is 'cnn' but mesh_policy_cnn.py could not be imported."
-        ) from e
-
-    ckpt = torch.load(ckpt_path, map_location=policy_device)
-    model_args = ckpt.get("model_args", None) if isinstance(ckpt, dict) else None
-    if not isinstance(model_args, dict):
-        raise RuntimeError(
-            f"Checkpoint {ckpt_path} is missing 'model_args'; expected artifact from train_mesh_policy.py."
-        )
-
-    model = MeshPolicyCNN(
-        in_channels=int(model_args["in_channels"]),
-        base_channels=int(model_args.get("base_channels", 48)),
-        head_channels=int(model_args.get("head_channels", 8)),
-        max_level=int(model_args["max_level"]),
-        refine_ratio=int(model_args["refine_ratio"]),
-        model_type=str(model_args.get("model_type", "upsample_heads")),
-    ).to(policy_device)
-
-    state = ckpt.get("model_state", ckpt)
-    if not isinstance(state, dict):
-        raise RuntimeError(f"Checkpoint {ckpt_path} does not contain a valid model state dict.")
-    model.load_state_dict(state, strict=True)
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
-
-    cfg_rr = _get_refine_ratio(cfg)
-    cfg_Lmax = int(cfg.get("policy", {}).get("max_level", cfg.get("data", {}).get("L_max", 3)))
-    ckpt_rr = int(model_args.get("refine_ratio", cfg_rr))
-    ckpt_Lmax = int(model_args.get("max_level", cfg_Lmax))
-    if ckpt_rr != cfg_rr:
-        raise RuntimeError(
-            f"Runtime mesh CNN refine_ratio mismatch: checkpoint={ckpt_rr}, cfg={cfg_rr}"
-        )
-    if ckpt_Lmax != cfg_Lmax:
-        raise RuntimeError(
-            f"Runtime mesh CNN max_level mismatch: checkpoint={ckpt_Lmax}, cfg={cfg_Lmax}"
-        )
-
-    tm = (ckpt.get("train_meta", {}) or {}) if isinstance(ckpt, dict) else {}
-
-    include_parent_mask = bool(cnn_cfg.get("include_parent_mask", True))
-    include_coords = bool(cnn_cfg.get("include_coords", True))
-    include_dt = bool(cnn_cfg.get("include_dt", False))
-    include_gradients = bool(
-        cnn_cfg.get(
-            "include_gradients",
-            tm.get("include_gradient_channels", tm.get("include_gradients", False)),
-        )
-    )
-    n_feature_channels_meta = tm.get("n_feature_channels", None)
-    if n_feature_channels_meta is not None:
-        n_feature_channels_meta = int(n_feature_channels_meta)
-
-    gradient_feature_indices = None
-    raw_grad_idx = cnn_cfg.get("gradient_feature_indices", None)
-    if raw_grad_idx is None:
-        raw_grad_idx = tm.get("gradient_feature_indices", None)
-    if isinstance(raw_grad_idx, dict):
-        rho_raw = raw_grad_idx.get("rho", None)
-        e_raw = raw_grad_idx.get("E", None)
-        gradient_feature_indices = {
-            "rho": (None if rho_raw is None else int(rho_raw)),
-            "E": (None if e_raw is None else int(e_raw)),
-        }
-    if bool(include_gradients):
-        if not isinstance(gradient_feature_indices, dict):
-            raise RuntimeError(
-                "Runtime CNN include_gradients=true but gradient feature indices were not found. "
-                "Set train.runtime_mesh.cnn.gradient_feature_indices={'rho':i,'E':j} or "
-                "use a checkpoint that stores train_meta.gradient_feature_indices."
-            )
-        if gradient_feature_indices.get("rho", None) is None or gradient_feature_indices.get("E", None) is None:
-            raise RuntimeError(
-                "Runtime CNN include_gradients=true but gradient_feature_indices is missing "
-                f"rho/E entries: {gradient_feature_indices}"
-            )
-
-    raw_feature_norm_mode = str(cnn_cfg.get("feature_norm_mode", "auto")).strip().lower()
-    if raw_feature_norm_mode == "auto":
-        raw_feature_norm_mode = str(tm.get("feature_norm_mode", "none"))
-    feature_norm_mode = _canonical_feature_norm_mode(raw_feature_norm_mode)
-    feature_norm_stats = _parse_feature_norm_stats(
-        cnn_cfg.get("feature_norm_stats", None),
-        n_channels=n_feature_channels_meta,
-    )
-    if feature_norm_stats is None:
-        feature_norm_stats = _parse_feature_norm_stats(
-            tm.get("feature_norm_stats", None),
-            n_channels=n_feature_channels_meta,
-        )
-    if _feature_norm_requires_stats(feature_norm_mode) and (feature_norm_stats is None):
-        raise RuntimeError(
-            "Runtime CNN feature_norm_mode requires stats, but no valid feature_norm_stats "
-            "were found in config or checkpoint train_meta."
-        )
-
-    raw_grad_norm_mode = str(cnn_cfg.get("gradient_norm_mode", "auto")).strip().lower()
-    if raw_grad_norm_mode == "auto":
-        raw_grad_norm_mode = str(tm.get("gradient_norm_mode", "none"))
-    gradient_norm_mode = _canonical_gradient_norm_mode(raw_grad_norm_mode)
-    gradient_norm_stats = _parse_gradient_norm_stats(cnn_cfg.get("gradient_norm_stats", None))
-    if gradient_norm_stats is None:
-        gradient_norm_stats = _parse_gradient_norm_stats(tm.get("gradient_norm_stats", None))
-    if bool(include_gradients) and _gradient_norm_requires_stats(gradient_norm_mode) and (gradient_norm_stats is None):
-        raise RuntimeError(
-            "Runtime CNN include_gradients=true with gradient_norm_mode requiring stats, "
-            "but no valid gradient_norm_stats were found in config or checkpoint train_meta."
-        )
-    dt_channel_mode = str(cnn_cfg.get("dt_channel_mode", "dt_hat")).strip().lower()
-    if dt_channel_mode not in ("raw", "dt_hat"):
-        raise ValueError(
-            "train.runtime_mesh.cnn.dt_channel_mode must be 'raw' or 'dt_hat'. "
-            f"Got {dt_channel_mode!r}"
-        )
-
-    coord_grid = None
-    if include_coords:
-        yy = torch.linspace(0.0, 1.0, H, device=policy_device, dtype=torch.float32)
-        xx = torch.linspace(0.0, 1.0, W, device=policy_device, dtype=torch.float32)
-        gy, gx = torch.meshgrid(yy, xx, indexing="ij")
-        coord_grid = torch.stack([gx, gy], dim=0).contiguous()
-    coarse_rc_grid = _runtime_build_coarse_rc_grid(H, W, device=policy_device)
-
-    thr_default, thr_by_level, thr_source = _runtime_mesh_cnn_thresholds(
-        cfg,
-        ckpt=ckpt if isinstance(ckpt, dict) else None,
-        cfg_Lmax=cfg_Lmax,
-        ckpt_path=ckpt_path,
-    )
-
-    ctx = {
-        "backend": "cnn",
-        "model": model,
-        "device": policy_device,
-        "in_channels": int(model_args["in_channels"]),
-        "model_type": str(model_args.get("model_type", "upsample_heads")),
-        "max_level": ckpt_Lmax,
-        "refine_ratio": ckpt_rr,
-        "include_parent_mask": include_parent_mask,
-        "include_coords": include_coords,
-        "include_dt": include_dt,
-        "include_gradients": include_gradients,
-        "feature_norm_mode": feature_norm_mode,
-        "feature_norm_stats": feature_norm_stats,
-        "gradient_feature_indices": gradient_feature_indices,
-        "gradient_norm_mode": gradient_norm_mode,
-        "gradient_norm_stats": gradient_norm_stats,
-        "dt_channel_mode": dt_channel_mode,
-        "coord_grid": coord_grid,
-        "coarse_rc_grid": coarse_rc_grid,
-        "threshold_default": float(thr_default),
-        "threshold_by_level": thr_by_level,
-        "checkpoint_path": ckpt_path,
-    }
-    print(
-        "[RUNTIME-MESH] loaded CNN policy:",
-        f"ckpt={ckpt_path}",
-        f"device={policy_device}",
-        f"in_channels={ctx['in_channels']}",
-        f"model_type={ctx['model_type']}",
-        f"max_level={ctx['max_level']}",
-        f"refine_ratio={ctx['refine_ratio']}",
-        f"include_gradients={bool(ctx['include_gradients'])}",
-        f"feature_norm_mode={ctx['feature_norm_mode']}",
-        f"gradient_norm_mode={ctx['gradient_norm_mode']}",
-        f"include_dt={bool(ctx['include_dt'])}",
-        f"dt_channel_mode={ctx['dt_channel_mode']}",
-        f"threshold_source={thr_source}",
-        f"threshold_default={ctx['threshold_default']:.6g}",
-    )
-    if feature_norm_stats is not None:
-        print(
-            "[RUNTIME-MESH] CNN feature normalization stats:",
-            {
-                "n_channels": int(len(feature_norm_stats["mean"])),
-                "mean_min": float(min(feature_norm_stats["mean"])),
-                "mean_max": float(max(feature_norm_stats["mean"])),
-                "std_min": float(min(feature_norm_stats["std"])),
-                "std_max": float(max(feature_norm_stats["std"])),
-            },
-            flush=True,
-        )
-    if bool(include_gradients):
-        print(
-            "[RUNTIME-MESH] CNN gradient channels:",
-            {
-                "rho": int(gradient_feature_indices["rho"]),
-                "E": int(gradient_feature_indices["E"]),
-            },
-            flush=True,
-        )
-        if gradient_norm_stats is not None:
-            print(
-                "[RUNTIME-MESH] CNN gradient normalization stats:",
-                {
-                    "rho": {
-                        "mean": float(gradient_norm_stats["rho"]["mean"]),
-                        "std": float(gradient_norm_stats["rho"]["std"]),
-                    },
-                    "E": {
-                        "mean": float(gradient_norm_stats["E"]["mean"]),
-                        "std": float(gradient_norm_stats["E"]["std"]),
-                    },
-                },
-                flush=True,
-            )
-    if len(thr_by_level) > 0:
-        print(
-            "[RUNTIME-MESH] CNN threshold_by_level:",
-            {int(k): float(v) for k, v in sorted(thr_by_level.items(), key=lambda kv: int(kv[0]))},
-            flush=True,
-        )
-    return ctx
 
 
 @torch.no_grad()
@@ -6207,61 +6144,8 @@ def _pred_mesh_for_step_strict(k_idx, *, pred_lists):
         ) from e
     
 def _tstats(name: str, t: torch.Tensor, max_elems: int = 0):
-    if t is None:
-        print(f"[NAN-DBG] {name}: None")
-        return
-    if not torch.is_tensor(t):
-        print(f"[NAN-DBG] {name}: (non-tensor) {type(t)} = {t}")
-        return
-
-    tt = t.detach()
-    finite = torch.isfinite(tt) if tt.dtype.is_floating_point or tt.dtype.is_complex else None
-
-    n = tt.numel()
-    msg = f"[NAN-DBG] {name}: shape={tuple(tt.shape)} dtype={tt.dtype} dev={tt.device} "
-
-    # For float/complex: report finiteness and summary stats on finite values
-    if tt.dtype.is_floating_point or tt.dtype.is_complex:
-        nf = int(finite.sum().item())
-        msg += f"finite={nf}/{n} "
-        if nf > 0:
-            v = tt[finite]
-            msg += (
-                f"min={v.min().item():.3e} max={v.max().item():.3e} "
-                f"mean={v.mean().item():.3e} absmax={v.abs().max().item():.3e}"
-            )
-        else:
-            msg += "ALL_NONFINITE"
-        print(msg)
-
-        if max_elems > 0 and nf < n:
-            bad = torch.nonzero(~finite, as_tuple=False)
-            bad = bad[:max_elems]
-            print(f"[NAN-DBG] {name}: first nonfinite indices (up to {max_elems}): {bad.tolist()}")
-        return
-
-    # For non-float: no finiteness concept; report integer/bool stats
-    # Always safe: min/max
-    try:
-        tmin = tt.min().item()
-        tmax = tt.max().item()
-        msg += f"min={tmin} max={tmax} "
-    except Exception as e:
-        msg += f"(min/max failed: {repr(e)}) "
-        print(msg)
-        return
-
-    # If integer, report mean/absmax by casting to float FOR REPORTING ONLY
-    if tt.dtype in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8, torch.long):
-        v = tt.to(torch.float32)
-        msg += f"mean={v.mean().item():.3e} absmax={v.abs().max().item():.3e}"
-    elif tt.dtype == torch.bool:
-        msg += f"true_count={int(tt.sum().item())}/{n}"
-    else:
-        # fallback
-        pass
-
-    print(msg)
+    # Legacy AMR debug logger intentionally disabled in Cartesian training path.
+    return
 
 
 def _assert_finite(name: str, t: torch.Tensor, crash: bool = True):
@@ -6275,6 +6159,29 @@ def _assert_finite(name: str, t: torch.Tensor, crash: bool = True):
         if crash:
             raise RuntimeError(f"Non-finite detected in {name}")
     return ok
+
+
+def _step_outputs_are_finite(
+    *,
+    loss_t: torch.Tensor | None,
+    pred_abs: torch.Tensor | None,
+    tgt_abs: torch.Tensor | None,
+    split: str,
+    batch_idx: int,
+    step_k: int,
+) -> bool:
+    ok_loss = _assert_finite(f"{split}.loss_step", loss_t, crash=False)
+    ok_pred = _assert_finite(f"{split}.pred_abs", pred_abs, crash=False)
+    ok_tgt = _assert_finite(f"{split}.tgt_abs", tgt_abs, crash=False)
+    ok = bool(ok_loss and ok_pred and ok_tgt)
+    if not ok:
+        print(
+            f"[WARN][{split}] skipping non-finite step: batch={int(batch_idx)} step_k={int(step_k)} "
+            f"(finite: loss={int(ok_loss)} pred={int(ok_pred)} tgt={int(ok_tgt)})",
+            flush=True,
+        )
+    return ok
+
 
 def _sanitize_float_tensor(
     t: torch.Tensor | None,
@@ -6360,34 +6267,53 @@ def sanitize_state_for_ops(x_abs: torch.Tensor, cfg: dict, rho_floor=1e-6, E_flo
     E_max = float(loss.get("ops_E_max", loss.get("state_E_max", 0.0)))
     m_max = float(loss.get("ops_m_max", loss.get("state_m_max", 0.0)))
 
-    idx = dec.infer_feature_indices(cfg, x_abs.size(1))
-    rho = x_abs[:, idx["rho"]].clamp_min(rho_floor)
-    E = x_abs[:, idx["E"]].clamp_min(E_floor)
+    Fdim = int(x_abs.size(1))
+    idx = dec.infer_feature_indices(cfg, Fdim)
+    rep = dec.state_representation_from_cfg(cfg, Fdim)
+
+    cols = [x_abs[:, j] for j in range(Fdim)]
+    rho = cols[idx["rho"]].clamp_min(rho_floor)
+    E = cols[idx["E"]].clamp_min(E_floor)
     if rho_max > 0.0:
         rho = rho.clamp_max(rho_max)
     if E_max > 0.0:
         E = E.clamp_max(E_max)
-    mx = x_abs[:, idx["mx"]]
-    my = x_abs[:, idx["my"]]
 
-    # enforce |u| <= u_clip by clamping momenta given rho
-    if u_clip > 0:
-        mx = mx.clamp(-u_clip * rho, u_clip * rho)
-        my = my.clamp(-u_clip * rho, u_clip * rho)
-    if m_max > 0.0:
-        mx = mx.clamp(min=-m_max, max=m_max)
-        my = my.clamp(min=-m_max, max=m_max)
+    if rep == "primitive_uvrhope":
+        u_idx = int(idx.get("u", idx["mx"]))
+        v_idx = int(idx.get("v", idx["my"]))
+        u = cols[u_idx]
+        v = cols[v_idx]
+        if u_clip > 0.0:
+            u = u.clamp(min=-u_clip, max=u_clip)
+            v = v.clamp(min=-u_clip, max=u_clip)
+        u = _sanitize_float_tensor(u, clip_abs=max(u_clip, m_max), fill_value=0.0, nonneg=False)
+        v = _sanitize_float_tensor(v, clip_abs=max(u_clip, m_max), fill_value=0.0, nonneg=False)
+        cols[u_idx] = u
+        cols[v_idx] = v
+
+        p_idx = idx.get("p", None)
+        if p_idx is not None:
+            p_floor = float(loss.get("p_floor", 0.0))
+            p = cols[int(p_idx)].clamp_min(p_floor)
+            cols[int(p_idx)] = _sanitize_float_tensor(p, clip_abs=0.0, fill_value=p_floor, nonneg=True)
+    else:
+        mx = cols[idx["mx"]]
+        my = cols[idx["my"]]
+        # enforce |u| <= u_clip by clamping momenta given rho
+        if u_clip > 0:
+            mx = mx.clamp(-u_clip * rho, u_clip * rho)
+            my = my.clamp(-u_clip * rho, u_clip * rho)
+        if m_max > 0.0:
+            mx = mx.clamp(min=-m_max, max=m_max)
+            my = my.clamp(min=-m_max, max=m_max)
+        cols[idx["mx"]] = _sanitize_float_tensor(mx, clip_abs=m_max, fill_value=0.0, nonneg=False)
+        cols[idx["my"]] = _sanitize_float_tensor(my, clip_abs=m_max, fill_value=0.0, nonneg=False)
 
     rho = _sanitize_float_tensor(rho, clip_abs=rho_max, fill_value=rho_floor, nonneg=True)
     E = _sanitize_float_tensor(E, clip_abs=E_max, fill_value=E_floor, nonneg=True)
-    mx = _sanitize_float_tensor(mx, clip_abs=m_max, fill_value=0.0, nonneg=False)
-    my = _sanitize_float_tensor(my, clip_abs=m_max, fill_value=0.0, nonneg=False)
-
-    cols = [x_abs[:, j] for j in range(x_abs.size(1))]
     cols[idx["rho"]] = rho
     cols[idx["E"]] = E
-    cols[idx["mx"]] = mx
-    cols[idx["my"]] = my
     return torch.stack(cols, dim=1)
 
 def _enforce_physical_state(
@@ -6407,6 +6333,7 @@ def _enforce_physical_state(
 
     Fdim = int(x_abs.size(1))
     idx = dec.infer_feature_indices(cfg, Fdim)
+    rep = dec.state_representation_from_cfg(cfg, Fdim)
     loss = cfg.get("loss", {}) or {}
     u_clip = float(loss.get("u_clip", 1e3))
     rho_max = float(loss.get("state_rho_max", 0.0))
@@ -6421,19 +6348,36 @@ def _enforce_physical_state(
     if E_max > 0.0:
         E = E.clamp_max(E_max)
 
-    mx = cols[idx["mx"]]
-    my = cols[idx["my"]]
-    if u_clip > 0.0:
-        mx = mx.clamp(min=-u_clip * rho, max=u_clip * rho)
-        my = my.clamp(min=-u_clip * rho, max=u_clip * rho)
-    if m_max > 0.0:
-        mx = mx.clamp(min=-m_max, max=m_max)
-        my = my.clamp(min=-m_max, max=m_max)
-
     cols[idx["rho"]] = _sanitize_float_tensor(rho, clip_abs=rho_max, fill_value=rho_floor, nonneg=True)
     cols[idx["E"]] = _sanitize_float_tensor(E, clip_abs=E_max, fill_value=E_floor, nonneg=True)
-    cols[idx["mx"]] = _sanitize_float_tensor(mx, clip_abs=m_max, fill_value=0.0, nonneg=False)
-    cols[idx["my"]] = _sanitize_float_tensor(my, clip_abs=m_max, fill_value=0.0, nonneg=False)
+
+    if rep == "primitive_uvrhope":
+        u_idx = int(idx.get("u", idx["mx"]))
+        v_idx = int(idx.get("v", idx["my"]))
+        u = cols[u_idx]
+        v = cols[v_idx]
+        if u_clip > 0.0:
+            u = u.clamp(min=-u_clip, max=u_clip)
+            v = v.clamp(min=-u_clip, max=u_clip)
+        cols[u_idx] = _sanitize_float_tensor(u, clip_abs=max(u_clip, m_max), fill_value=0.0, nonneg=False)
+        cols[v_idx] = _sanitize_float_tensor(v, clip_abs=max(u_clip, m_max), fill_value=0.0, nonneg=False)
+
+        p_idx = idx.get("p", None)
+        if p_idx is not None:
+            p_floor = float(loss.get("p_floor", 0.0))
+            p = cols[int(p_idx)].clamp_min(p_floor)
+            cols[int(p_idx)] = _sanitize_float_tensor(p, clip_abs=0.0, fill_value=p_floor, nonneg=True)
+    else:
+        mx = cols[idx["mx"]]
+        my = cols[idx["my"]]
+        if u_clip > 0.0:
+            mx = mx.clamp(min=-u_clip * rho, max=u_clip * rho)
+            my = my.clamp(min=-u_clip * rho, max=u_clip * rho)
+        if m_max > 0.0:
+            mx = mx.clamp(min=-m_max, max=m_max)
+            my = my.clamp(min=-m_max, max=m_max)
+        cols[idx["mx"]] = _sanitize_float_tensor(mx, clip_abs=m_max, fill_value=0.0, nonneg=False)
+        cols[idx["my"]] = _sanitize_float_tensor(my, clip_abs=m_max, fill_value=0.0, nonneg=False)
     return torch.stack(cols, dim=1)
 
 def _resolve_time_integrator(cfg: dict) -> str:
@@ -6518,6 +6462,7 @@ def train_one_epoch_multi_step(
     epoch_idx: int | None = None,
     runtime_mesh_policy: Dict[str, Any] | None = None,
     chunk_sidecar: ChunkSidecarH5 | None = None,
+    ramp_feature_ctx: Dict[str, Any] | None = None,
 ):
     """
     STRICT multi-step mesh-first training with:
@@ -6536,22 +6481,13 @@ def train_one_epoch_multi_step(
     diagnostics_accum = _new_diagnostics_accumulator(diag_cfg)
 
     dbg = cfg.get("debug", {})
-    nan_watch = bool(dbg.get("nan_watch", True))          # turn on/off
-    nan_watch_first_only = bool(dbg.get("nan_first_only", True))
+    nan_watch = False  # legacy AMR NaN debug logging removed
     assert_finite_checks = bool(dbg.get("assert_finite_checks", False))
     ops_danger_watch = bool(dbg.get("ops_danger_watch", False))
-    hang_watch = bool(dbg.get("hang_watch", True))
-    hang_watch_batches = int(dbg.get("hang_watch_batches", 4))
-    if hang_watch_batches < 0:
-        hang_watch_batches = 0
-    # Effective enable: either master switch off, or 0 batches -> disabled.
-    hang_watch_enabled = bool(hang_watch and (hang_watch_batches > 0))
     print_batch_time = bool(dbg.get("print_batch_time", False))
     print_runtime_mesh_batch_breakdown = bool(dbg.get("print_runtime_mesh_batch_breakdown", True))
     sync_runtime_timing = bool(dbg.get("sync_runtime_timing", False))
-    runtime_mesh_enabled = bool(
-        (cfg.get("train", {}).get("runtime_mesh", {}) or {}).get("enabled", False)
-    )
+    runtime_mesh_enabled = _runtime_mesh_enabled_from_cfg(cfg)
     progress_every_batches_raw = int(dbg.get("progress_every_batches", 10))
     # 0 (or negative) disables periodic [PROGRESS] logging.
     progress_print_enabled = bool(progress_every_batches_raw > 0)
@@ -6578,14 +6514,10 @@ def train_one_epoch_multi_step(
         train_one_epoch_multi_step._nan_printed = False
 
     def _should_print():
-        if not nan_watch:
-            return False
-        if nan_watch_first_only and train_one_epoch_multi_step._nan_printed:
-            return False
-        return True
+        return False
 
     def _mark_printed():
-        train_one_epoch_multi_step._nan_printed = True
+        return
 
     def _record_step_diagnostics(
         *,
@@ -6611,12 +6543,13 @@ def train_one_epoch_multi_step(
         )
 
     def _dump_state(tag, x):
-        # expects channels [rho,mx,my,E] in first 4 or via infer_feature_indices
-        idx_map = dec.infer_feature_indices(cfg, x.size(1))
-        rho = x[:, idx_map["rho"]]
-        mx  = x[:, idx_map["mx"]]
-        my  = x[:, idx_map["my"]]
-        E   = x[:, idx_map["E"]]
+        state = dec.state_views(x, cfg)
+        rho = state["rho"]
+        mx = state["mx"]
+        my = state["my"]
+        E = state["E_tot"]
+        ux = state["u"]
+        uy = state["v"]
         rho_abs = rho.abs()
 
         print(f"\n[NAN-DBG][{tag}] x stats")
@@ -6628,22 +6561,25 @@ def train_one_epoch_multi_step(
         _tstats("my", my)
         _tstats("E", E)
 
-        rho_safe = rho_abs.clamp_min(1e-12)  # diagnostic only
-        ux = mx / rho_safe
-        uy = my / rho_safe
-        _tstats("ux=mx/|rho|", ux)
-        _tstats("uy=my/|rho|", uy)
+        _tstats("ux", ux)
+        _tstats("uy", uy)
 
     @torch.no_grad()
-    def _enforce_physical_state_with_diag(x_abs: torch.Tensor, *, tag: str, step_k: int,
-                                        rho_idx: int = 0, E_idx: int = 3,
-                                        rho_floor: float = 1e-6, E_floor: float = 1e-6) -> torch.Tensor:
+    def _enforce_physical_state_with_diag(
+        x_abs: torch.Tensor,
+        *,
+        tag: str,
+        step_k: int,
+        rho_floor: float = 1e-6,
+        E_floor: float = 1e-6,
+    ) -> torch.Tensor:
         """
         Prints how often rho/E are below floor BEFORE clamp, then applies your existing clamp helper.
         """
         # pre-clamp stats on the tensor you're about to clamp
-        rho_pre = x_abs[:, rho_idx]
-        E_pre   = x_abs[:, E_idx]
+        idx_here = dec.infer_feature_indices(cfg, int(x_abs.size(1)))
+        rho_pre = x_abs[:, int(idx_here["rho"])]
+        E_pre = x_abs[:, int(idx_here["E"])]
 
         negR_frac = (rho_pre < rho_floor).float().mean().item()
         negE_frac = (E_pre   < E_floor).float().mean().item()
@@ -6686,18 +6622,18 @@ def train_one_epoch_multi_step(
         cfg, epoch_idx=epoch_idx, base_integrator=time_integrator
     )
 
-    # DEC / PARC controls
+    # Physics-input controls
     loss_cfg = cfg.get("loss", {}) or {}
-    dec_use = bool(loss_cfg.get("dec", False))
-    parc_use = bool(loss_cfg.get("parc", False) or loss_cfg.get("parc_inputs", False))
+    parc_use = _physics_inputs_active_from_loss_cfg(loss_cfg)
     use_adapter = bool(loss_cfg.get("parc_use_adapter", False))
 
     # Variant-B baseline strength (reuse your existing name)
     dec_blend_w = float(loss_cfg.get("blend_weight", 0.0))        # baseline weight (recommend 1.0 when parc_use)
     dec_resid_w = float(loss_cfg.get("residual_weight", 0.0))     # optional residual loss weight
 
-    # Determine whether we must compute physics operators this step
-    need_phy = parc_use or (dec_use and (dec_blend_w != 0.0 or dec_resid_w != 0.0))
+    # Determine whether we must compute physics operators this step.
+    # Physics is now controlled by loss.physics_inputs_enabled.
+    need_phy = bool(parc_use)
 
     parc_sel_cache: Dict[int, Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]] = {}
     parc_mask_cache: Dict[Tuple[int, str, int], torch.Tensor] = {}
@@ -6738,15 +6674,18 @@ def train_one_epoch_multi_step(
                if use_amp and device.type == "cuda"
                else (lambda: torch.autocast("cpu", enabled=False)))
 
-    runtime_mesh_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
-    runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
+    runtime_mesh_enabled = _runtime_mesh_enabled_from_cfg(cfg)
+    if runtime_mesh_enabled:
+        raise RuntimeError(
+            "Runtime mesh is disabled in Physics-Aware-cartesian. "
+            "Set train.runtime_mesh.enabled=false."
+        )
     runtime_multires_cfg = _runtime_multires_lookup_cfg(cfg)
-    runtime_multires_enabled = bool(runtime_mesh_enabled and runtime_multires_cfg.get("enabled", False))
+    runtime_multires_enabled = False
     runtime_multires_fallback_to_idw = bool(runtime_multires_cfg.get("fallback_to_idw", True))
     runtime_multires_lookup: Optional[_RuntimeMultiResGtLookup] = None
-    runtime_update_every = int(runtime_mesh_cfg.get("update_every_steps", 1))
-    runtime_mesh_backend = _runtime_mesh_backend(cfg)
-    runtime_domain_mode = _runtime_mesh_domain_mode(cfg)
+    runtime_update_every = 1
+    runtime_domain_mode = "disabled"
     runtime_idw_backend = "exact"
     runtime_idw_backend_kwargs: Dict[str, Any] = {}
     runtime_bbox = _get_bbox(cfg)
@@ -6758,106 +6697,6 @@ def train_one_epoch_multi_step(
     runtime_wedge_path = None
     runtime_wedge_constraints = None
     runtime_base_mesh = None
-    if runtime_mesh_enabled:
-        mesh_spec_path = cfg.get("mesh", {}).get("starting_mesh_path", None)
-        if not mesh_spec_path:
-            raise RuntimeError("Runtime mesh mode requires cfg['mesh']['starting_mesh_path'].")
-        if runtime_domain_mode == "starting_mesh":
-            runtime_base_mesh = _get_runtime_starting_mesh_base(
-                cfg=cfg,
-                H=H,
-                W=W,
-                dx=float(dx),
-                dy=float(dy),
-                device=device,
-                mesh_spec_path=str(mesh_spec_path),
-            )
-        else:
-            runtime_wedge_path = _load_wedge_path_from_spec(str(mesh_spec_path), cfg)
-            runtime_wedge_constraints = _get_runtime_wedge_constraints(
-                cfg=cfg,
-                H=H,
-                W=W,
-                device=device,
-                wedge_path=runtime_wedge_path,
-            )
-        runtime_idw_backend, runtime_idw_backend_kwargs = _runtime_idw_backend_settings(
-            cfg,
-            out_device=device,
-        )
-        if runtime_mesh_backend == "cnn" and runtime_mesh_policy is None:
-            raise RuntimeError(
-                "Runtime mesh backend is 'cnn' but runtime_mesh_policy was not loaded."
-            )
-        if runtime_multires_enabled:
-            level_files = _resolve_runtime_multires_level_files(runtime_multires_cfg)
-            if not level_files:
-                raise RuntimeError(
-                    "Runtime multires GT lookup is enabled, but no level files were resolved. "
-                    "Set train.runtime_mesh.multires_gt_lookup.level_files "
-                    "or train.runtime_mesh.multires_gt_lookup.directory."
-                )
-            max_level_policy = int(cfg.get("policy", {}).get("max_level", max(level_files.keys())))
-            runtime_multires_lookup = _RuntimeMultiResGtLookup(
-                level_files=level_files,
-                H=H,
-                W=W,
-                bbox=runtime_bbox,
-                refine_ratio=runtime_refine_ratio,
-                max_level=max_level_policy,
-                max_cached_feature_steps=int(runtime_multires_cfg.get("max_cached_feature_steps", 16)),
-            )
-        grad_step0_parent_mode = str(
-            runtime_mesh_cfg.get("gradient_step0_parent_mapping_mode", "from_centers")
-        ).strip().lower()
-        grad_parent_msg = (
-            f", gradient_step0_parent_mapping_mode={grad_step0_parent_mode}"
-            if runtime_mesh_backend in ("gradient", "gradient_fast")
-            else ""
-        )
-        gf_fill_msg = ""
-        if runtime_mesh_backend == "gradient_fast":
-            gf_cfg = runtime_mesh_cfg.get("gradient_fast", {}) or {}
-            gf_fill_msg = (
-                f", gradient_fast.fill_empty_interior={int(bool(gf_cfg.get('fill_empty_interior', True)))}"
-            )
-        print(
-            f"[RUNTIME-MESH] train loop active (backend={runtime_mesh_backend}, domain_mode={runtime_domain_mode}, "
-            f"idw_backend={runtime_idw_backend}, update_every_steps={runtime_update_every}{grad_parent_msg}{gf_fill_msg})"
-        )
-        if bool(runtime_mesh_plot_settings.get("enabled", False)):
-            print(
-                "[RUNTIME-MESH][PLOT] enabled: "
-                f"out_dir={runtime_mesh_plot_settings.get('out_dir')} "
-                f"split={runtime_mesh_plot_settings.get('split')} "
-                f"every_rebuilds={int(runtime_mesh_plot_settings.get('every_rebuilds', 1))} "
-                f"max_plots={int(runtime_mesh_plot_settings.get('max_plots', 0))} "
-                f"plot_predictor_inputs={int(bool(runtime_mesh_plot_settings.get('plot_predictor_inputs', False)))} "
-                f"predictor_input_max_channels={int(runtime_mesh_plot_settings.get('predictor_input_max_channels', 4))} "
-                f"plot_gt_features={int(bool(runtime_mesh_plot_settings.get('plot_gt_features', False)))} "
-                f"gt_feature_max_channels={int(runtime_mesh_plot_settings.get('gt_feature_max_channels', 4))}",
-                flush=True,
-            )
-        if runtime_multires_enabled:
-            levels_sorted = sorted(runtime_multires_lookup.level_files.keys()) if runtime_multires_lookup is not None else []
-            print(
-                f"[RUNTIME-MESH][MULTIRES] GT lookup enabled: levels={levels_sorted}, "
-                f"fallback_to_idw={int(runtime_multires_fallback_to_idw)}",
-                flush=True,
-            )
-        runtime_mesh_plot_wedge_path = runtime_wedge_path
-        if (
-            bool(runtime_mesh_plot_settings.get("enabled", False))
-            and bool(runtime_mesh_plot_settings.get("show_wedge", True))
-            and (runtime_mesh_plot_wedge_path is None)
-        ):
-            try:
-                runtime_mesh_plot_wedge_path = _load_wedge_path_from_spec(str(mesh_spec_path), cfg)
-            except Exception as e:
-                print(
-                    f"[RUNTIME-MESH][PLOT][WARN] Could not load wedge path for overlay: {e!r}",
-                    flush=True,
-                )
 
     chunk_cfg = cfg.get("chunk", {}) or {}
     chunk_enabled = bool(chunk_cfg.get("enabled", False))
@@ -7097,7 +6936,6 @@ def train_one_epoch_multi_step(
         if pei_np.shape[0] != 2:
             raise RuntimeError(f"chunking expects pred_ei shape (2,E), got {tuple(pei_np.shape)}")
 
-        N = int(parents_np.size)
         out_np: list[dict[str, Any]] = []
         for _cid, y0, y1, x0, x1 in chunk_tile_spec:
             row = parents_np // int(W)
@@ -7139,11 +6977,6 @@ def train_one_epoch_multi_step(
         nonlocal chunk_warned_missing_sidecar, chunk_warned_sidecar_step_miss
         if not chunk_enabled:
             return None
-
-        # Runtime remeshing changes geometry every step; sidecar metadata is only valid
-        # for precomputed meshes and should not be reused here.
-        if runtime_mesh_enabled:
-            return _build_chunk_specs_on_the_fly(pred_parents=pred_parents, pred_ei=pred_ei)
 
         if chunk_sidecar_ok and (step_t_abs is not None):
             chunks_np = chunk_sidecar.get_timestep_chunks(int(step_t_abs))
@@ -7298,7 +7131,6 @@ def train_one_epoch_multi_step(
         total_batches = int(len(loader))
     except Exception:
         total_batches = -1
-    hang_cap_notified = False
 
     def _maybe_print_batch_progress(
         batch_idx: int,
@@ -7325,23 +7157,8 @@ def train_one_epoch_multi_step(
             return
         if (bi % progress_every_batches) != 0:
             return
-        elapsed = float(time.perf_counter() - epoch_loop_t0)
-        avg_total = elapsed / float(max(bi, 1))
-        avg_body = float(avg_body_s)
-        if total_batches > 0:
-            print(
-                f"[PROGRESS] train batch {bi}/{total_batches} "
-                f"batch_wall={batch_wall_s:.3f}s data_wait={float(data_wait_s):.3f}s "
-                f"avg_batch={avg_total:.3f}s avg_body={avg_body:.3f}s elapsed={elapsed:.1f}s",
-                flush=True,
-            )
-        else:
-            print(
-                f"[PROGRESS] train batch {bi} "
-                f"batch_wall={batch_wall_s:.3f}s data_wait={float(data_wait_s):.3f}s "
-                f"avg_batch={avg_total:.3f}s avg_body={avg_body:.3f}s elapsed={elapsed:.1f}s",
-                flush=True,
-            )
+        # Legacy progress logging removed.
+        return
 
     def _maybe_print_runtime_mesh_batch_breakdown(
         batch_idx: int,
@@ -7654,21 +7471,9 @@ def train_one_epoch_multi_step(
         )
 
     for batch_idx, batch in enumerate(loader):
-        if hang_watch_enabled and (not hang_cap_notified) and (batch_idx == hang_watch_batches):
-            print(
-                f"[HANG-DBG] detailed hang logs reached configured limit: "
-                f"debug.hang_watch_batches={hang_watch_batches}. "
-                f"Set a larger value to continue per-step diagnostics.",
-                flush=True,
-            )
-            hang_cap_notified = True
-
-        batch_dbg = bool(hang_watch_enabled and (batch_idx < hang_watch_batches))
         iter_enter_t = time.perf_counter()
         data_wait_s = max(0.0, float(iter_enter_t - iter_wait_anchor_t))
         batch_t0 = float(iter_enter_t)
-        if batch_dbg:
-            print(f"[HANG-DBG] batch fetched: idx={batch_idx}", flush=True)
 
         batch_rt_mesh_predict_s = 0.0
         batch_rt_mesh_materialize_s = 0.0
@@ -7728,33 +7533,21 @@ def train_one_epoch_multi_step(
         dt_ref_scalar = batch.get("dt_ref", None)
         t_indices = batch.get("t_indices", None)
 
-        has_precomp_lists = (
-            (pred_centers_list is not None)
-            and (pred_levels_list is not None)
-            and (pred_parents_list is not None)
-            and (pred_ei_list is not None)
-            and (mask_pred_list is not None)
-            and (feat_t_on_pred_list is not None)
-            and (feat_tp1_on_pred_list is not None)
-        )
+        pred_centers_list = _require_list(batch, "pred_centers_list")
+        pred_levels_list = _require_list(batch, "pred_levels_list")
+        pred_parents_list = _require_list(batch, "pred_parents_list")
+        pred_ei_list = _require_list(batch, "pred_ei_list")
+        mask_pred_list = _require_list(batch, "mask_pred_list")
+        feat_t_on_pred_list = _require_list(batch, "feat_t_on_pred_list")
+        feat_tp1_on_pred_list = _require_list(batch, "feat_tp1_on_pred_list")
 
-        pred_lists = None
-        if (not runtime_mesh_enabled) or has_precomp_lists:
-            pred_centers_list = _require_list(batch, "pred_centers_list")
-            pred_levels_list = _require_list(batch, "pred_levels_list")
-            pred_parents_list = _require_list(batch, "pred_parents_list")
-            pred_ei_list = _require_list(batch, "pred_ei_list")
-            mask_pred_list = _require_list(batch, "mask_pred_list")
-            feat_t_on_pred_list = _require_list(batch, "feat_t_on_pred_list")
-            feat_tp1_on_pred_list = _require_list(batch, "feat_tp1_on_pred_list")
+        if need_phy and pred_ea_list is None:
+            raise RuntimeError(
+                "PARC/DEC enabled but batch is missing pred_ea_list / pred_edge_attr_list. "
+                "Update H5 loader + CollateWithPrecompute to attach edge_attr per step."
+            )
 
-            if (not runtime_mesh_enabled) and need_phy and pred_ea_list is None:
-                raise RuntimeError(
-                    "PARC/DEC enabled but batch is missing pred_ea_list / pred_edge_attr_list. "
-                    "Update H5 loader + CollateWithPrecompute to attach edge_attr per step."
-                )
-
-            pred_lists = (pred_centers_list, pred_levels_list, pred_parents_list, pred_ei_list, mask_pred_list)
+        pred_lists = (pred_centers_list, pred_levels_list, pred_parents_list, pred_ei_list, mask_pred_list)
 
         window_loss = 0.0
         window_mae = 0.0
@@ -7765,7 +7558,7 @@ def train_one_epoch_multi_step(
         batch_rt_other_zero_grad_s += _rt_dt(t_zero_grad_t0)
 
         # Only DEC needs edge_attr. MLS does not.
-        if (not runtime_mesh_enabled) and need_phy and (not use_mls) and (pred_ea_list is None):
+        if need_phy and (not use_mls) and (pred_ea_list is None):
             raise RuntimeError(
                 "DEC/PARC physics enabled but batch is missing pred_ea_list / pred_edge_attr_list. "
                 "Update loader + CollateWithPrecompute to attach edge_attr per step."
@@ -7845,19 +7638,15 @@ def train_one_epoch_multi_step(
                 if mu is not None and torch.is_tensor(mu):
                     _tstats("mu", mu)
 
-                # assumes channels [rho, mx, my, E] in x_in_abs
-                rho = x_in_abs[:, 0]
-                mx  = x_in_abs[:, 1]
-                my  = x_in_abs[:, 2]
-
-                rho_safe = rho.abs().clamp_min(1e-12)
-                ux = mx / rho_safe
-                uy = my / rho_safe
+                state_dbg = dec.state_views(x_in_abs, cfg)
+                rho = state_dbg["rho"]
+                ux = state_dbg["u"]
+                uy = state_dbg["v"]
 
                 _tstats("rho", rho)
                 print(f"[NAN-debug] |rho|<1e-6 count: {(rho.abs() < 1e-6).sum().item()} / {rho.numel()}")
-                _tstats("ux(mx/rho_safe)", ux)
-                _tstats("uy(my/rho_safe)", uy)
+                _tstats("ux", ux)
+                _tstats("uy", uy)
 
                 _mark_printed()
 
@@ -8149,7 +7938,15 @@ def train_one_epoch_multi_step(
 
                 # ----- build node input X (PARC appends operator inputs) -----
                 t_input_t0 = _step_t0()
-                x_in = _build_X(norm_in, pred_centers, pred_levels, cfg, dt_hat=dt_hat)
+                x_in = _build_X(
+                    norm_in,
+                    pred_centers,
+                    pred_levels,
+                    cfg,
+                    dt_hat=dt_hat,
+                    ramp_feature_ctx=ramp_feature_ctx,
+                    step_t_abs=step_t_abs,
+                )
 
                 # Allow diffusion-only or advection-only PARC inputs:
                 # If one operator term is missing (None), substitute a correctly-shaped zero tensor.
@@ -8284,7 +8081,15 @@ def train_one_epoch_multi_step(
                     Fdim = x_in_abs.size(1)
 
                     # Base X is built from norm_in + geometry (pos, level, etc.)
-                    base_X = _build_X(norm_in, pred_centers, pred_levels, cfg, dt_hat=dt_hat)
+                    base_X = _build_X(
+                        norm_in,
+                        pred_centers,
+                        pred_levels,
+                        cfg,
+                        dt_hat=dt_hat,
+                        ramp_feature_ctx=ramp_feature_ctx,
+                        step_t_abs=step_t_abs,
+                    )
 
                     print("\n[BASE_X BREAKDOWN]")
                     print("  base_X shape:", tuple(base_X.shape))
@@ -8367,7 +8172,10 @@ def train_one_epoch_multi_step(
                     loss = cfg.get("loss", {}) or {}
                     inc_adv = bool(loss.get("parc_include_adv", True))
                     inc_diff = bool(loss.get("parc_include_diff", True))
-                    expected_parc = (len(sel_adv) if inc_adv else 0) + (len(sel_diff) if inc_diff else 0)
+                    expected_parc = (
+                        (len(sel_adv) if inc_adv else 0) + (len(sel_diff) if inc_diff else 0)
+                        if parc_use else 0
+                    )
                     got_parc = 0 if parc_extra is None else int(parc_extra.size(1))
                     print("  expected parc_extra dim:", expected_parc, "got:", got_parc)
 
@@ -8545,7 +8353,15 @@ def train_one_epoch_multi_step(
                                         base_stage = base_stage + adv_w_stage * r_adv_stage
                                     r_phy_stage = _sanitize_ops_term(base_stage, cfg)
 
-                        x_stage_in = _build_X(norm_state, pred_centers, pred_levels, cfg, dt_hat=dt_hat)
+                        x_stage_in = _build_X(
+                            norm_state,
+                            pred_centers,
+                            pred_levels,
+                            cfg,
+                            dt_hat=dt_hat,
+                            ramp_feature_ctx=ramp_feature_ctx,
+                            step_t_abs=step_t_abs,
+                        )
                         if parc_use and ((r_adv_stage is not None) or (r_diff_stage is not None)):
                             ref_stage = r_diff_stage if (r_diff_stage is not None) else r_adv_stage
                             r_adv_in_stage = r_adv_stage if (r_adv_stage is not None) else torch.zeros_like(ref_stage)
@@ -9099,13 +8915,6 @@ def train_one_epoch_multi_step(
                     )
 
                 t_model_t0 = _rt_t0()
-                if batch_dbg:
-                    print(
-                        f"[HANG-DBG] train entering _run_step: step={k} "
-                        f"N={int(x_in_abs.shape[0]) if torch.is_tensor(x_in_abs) else -1} "
-                        f"E={int(active_pred_ei.shape[1]) if (torch.is_tensor(active_pred_ei) and active_pred_ei.ndim == 2) else -1}",
-                        flush=True,
-                    )
                 step_model_timing: Dict[str, float] = {}
                 loss_k, y_pred_abs_k, _ = _run_step(
                     step_k=k,
@@ -9122,13 +8931,21 @@ def train_one_epoch_multi_step(
                     x_ops_abs=None,
                     timing_out=step_model_timing,
                 )
-                if batch_dbg:
-                    print(f"[HANG-DBG] train _run_step returned: step={k}", flush=True)
                 t_model_s = _rt_dt(t_model_t0)
                 batch_rt_other_model_s += float(t_model_s)
                 batch_rt_model_calls += 1
                 for tk, tv in step_model_timing.items():
                     batch_rt_model_parts_s[tk] = float(batch_rt_model_parts_s.get(tk, 0.0)) + float(tv)
+
+                if not _step_outputs_are_finite(
+                    loss_t=loss_k,
+                    pred_abs=y_pred_abs_k,
+                    tgt_abs=x_tgt_abs,
+                    split="train",
+                    batch_idx=batch_idx,
+                    step_k=k,
+                ):
+                    continue
 
                 t_metrics_t0 = time.perf_counter()
                 window_loss += float(loss_k.detach().cpu())
@@ -9200,55 +9017,34 @@ def train_one_epoch_multi_step(
 
             # ===== backward + step once per window =====
             if window_loss_graph is not None:
-                if batch_dbg:
-                    print("[HANG-DBG] starting backward+step", flush=True)
-                t_bw0 = time.perf_counter() if batch_dbg else None
                 if scaler is not None:
                     t_bw_real_t0 = _rt_t0()
                     scaler.scale(window_loss_graph).backward()
                     batch_rt_other_backward_s += _rt_dt(t_bw_real_t0)
-                    if batch_dbg:
-                        print(f"[HANG-DBG] backward done (scaled) in {time.perf_counter() - t_bw0:.3f}s", flush=True)
-                    t_clip0 = time.perf_counter() if batch_dbg else None
                     t_clip_real_t0 = _rt_t0()
                     scaler.unscale_(opt)  # <-- required before clipping
                     if grad_clip > 0.0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                     batch_rt_other_unscale_clip_s += _rt_dt(t_clip_real_t0)
-                    if batch_dbg:
-                        print(f"[HANG-DBG] unscale+clip done in {time.perf_counter() - t_clip0:.3f}s", flush=True)
-                    t_step0 = time.perf_counter() if batch_dbg else None
                     t_step_real_t0 = _rt_t0()
                     scaler.step(opt)
                     scaler.update()
                     batch_rt_other_optimizer_s += _rt_dt(t_step_real_t0)
-                    if batch_dbg:
-                        print(f"[HANG-DBG] optimizer step+update done in {time.perf_counter() - t_step0:.3f}s", flush=True)
                 else:
                     t_bw_real_t0 = _rt_t0()
                     window_loss_graph.backward()
                     batch_rt_other_backward_s += _rt_dt(t_bw_real_t0)
-                    if batch_dbg:
-                        print(f"[HANG-DBG] backward done in {time.perf_counter() - t_bw0:.3f}s", flush=True)
-                    t_clip0 = time.perf_counter() if batch_dbg else None
                     t_clip_real_t0 = _rt_t0()
                     if grad_clip > 0.0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                     batch_rt_other_unscale_clip_s += _rt_dt(t_clip_real_t0)
-                    if batch_dbg:
-                        print(f"[HANG-DBG] clip done in {time.perf_counter() - t_clip0:.3f}s", flush=True)
-                    t_step0 = time.perf_counter() if batch_dbg else None
                     t_step_real_t0 = _rt_t0()
                     opt.step()
                     batch_rt_other_optimizer_s += _rt_dt(t_step_real_t0)
-                    if batch_dbg:
-                        print(f"[HANG-DBG] optimizer step done in {time.perf_counter() - t_step0:.3f}s", flush=True)
             else:
                 t_step_real_t0 = _rt_t0()
                 opt.step()
                 batch_rt_other_optimizer_s += _rt_dt(t_step_real_t0)
-                if batch_dbg:
-                    print("[HANG-DBG] no graph loss; optimizer step only", flush=True)
 
             total_loss_accum += window_loss
             mae_accum += window_mae
@@ -9326,17 +9122,12 @@ def train_one_epoch_multi_step(
                 xtgt_missing=batch_rt_multires_xtgt_missing,
             )
             iter_wait_anchor_t = time.perf_counter()
-            if batch_dbg:
-                print(
-                    f"[HANG-DBG] batch complete: idx={batch_idx} "
-                    f"wall={batch_wall:.3f}s",
-                    flush=True,
-                )
             continue
 
         # ======================
         # STEP 0 (k=0)
         # ======================
+        abort_window_nonfinite = False
         k = 0
         pred_centers_1, pred_levels_1, pred_parents_1, pred_ei_1, mask_pred_1 = _pred_mesh_for_step_strict(
             k, pred_lists=pred_lists
@@ -9379,6 +9170,16 @@ def train_one_epoch_multi_step(
             dt_ref_scalar=dt_ref_scalar,
         )
 
+        if not _step_outputs_are_finite(
+            loss_t=loss0,
+            pred_abs=y_pred_abs0,
+            tgt_abs=x_tgt_abs0,
+            split="train",
+            batch_idx=batch_idx,
+            step_k=0,
+        ):
+            abort_window_nonfinite = True
+
         # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
         # [STEP-C] DRIFT WATCH (place HERE for step 0, before _run_step)
         if cfg.get("debug", {}).get("drift_watch", False):
@@ -9391,60 +9192,34 @@ def train_one_epoch_multi_step(
             print(f"[DRIFT-C] step_k=0 (pre-run) mean={drift_mean.tolist()} max={drift_max.tolist()}")
         # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
-        # ---- DEBUG: normalization check on real training tensors (prints once) ----
-        if cfg.get("debug", {}).get("print_norm_sanity_once", True) and (not hasattr(train_one_epoch_multi_step, "_printed_norm_sanity")):
-            train_one_epoch_multi_step._printed_norm_sanity = True
+        if not abort_window_nonfinite:
+            window_loss += float(loss0.detach().cpu())
+            window_mae  += float(torch.mean(torch.abs(y_pred_abs0.detach() - x_tgt_abs0)).cpu())
+            n_steps += 1
+            window_loss_graph = loss0 if window_loss_graph is None else (window_loss_graph + loss0)
 
-            print("\n[NORM-SANITY] step0 tensors on pred mesh (k+1)")
-            _tstats("x_in_abs0", x_in_abs0)
-            _tstats("x_tgt_abs0", x_tgt_abs0)
-
-            norm_in0  = _maybe_norm(x_in_abs0,  mu, sigma)
-            norm_tgt0 = _maybe_norm(x_tgt_abs0, mu, sigma)
-
-            _tstats("norm_in0", norm_in0)
-            _tstats("norm_tgt0", norm_tgt0)
-
-            if mu is None or sigma is None:
-                print("[NORM-SANITY] mu/sigma are None (normalization disabled).")
-            else:
-                _tstats("mu", mu)
-                _tstats("sigma", sigma)
-
-                # check how close to 0 mean / unit scale the normalized values look (rough)
-                try:
-                    m = norm_in0.mean(dim=0).detach().cpu()
-                    s = norm_in0.std(dim=0, unbiased=False).detach().cpu()
-                    print("[NORM-SANITY] norm_in0 per-channel mean:", m.numpy())
-                    print("[NORM-SANITY] norm_in0 per-channel std :", s.numpy())
-                except Exception as e:
-                    print("[NORM-SANITY][WARN] couldn't compute per-channel mean/std:", repr(e))
-
-        window_loss += float(loss0.detach().cpu())
-        window_mae  += float(torch.mean(torch.abs(y_pred_abs0.detach() - x_tgt_abs0)).cpu())
-        n_steps += 1
-        window_loss_graph = loss0 if window_loss_graph is None else (window_loss_graph + loss0)
-
-        # chain absolute prediction forward
-        #pred_feats_k = y_pred_abs0
-        #pred_feats_k = _enforce_physical_state(y_pred_abs0, rho_floor=1e-6, E_floor=1e-6)
-        #pred_feats_k = _enforce_physical_state_with_diag(
-        #    y_pred_abs0, tag="rollout_chain", step_k=0, rho_floor=1e-6, E_floor=1e-6
-        #)
-        pred_feats_k = _enforce_physical_state(y_pred_abs0, cfg, rho_floor=1e-6, E_floor=1e-6)
-        _record_step_diagnostics(
-            pred_raw_abs=y_pred_abs0,
-            pred_used_abs=pred_feats_k,
-            gt_abs=x_tgt_abs0,
-            pred_levels=pred_levels_1,
-            pred_centers=pred_centers_1,
-            pred_ei=pred_ei_1,
-        )
+            # chain absolute prediction forward
+            #pred_feats_k = y_pred_abs0
+            #pred_feats_k = _enforce_physical_state(y_pred_abs0, rho_floor=1e-6, E_floor=1e-6)
+            #pred_feats_k = _enforce_physical_state_with_diag(
+            #    y_pred_abs0, tag="rollout_chain", step_k=0, rho_floor=1e-6, E_floor=1e-6
+            #)
+            pred_feats_k = _enforce_physical_state(y_pred_abs0, cfg, rho_floor=1e-6, E_floor=1e-6)
+            _record_step_diagnostics(
+                pred_raw_abs=y_pred_abs0,
+                pred_used_abs=pred_feats_k,
+                gt_abs=x_tgt_abs0,
+                pred_levels=pred_levels_1,
+                pred_centers=pred_centers_1,
+                pred_ei=pred_ei_1,
+            )
 
         # ======================
         # STEPS 1..K-2
         # ======================
         for k in range(1, K - 1):
+            if abort_window_nonfinite:
+                break
             #print(f"\nStep {k}")
             pred_centers_next, pred_levels_next, pred_parents_next, pred_ei_next, mask_pred_next = _pred_mesh_for_step_strict(k, pred_lists=pred_lists)
             pred_ea_next = pred_ea_list[k + 1] if (pred_ea_list is not None) else None
@@ -9490,21 +9265,17 @@ def train_one_epoch_multi_step(
                         xs = x_in_abs[ii].detach().to("cpu")
                         xt = x_in_teacher[ii].detach().to("cpu")
 
-                        # channels assumed [rho, mx, my, E]
-                        print(f"    drift[rho,mx,my,E]={d.tolist()}")
-                        print(f"    roll [rho,mx,my,E]={xs.tolist()}")
-                        print(f"    teach[rho,mx,my,E]={xt.tolist()}")
+                        print(f"    drift={d.tolist()}")
+                        print(f"    roll ={xs.tolist()}")
+                        print(f"    teach={xt.tolist()}")
 
-                        # velocity diagnostic (avoid div0)
-                        rho_r = float(xs[0])
-                        rho_t = float(xt[0])
-                        mx_r, my_r = float(xs[1]), float(xs[2])
-                        mx_t, my_t = float(xt[1]), float(xt[2])
-
-                        urx = mx_r / max(abs(rho_r), 1e-12)
-                        ury = my_r / max(abs(rho_r), 1e-12)
-                        utx = mx_t / max(abs(rho_t), 1e-12)
-                        uty = my_t / max(abs(rho_t), 1e-12)
+                        # velocity diagnostic from the configured state representation
+                        s_roll = dec.state_views(xs.view(1, -1).to(dtype=torch.float32), cfg)
+                        s_teach = dec.state_views(xt.view(1, -1).to(dtype=torch.float32), cfg)
+                        urx = float(s_roll["u"][0].item())
+                        ury = float(s_roll["v"][0].item())
+                        utx = float(s_teach["u"][0].item())
+                        uty = float(s_teach["v"][0].item())
 
                         print(f"    u_roll=[{urx:.3e},{ury:.3e}]  u_teach=[{utx:.3e},{uty:.3e}]")
             # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
@@ -9547,6 +9318,17 @@ def train_one_epoch_multi_step(
                 dt_ref_scalar=dt_ref_scalar,
                 x_ops_abs=(x_in_teacher if (use_ops_teacher and k > 0) else None),
             )
+
+            if not _step_outputs_are_finite(
+                loss_t=loss_k,
+                pred_abs=y_pred_abs_k,
+                tgt_abs=x_tgt_abs,
+                split="train",
+                batch_idx=batch_idx,
+                step_k=k,
+            ):
+                abort_window_nonfinite = True
+                break
 
             window_loss += float(loss_k.detach().cpu())
             window_mae  += float(torch.mean(torch.abs(y_pred_abs_k.detach() - x_tgt_abs)).cpu())
@@ -9628,11 +9410,10 @@ def evaluate_one_epoch_multi_step(
     epoch_idx: int | None = None,
     runtime_mesh_policy: Dict[str, Any] | None = None,
     infer_only: bool = False,
+    ramp_feature_ctx: Dict[str, Any] | None = None,
 ):
 
     model.eval()
-
-    idx_map = None
 
     # ---- dx,dy ----
     if dx is None or dy is None:
@@ -9660,14 +9441,13 @@ def evaluate_one_epoch_multi_step(
     )
 
     loss_cfg = cfg.get("loss", {}) or {}
-    dec_use = bool(loss_cfg.get("dec", False))
-    parc_use = bool(loss_cfg.get("parc", False) or loss_cfg.get("parc_inputs", False))
+    parc_use = _physics_inputs_active_from_loss_cfg(loss_cfg)
     use_adapter = bool(loss_cfg.get("parc_use_adapter", False))
 
     dec_blend_w = float(loss_cfg.get("blend_weight", 0.0))
     dec_resid_w = float(loss_cfg.get("residual_weight", 0.0))
 
-    need_phy = parc_use or (dec_use and (dec_blend_w != 0.0 or dec_resid_w != 0.0))
+    need_phy = bool(parc_use)
 
     backend = str(loss_cfg.get("physics_backend", "dec")).lower()
     use_mls = (backend in ("mls", "moving_least_squares", "moving-least-squares"))
@@ -9676,16 +9456,19 @@ def evaluate_one_epoch_multi_step(
                if use_amp and device.type == "cuda"
                else (lambda: torch.autocast("cpu", enabled=False)))
 
-    runtime_mesh_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
-    runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
+    runtime_mesh_enabled = _runtime_mesh_enabled_from_cfg(cfg)
+    if runtime_mesh_enabled:
+        raise RuntimeError(
+            "Runtime mesh is disabled in Physics-Aware-cartesian. "
+            "Set train.runtime_mesh.enabled=false."
+        )
     runtime_multires_cfg = _runtime_multires_lookup_cfg(cfg)
-    runtime_multires_enabled = bool(runtime_mesh_enabled and runtime_multires_cfg.get("enabled", False))
+    runtime_multires_enabled = False
     runtime_multires_fallback_to_idw = bool(runtime_multires_cfg.get("fallback_to_idw", True))
     runtime_multires_lookup: Optional[_RuntimeMultiResGtLookup] = None
-    runtime_infer_only = bool(infer_only)
-    runtime_update_every = int(runtime_mesh_cfg.get("update_every_steps", 1))
-    runtime_mesh_backend = _runtime_mesh_backend(cfg)
-    runtime_domain_mode = _runtime_mesh_domain_mode(cfg)
+    runtime_infer_only = False
+    runtime_update_every = 1
+    runtime_domain_mode = "disabled"
     runtime_idw_backend = "exact"
     runtime_idw_backend_kwargs: Dict[str, Any] = {}
     runtime_bbox = _get_bbox(cfg)
@@ -9697,118 +9480,6 @@ def evaluate_one_epoch_multi_step(
     runtime_wedge_path = None
     runtime_wedge_constraints = None
     runtime_base_mesh = None
-    if runtime_infer_only and (not runtime_mesh_enabled):
-        print(
-            "[RUNTIME-MESH][WARN] infer_only requested, but runtime_mesh.enabled=false; running full eval mode.",
-            flush=True,
-        )
-        runtime_infer_only = False
-    if runtime_mesh_enabled:
-        mesh_spec_path = cfg.get("mesh", {}).get("starting_mesh_path", None)
-        if not mesh_spec_path:
-            raise RuntimeError("Runtime mesh mode requires cfg['mesh']['starting_mesh_path'].")
-        if runtime_domain_mode == "starting_mesh":
-            runtime_base_mesh = _get_runtime_starting_mesh_base(
-                cfg=cfg,
-                H=H,
-                W=W,
-                dx=float(dx),
-                dy=float(dy),
-                device=device,
-                mesh_spec_path=str(mesh_spec_path),
-            )
-        else:
-            runtime_wedge_path = _load_wedge_path_from_spec(str(mesh_spec_path), cfg)
-            runtime_wedge_constraints = _get_runtime_wedge_constraints(
-                cfg=cfg,
-                H=H,
-                W=W,
-                device=device,
-                wedge_path=runtime_wedge_path,
-            )
-        runtime_idw_backend, runtime_idw_backend_kwargs = _runtime_idw_backend_settings(
-            cfg,
-            out_device=device,
-        )
-        if runtime_mesh_backend == "cnn" and runtime_mesh_policy is None:
-            raise RuntimeError(
-                "Runtime mesh backend is 'cnn' but runtime_mesh_policy was not loaded."
-            )
-        if runtime_multires_enabled:
-            level_files = _resolve_runtime_multires_level_files(runtime_multires_cfg)
-            if not level_files:
-                raise RuntimeError(
-                    "Runtime multires GT lookup is enabled, but no level files were resolved. "
-                    "Set train.runtime_mesh.multires_gt_lookup.level_files "
-                    "or train.runtime_mesh.multires_gt_lookup.directory."
-                )
-            max_level_policy = int(cfg.get("policy", {}).get("max_level", max(level_files.keys())))
-            runtime_multires_lookup = _RuntimeMultiResGtLookup(
-                level_files=level_files,
-                H=H,
-                W=W,
-                bbox=runtime_bbox,
-                refine_ratio=runtime_refine_ratio,
-                max_level=max_level_policy,
-                max_cached_feature_steps=int(runtime_multires_cfg.get("max_cached_feature_steps", 16)),
-            )
-        grad_step0_parent_mode = str(
-            runtime_mesh_cfg.get("gradient_step0_parent_mapping_mode", "from_centers")
-        ).strip().lower()
-        grad_parent_msg = (
-            f", gradient_step0_parent_mapping_mode={grad_step0_parent_mode}"
-            if runtime_mesh_backend in ("gradient", "gradient_fast")
-            else ""
-        )
-        gf_fill_msg = ""
-        if runtime_mesh_backend == "gradient_fast":
-            gf_cfg = runtime_mesh_cfg.get("gradient_fast", {}) or {}
-            gf_fill_msg = (
-                f", gradient_fast.fill_empty_interior={int(bool(gf_cfg.get('fill_empty_interior', True)))}"
-            )
-        print(
-            f"[RUNTIME-MESH] eval loop active (backend={runtime_mesh_backend}, domain_mode={runtime_domain_mode}, "
-            f"idw_backend={runtime_idw_backend}, update_every_steps={runtime_update_every}{grad_parent_msg}{gf_fill_msg}, "
-            f"infer_only={int(runtime_infer_only)})"
-        )
-        if bool(runtime_mesh_plot_settings.get("enabled", False)):
-            print(
-                "[RUNTIME-MESH][PLOT] enabled: "
-                f"out_dir={runtime_mesh_plot_settings.get('out_dir')} "
-                f"split={runtime_mesh_plot_settings.get('split')} "
-                f"every_rebuilds={int(runtime_mesh_plot_settings.get('every_rebuilds', 1))} "
-                f"max_plots={int(runtime_mesh_plot_settings.get('max_plots', 0))} "
-                f"plot_predictor_inputs={int(bool(runtime_mesh_plot_settings.get('plot_predictor_inputs', False)))} "
-                f"predictor_input_max_channels={int(runtime_mesh_plot_settings.get('predictor_input_max_channels', 4))} "
-                f"plot_gt_features={int(bool(runtime_mesh_plot_settings.get('plot_gt_features', False)))} "
-                f"gt_feature_max_channels={int(runtime_mesh_plot_settings.get('gt_feature_max_channels', 4))}",
-                flush=True,
-            )
-        if runtime_multires_enabled:
-            levels_sorted = sorted(runtime_multires_lookup.level_files.keys()) if runtime_multires_lookup is not None else []
-            print(
-                f"[RUNTIME-MESH][MULTIRES] GT lookup enabled: levels={levels_sorted}, "
-                f"fallback_to_idw={int(runtime_multires_fallback_to_idw)}",
-                flush=True,
-            )
-        runtime_mesh_plot_wedge_path = runtime_wedge_path
-        if (
-            bool(runtime_mesh_plot_settings.get("enabled", False))
-            and bool(runtime_mesh_plot_settings.get("show_wedge", True))
-            and (runtime_mesh_plot_wedge_path is None)
-        ):
-            try:
-                runtime_mesh_plot_wedge_path = _load_wedge_path_from_spec(str(mesh_spec_path), cfg)
-            except Exception as e:
-                print(
-                    f"[RUNTIME-MESH][PLOT][WARN] Could not load wedge path for overlay: {e!r}",
-                    flush=True,
-                )
-        if runtime_infer_only:
-            print(
-                "[RUNTIME-MESH] infer_only enabled: skipping GT->pred remap and target-based eval metrics/loss.",
-                flush=True,
-            )
 
     # ---- metric accumulators (weighted by cell area) ----
     step_wsum = []
@@ -9958,12 +9629,8 @@ def evaluate_one_epoch_multi_step(
         pred_levels: [N] levels for pred mesh (for area weights)
         Returns dict of global integrals.
         """
-        nonlocal idx_map
         if x_abs.ndim != 2:
             raise RuntimeError(f"x_abs must be [N,F], got {tuple(x_abs.shape)}")
-        N, Fdim = x_abs.shape
-        if idx_map is None:
-            idx_map = dec.infer_feature_indices(cfg, Fdim)  # expects keys like rho,mx,my,E
 
         # area weights on pred mesh
         w = dec.cell_area_from_levels(
@@ -9972,10 +9639,11 @@ def evaluate_one_epoch_multi_step(
             refine_ratio=_get_refine_ratio(cfg),
         )  # [N]
 
-        rho = x_abs[:, idx_map["rho"]]
-        mx  = x_abs[:, idx_map["mx"]]
-        my  = x_abs[:, idx_map["my"]]
-        E   = x_abs[:, idx_map["E"]]
+        state = dec.state_views(x_abs, cfg)
+        rho = state["rho"]
+        mx = state["mx"]
+        my = state["my"]
+        E = state["E_tot"]
 
         # global integrals over domain (pred mesh)
         out = {
@@ -10034,37 +9702,26 @@ def evaluate_one_epoch_multi_step(
 
             dt_ref_scalar = batch.get("dt_ref", None)
 
-            has_precomp_lists = (
-                (pred_centers_list is not None)
-                and (pred_levels_list is not None)
-                and (pred_parents_list is not None)
-                and (pred_ei_list is not None)
-                and (mask_pred_list is not None)
-                and (feat_t_on_pred_list is not None)
-                and (feat_tp1_on_pred_list is not None)
-            )
+            pred_centers_list = _require_list(batch, "pred_centers_list")
+            pred_levels_list = _require_list(batch, "pred_levels_list")
+            pred_parents_list = _require_list(batch, "pred_parents_list")
+            pred_ei_list = _require_list(batch, "pred_ei_list")
+            mask_pred_list = _require_list(batch, "mask_pred_list")
+            feat_t_on_pred_list = _require_list(batch, "feat_t_on_pred_list")
+            feat_tp1_on_pred_list = _require_list(batch, "feat_tp1_on_pred_list")
 
-            pred_lists = None
-            if (not runtime_mesh_enabled) or has_precomp_lists:
-                pred_centers_list = _require_list(batch, "pred_centers_list")
-                pred_levels_list = _require_list(batch, "pred_levels_list")
-                pred_parents_list = _require_list(batch, "pred_parents_list")
-                pred_ei_list = _require_list(batch, "pred_ei_list")
-                mask_pred_list = _require_list(batch, "mask_pred_list")
-                feat_t_on_pred_list = _require_list(batch, "feat_t_on_pred_list")
-                feat_tp1_on_pred_list = _require_list(batch, "feat_tp1_on_pred_list")
+            if need_phy and pred_ea_list is None:
+                raise RuntimeError(
+                    "PARC/DEC enabled but batch is missing pred_ea_list / pred_edge_attr_list."
+                )
 
-                if (not runtime_mesh_enabled) and need_phy and pred_ea_list is None:
-                    raise RuntimeError(
-                        "PARC/DEC enabled but batch is missing pred_ea_list / pred_edge_attr_list."
-                    )
-
-                pred_lists = (pred_centers_list, pred_levels_list, pred_parents_list, pred_ei_list, mask_pred_list)
+            pred_lists = (pred_centers_list, pred_levels_list, pred_parents_list, pred_ei_list, mask_pred_list)
 
             # helper closure for one step (mirrors train)
             def _run_step_eval(
                 *,
                 step_k: int,
+                step_t_abs: int | None,
                 pred_centers,
                 pred_levels,
                 pred_parents,
@@ -10183,7 +9840,15 @@ def evaluate_one_epoch_multi_step(
                                 r_phy_abs = _sanitize_ops_term(base, cfg)
 
                     # Build node inputs
-                    x_in = _build_X(norm_in, pred_centers, pred_levels, cfg, dt_hat=dt_hat)
+                    x_in = _build_X(
+                        norm_in,
+                        pred_centers,
+                        pred_levels,
+                        cfg,
+                        dt_hat=dt_hat,
+                        ramp_feature_ctx=ramp_feature_ctx,
+                        step_t_abs=step_t_abs,
+                    )
 
                     parc_extra = None
                     if parc_use:
@@ -10340,7 +10005,15 @@ def evaluate_one_epoch_multi_step(
                                             base_stage = base_stage + adv_w_stage * r_adv_stage
                                         r_phy_stage = _sanitize_ops_term(base_stage, cfg)
 
-                            x_stage_in = _build_X(norm_state, pred_centers, pred_levels, cfg, dt_hat=dt_hat)
+                            x_stage_in = _build_X(
+                                norm_state,
+                                pred_centers,
+                                pred_levels,
+                                cfg,
+                                dt_hat=dt_hat,
+                                ramp_feature_ctx=ramp_feature_ctx,
+                                step_t_abs=step_t_abs,
+                            )
                             if parc_use and ((r_adv_stage is not None) or (r_diff_stage is not None)):
                                 ref_stage = r_diff_stage if (r_diff_stage is not None) else r_adv_stage
                                 r_adv_in_stage = r_adv_stage if (r_adv_stage is not None) else torch.zeros_like(ref_stage)
@@ -10772,10 +10445,18 @@ def evaluate_one_epoch_multi_step(
                                 t_xtgt_map_s = time.perf_counter() - t_xtgt_t0
 
                     dtk = dtk.to(device=device, dtype=x_in_abs.dtype)
+                    step_t_abs_eval = None
+                    if t_indices is not None:
+                        step_t_abs_eval = (
+                            int(t_indices[k + 1].item())
+                            if torch.is_tensor(t_indices)
+                            else int(t_indices[k + 1])
+                        )
 
                     t_model_t0 = time.perf_counter()
                     loss_k, y_pred_abs_k = _run_step_eval(
                         step_k=k,
+                        step_t_abs=step_t_abs_eval,
                         pred_centers=active_pred_centers,
                         pred_levels=active_pred_levels,
                         pred_parents=active_pred_parents,
@@ -10786,6 +10467,16 @@ def evaluate_one_epoch_multi_step(
                         dt_phys=dtk,
                     )
                     t_model_s = time.perf_counter() - t_model_t0
+
+                    if not _step_outputs_are_finite(
+                        loss_t=loss_k,
+                        pred_abs=y_pred_abs_k,
+                        tgt_abs=x_tgt_abs,
+                        split="eval",
+                        batch_idx=batch_idx,
+                        step_k=k,
+                    ):
+                        continue
 
                     total_loss_accum += float(loss_k.detach().cpu())
                     n_steps_total += 1
@@ -10951,9 +10642,17 @@ def evaluate_one_epoch_multi_step(
 
             dt0 = dt_list[0]
             dt0 = dt0.to(device=device, dtype=x_in_abs0.dtype) if torch.is_tensor(dt0) else torch.tensor(float(dt0), device=device, dtype=x_in_abs0.dtype)
+            step0_t_abs = None
+            if t_indices is not None:
+                step0_t_abs = (
+                    int(t_indices[1].item())
+                    if torch.is_tensor(t_indices)
+                    else int(t_indices[1])
+                )
 
             loss0, y_pred_abs0 = _run_step_eval(
                 step_k=0,
+                step_t_abs=step0_t_abs,
                 pred_centers=pred_centers_1,
                 pred_levels=pred_levels_1,
                 pred_parents=pred_parents_1,
@@ -10963,6 +10662,16 @@ def evaluate_one_epoch_multi_step(
                 x_tgt_abs=x_tgt_abs0,
                 dt_phys=dt0,
             )
+
+            if not _step_outputs_are_finite(
+                loss_t=loss0,
+                pred_abs=y_pred_abs0,
+                tgt_abs=x_tgt_abs0,
+                split="eval",
+                batch_idx=batch_idx,
+                step_k=0,
+            ):
+                continue
 
             total_loss_accum += float(loss0.detach().cpu())
             n_steps_total += 1
@@ -11050,9 +10759,17 @@ def evaluate_one_epoch_multi_step(
 
                 dtk = dt_list[k]
                 dtk = dtk.to(device=device, dtype=x_in_abs.dtype) if torch.is_tensor(dtk) else torch.tensor(float(dtk), device=device, dtype=x_in_abs.dtype)
+                stepk_t_abs = None
+                if t_indices is not None:
+                    stepk_t_abs = (
+                        int(t_indices[k + 1].item())
+                        if torch.is_tensor(t_indices)
+                        else int(t_indices[k + 1])
+                    )
 
                 loss_k, y_pred_abs_k = _run_step_eval(
                     step_k=k,
+                    step_t_abs=stepk_t_abs,
                     pred_centers=pred_centers_next,
                     pred_levels=pred_levels_next,
                     pred_parents=pred_parents_next,
@@ -11062,6 +10779,16 @@ def evaluate_one_epoch_multi_step(
                     x_tgt_abs=x_tgt_abs,
                     dt_phys=dtk,
                 )
+
+                if not _step_outputs_are_finite(
+                    loss_t=loss_k,
+                    pred_abs=y_pred_abs_k,
+                    tgt_abs=x_tgt_abs,
+                    split="eval",
+                    batch_idx=batch_idx,
+                    step_k=k,
+                ):
+                    continue
 
                 total_loss_accum += float(loss_k.detach().cpu())
                 n_steps_total += 1
@@ -11227,36 +10954,31 @@ def evaluate_one_epoch_multi_step(
         runtime_multires_lookup = None
     return avg_loss, stats
 
-def parent_mask_from_selected(pred_parents: torch.Tensor,
-                              pred_levels: torch.Tensor,
-                              H: int, W: int,
-                              min_level: int = 1) -> torch.Tensor:
-    """
-    Returns an (H, W) bool mask over the coarse-parent grid.
-    A parent cell is marked True if ANY selected node with level >= min_level
-    belongs to that parent.
-    """
-    device = pred_parents.device
-    m = torch.zeros(H * W, dtype=torch.bool, device=device)
-    sel = (pred_levels >= min_level)
-    if sel.any():
-        p = pred_parents[sel].long().clamp_(0, H*W - 1)
-        m[p] = True
-    return m.view(H, W)
-
-
 def build_model_from_cfg(cfg, device):
-    use_cols = cfg.get("features", {}).get("use_columns", [0, 1, 2, 3])
-    Fdim = int(cfg.get("features", {}).get("num_features", len(use_cols)))
+    feats_cfg = cfg.get("features", {}) or {}
+    use_cols = feats_cfg.get("use_columns", None)
+    if isinstance(use_cols, (list, tuple)) and len(use_cols) > 0:
+        use_cols = list(use_cols)
+    else:
+        names = feats_cfg.get("names", None)
+        if isinstance(names, (list, tuple)) and len(names) > 0:
+            use_cols = list(range(len(names)))
+        else:
+            use_cols = [0, 1, 2, 3, 4]
+    Fdim = int(feats_cfg.get("num_features", len(use_cols)))
     model_cfg = cfg.get("model", {}) or {}
 
     b = cfg.get("features", {}).get("build", {})
     in_ch = Fdim + (2 if b.get("use_pos", True) else 0) + (1 if b.get("use_level", True) else 0)
     if bool(b.get("use_dt_hat_fixed", False)):
         in_ch += 1
+    if bool(b.get("include_ramp_angle", False)):
+        in_ch += 1
+    if bool(b.get("include_signed_distance_to_ramp", False)):
+        in_ch += 1
 
     loss = cfg.get("loss", {}) or {}
-    parc_on = bool(loss.get("parc", False) or loss.get("parc_inputs", False))
+    parc_on = _physics_inputs_active_from_loss_cfg(loss)
     if parc_on:
         in_ch += dec.parc_extra_in_channels(cfg, Fdim)
 
@@ -11357,32 +11079,20 @@ def main(
         cfg.setdefault("train", {})["save_dir"] = out_dir_abs
         print(f"[CLI] Overriding train.save_dir -> {out_dir_abs}")
 
-    # Canonical level settings:
-    # - policy.max_level controls AMR mask hierarchy / clipping depth.
-    # - data.L_max is kept in sync when missing.
-    # - eval.fine_L is auto-derived from policy.max_level (no separate tuning).
+    # Cartesian project contract:
+    # - fixed uniform mesh (no AMR hierarchy)
+    # - level depth is forced to zero regardless of config defaults
     data_cfg = cfg.setdefault("data", {})
     policy_cfg = cfg.setdefault("policy", {})
     eval_cfg = cfg.setdefault("eval", {})
     features_cfg = cfg.setdefault("features", {})
     norm_cfg = features_cfg.setdefault("normalization", {})
-
-    if "max_level" not in policy_cfg:
-        policy_cfg["max_level"] = int(data_cfg.get("L_max", 3))
-    if "L_max" not in data_cfg:
-        data_cfg["L_max"] = int(policy_cfg.get("max_level", 3))
-
-    lmax_policy = int(policy_cfg.get("max_level", 3))
-    lmax_data = int(data_cfg.get("L_max", lmax_policy))
-    if lmax_policy != lmax_data:
-        print(
-            f"[CFG][WARN] policy.max_level ({lmax_policy}) != data.L_max ({lmax_data}). "
-            "Using policy.max_level for AMR operations.",
-            flush=True,
-        )
-    eval_cfg["fine_L"] = int(lmax_policy)
+    data_cfg["L_max"] = 0
+    policy_cfg["max_level"] = 0
+    policy_cfg["starting_refine_to_level"] = 0
+    eval_cfg["fine_L"] = 0
     print(
-        f"[CFG] effective levels: policy.max_level={lmax_policy}, data.L_max={lmax_data}, eval.fine_L={int(eval_cfg['fine_L'])}",
+        "[CFG] fixed-mesh contract active: data.L_max=0, policy.max_level=0, eval.fine_L=0",
         flush=True,
     )
 
@@ -11394,14 +11104,34 @@ def main(
     norm_cfg["momentum_sigma_mode"] = momentum_sigma_mode
     print(f"[NORM-CFG] momentum_sigma_mode={momentum_sigma_mode}")
 
-    idx = dec.infer_feature_indices(cfg, 4)
-    print("[IDX]", idx)
-    assert idx["rho"] == 0 and idx["mx"] == 1 and idx["my"] == 2 and idx["E"] == 3
+    # Feature-builder defaults
+    features_cfg = cfg.setdefault("features", {})
+    build_cfg = features_cfg.setdefault("build", {})
+    if not isinstance(build_cfg, dict):
+        raise ValueError("features.build must be a JSON object when provided.")
+    build_cfg.setdefault("use_pos", True)
+    # Cartesian project contract: no AMR-level feature channel.
+    build_cfg["use_level"] = False
+    build_cfg.setdefault("use_dt_hat_fixed", False)
+    # Optional geometry channels (default-off to preserve current behavior)
+    build_cfg.setdefault("include_ramp_angle", False)
+    build_cfg.setdefault("ramp_angle_deg", None)
+    build_cfg.setdefault("ramp_angle_units", "radians")
+    build_cfg.setdefault("include_signed_distance_to_ramp", False)
+    build_cfg.setdefault("signed_distance_low_y_quantile", 0.12)
+    build_cfg.setdefault("signed_distance_min_points", 32)
+    build_cfg.setdefault("signed_distance_normalize", True)
+
+    use_cols_cfg = features_cfg.get("use_columns", None)
+    if isinstance(use_cols_cfg, (list, tuple)) and len(use_cols_cfg) > 0:
+        f_guess = int(len(use_cols_cfg))
+    else:
+        f_guess = int(features_cfg.get("num_features", 4))
+    idx = dec.infer_feature_indices(cfg, f_guess)
+    rep = dec.state_representation_from_cfg(cfg, f_guess)
+    print(f"[IDX] rep={rep} map={idx}")
 
     loss = cfg.setdefault("loss", {})
-
-    # Do NOT force dec on by default unless you really mean it.
-    loss.setdefault("dec", False)
 
     loss.setdefault("mode", "diffusion")           # "diffusion" | "advection" | "advdiff"
     loss.setdefault("blend_weight", 0.0)
@@ -11411,20 +11141,48 @@ def main(
     loss.setdefault("advection_scheme", "upwind")
     loss.setdefault("rho_eps", 1e-8)
 
-    loss.setdefault("parc", False)                 # enable PARC operator inputs + Variant-B baseline behavior
+    # Physics-input controls (authoritative):
+    #   - physics_inputs_enabled: master on/off for physics-derived GNN input channels
+    #   - physics_backend: operator backend used when physics inputs are enabled
+    loss.setdefault("physics_inputs_enabled", True)
+    loss.setdefault("physics_backend", "dec")
     loss.setdefault("parc_input_form", "rate")     # "rate" (dt_ref*r/sigma) or "delta" (dt*r/sigma)
     loss.setdefault("parc_include_adv", True)
     loss.setdefault("parc_include_diff", True)
     loss.setdefault("parc_input_weighted", False)  # usually False
     loss.setdefault("parc_detach_inputs", True)
 
-    # If PARC is enabled, recommend:
-    # - ensure DEC geometry exists
-    # - apply baseline by default
-    if bool(loss.get("parc", False)):
-        loss["dec"] = True
-        loss.setdefault("blend_weight", 1.0)       # Variant-B baseline strength (1.0 recommended)
-        loss.setdefault("channels", ["rho", "x_momentum", "y_momentum", "E"])  # default physics channels
+    if rep == "primitive_uvrhope":
+        loss.setdefault("channels", ["U", "V", "RHO", "P", "E"])
+        loss.setdefault("adv_channels", ["U", "V", "RHO", "P", "E"])
+        loss.setdefault("diff_channels", ["RHO", "P", "E"])
+    else:
+        loss.setdefault("channels", ["rho", "x_momentum", "y_momentum", "E"])
+
+    backend_mode = str(loss.get("physics_backend", "dec")).strip().lower()
+    backend_alias = {
+        "dec": "dec",
+        "mls": "mls",
+        "moving_least_squares": "mls",
+        "moving-least-squares": "mls",
+    }
+    if backend_mode not in backend_alias:
+        raise ValueError(
+            "loss.physics_backend must be one of {dec, mls, moving_least_squares, moving-least-squares}. "
+            f"Got: {loss.get('physics_backend')!r}"
+        )
+    loss["physics_backend"] = backend_alias[backend_mode]
+
+    if (not _physics_inputs_active_from_loss_cfg(loss)) and (
+        float(loss.get("blend_weight", 0.0)) != 0.0 or float(loss.get("residual_weight", 0.0)) != 0.0
+    ):
+        print(
+            "[PHYSICS-CFG][WARN] physics_inputs_enabled=false disables physics operators; "
+            "forcing blend_weight=0 and residual_weight=0.",
+            flush=True,
+        )
+        loss["blend_weight"] = 0.0
+        loss["residual_weight"] = 0.0
 
     mode = str(loss.get("mode", "diffusion")).lower()
 
@@ -11443,7 +11201,8 @@ def main(
         loss.setdefault("adv_weight", 0.0)
         loss.setdefault("diff_weight", 1.0)
 
-    print("[DEC-CFG] dec=", loss.get("dec"),
+    print("[PHYSICS-CFG] backend=", loss.get("physics_backend"),
+      "inputs_enabled=", int(_physics_inputs_active_from_loss_cfg(loss)),
       "mode=", loss.get("mode"),
       "adv_w=", loss.get("adv_weight"),
       "diff_w=", loss.get("diff_weight"),
@@ -11451,6 +11210,15 @@ def main(
       "resid_w=", loss.get("residual_weight"),
       "blend_w=", loss.get("blend_weight"),
       "channels=", loss.get("channels"))
+    print(
+        "[PHYSICS-INPUTS]",
+        "enabled=",
+        int(_physics_inputs_active_from_loss_cfg(loss)),
+        "include_adv=",
+        int(bool(loss.get("parc_include_adv", True))),
+        "include_diff=",
+        int(bool(loss.get("parc_include_diff", True))),
+    )
 
     # Speed defaults (non‑breaking):
     cfg.setdefault("speed", {}).setdefault("amp", True)
@@ -11461,96 +11229,19 @@ def main(
     train_cfg = cfg.setdefault("train", {})
     train_cfg.setdefault("validation_every_epochs", 1)
     train_cfg.setdefault("checkpoint_every_epochs", 1)
-    train_cfg.setdefault("mesh_mode", "predicted")
-
-    mesh_mode = str(train_cfg.get("mesh_mode", "predicted")).strip().lower()
-    if mesh_mode not in ("predicted", "uniform"):
-        raise ValueError(
-            f"train.mesh_mode must be 'predicted' or 'uniform', got '{mesh_mode}'"
-        )
+    train_cfg.setdefault("mesh_mode", "uniform")
+    train_cfg.setdefault("use_precompute", False)
+    mesh_mode = str(train_cfg.get("mesh_mode", "uniform")).strip().lower()
     train_cfg["mesh_mode"] = mesh_mode
 
-    # Runtime mesh defaults (infrastructure only in this commit)
-    runtime_mesh_cfg = train_cfg.setdefault("runtime_mesh", {})
-    runtime_mesh_cfg.setdefault("enabled", False)
-    runtime_mesh_cfg.setdefault("detach_policy_input", True)
-    runtime_mesh_cfg.setdefault("reset_to_coarse_each_step", True)
-    runtime_mesh_cfg.setdefault("refine_only", True)
-    runtime_mesh_cfg.setdefault("warm_start_from_precompute", True)
-    runtime_mesh_cfg.setdefault("update_every_steps", 1)
-    runtime_mesh_cfg.setdefault("max_cells_per_step", 400_000)
-    runtime_mesh_cfg.setdefault("policy_backend", "gradient")
-    runtime_mesh_cfg.setdefault("gradient_step0_parent_mapping_mode", "from_centers")
-    runtime_mesh_cfg.setdefault("domain_mode", "wedge_lookup")
-    runtime_mesh_cfg.setdefault("wedge_clip_use_lookup", True)
-    runtime_mesh_cfg.setdefault("wedge_clip_lookup_fallback", False)
-    runtime_mesh_idw_cfg = runtime_mesh_cfg.setdefault("idw", {})
-    if not isinstance(runtime_mesh_idw_cfg, dict):
-        raise ValueError("train.runtime_mesh.idw must be a JSON object when provided.")
-    runtime_mesh_idw_cfg.setdefault("backend", "exact")
-    runtime_mesh_idw_cfg.setdefault("faiss_nlist", 256)
-    runtime_mesh_idw_cfg.setdefault("faiss_nprobe", 16)
-    runtime_mesh_idw_cfg.setdefault("faiss_cache", True)
-    runtime_mesh_idw_cfg.setdefault("faiss_cache_max_entries", 4)
-    runtime_mesh_idw_cfg.setdefault("allow_fallback_to_exact", True)
-    runtime_multires_cfg = runtime_mesh_cfg.setdefault("multires_gt_lookup", {})
-    if isinstance(runtime_multires_cfg, bool):
-        runtime_multires_cfg = {"enabled": bool(runtime_multires_cfg)}
-        runtime_mesh_cfg["multires_gt_lookup"] = runtime_multires_cfg
-    if not isinstance(runtime_multires_cfg, dict):
-        raise ValueError("train.runtime_mesh.multires_gt_lookup must be a bool or JSON object.")
-    runtime_multires_cfg.setdefault("enabled", False)
-    runtime_multires_cfg.setdefault("directory", "")
-    runtime_multires_cfg.setdefault("level_files", {})
-    runtime_multires_cfg.setdefault("fallback_to_idw", True)
-    runtime_multires_cfg.setdefault("max_cached_feature_steps", 16)
-    if runtime_multires_cfg["level_files"] and (not isinstance(runtime_multires_cfg["level_files"], dict)):
-        raise ValueError("train.runtime_mesh.multires_gt_lookup.level_files must be a JSON object.")
-    runtime_mesh_gf_cfg = runtime_mesh_cfg.setdefault("gradient_fast", {})
-    if not isinstance(runtime_mesh_gf_cfg, dict):
-        raise ValueError("train.runtime_mesh.gradient_fast must be a JSON object when provided.")
-    runtime_mesh_gf_cfg.setdefault("fill_empty_interior", True)
-    runtime_mesh_gf_cfg.setdefault("fill_empty_chunk", 1024)
-    runtime_mesh_cnn_cfg = runtime_mesh_cfg.setdefault("cnn", {})
-    if not isinstance(runtime_mesh_cnn_cfg, dict):
-        raise ValueError("train.runtime_mesh.cnn must be a JSON object when provided.")
-    runtime_mesh_cnn_cfg.setdefault("checkpoint_path", "")
-    runtime_mesh_cnn_cfg.setdefault("include_parent_mask", True)
-    runtime_mesh_cnn_cfg.setdefault("include_coords", True)
-    runtime_mesh_cnn_cfg.setdefault("include_dt", False)
-    runtime_mesh_cnn_cfg.setdefault("include_gradients", False)
-    runtime_mesh_cnn_cfg.setdefault("feature_norm_mode", "auto")
-    runtime_mesh_cnn_cfg.setdefault("feature_norm_stats", {})
-    runtime_mesh_cnn_cfg.setdefault("gradient_feature_indices", {})
-    runtime_mesh_cnn_cfg.setdefault("gradient_norm_mode", "auto")
-    runtime_mesh_cnn_cfg.setdefault("gradient_norm_stats", {})
-    runtime_mesh_cnn_cfg.setdefault("dt_channel_mode", "dt_hat")
-    runtime_mesh_cnn_cfg.setdefault("threshold_default", 0.5)
-    runtime_mesh_cnn_cfg.setdefault("threshold_by_level", {})
-    runtime_mesh_cnn_cfg.setdefault("use_saved_thresholds", False)
-    runtime_mesh_cnn_cfg.setdefault("device", "same")
-    step_log_cfg = runtime_mesh_cfg.setdefault("step_log", {})
-    if not isinstance(step_log_cfg, dict):
-        raise ValueError("train.runtime_mesh.step_log must be a JSON object when provided.")
-    step_log_cfg.setdefault("enabled", False)
-    step_log_cfg.setdefault("path", os.path.join(cfg.get("train", {}).get("save_dir", "."), "runtime_step_log.csv"))
-    step_log_cfg.setdefault("append", False)
-    mesh_plot_cfg = runtime_mesh_cfg.setdefault("mesh_plot", {})
-    if not isinstance(mesh_plot_cfg, dict):
-        raise ValueError("train.runtime_mesh.mesh_plot must be a JSON object when provided.")
-    mesh_plot_cfg.setdefault("enabled", False)
-    mesh_plot_cfg.setdefault("out_dir", os.path.join(cfg.get("train", {}).get("save_dir", "."), "runtime_mesh_plots"))
-    mesh_plot_cfg.setdefault("split", "train")
-    mesh_plot_cfg.setdefault("every_rebuilds", 1)
-    mesh_plot_cfg.setdefault("max_plots", 20)
-    mesh_plot_cfg.setdefault("dpi", 180)
-    mesh_plot_cfg.setdefault("line_width", 0.2)
-    mesh_plot_cfg.setdefault("show_wedge", True)
-    mesh_plot_cfg.setdefault("plot_predictor_inputs", False)
-    mesh_plot_cfg.setdefault("predictor_input_max_channels", 4)
-    mesh_plot_cfg.setdefault("plot_gt_features", False)
-    mesh_plot_cfg.setdefault("gt_feature_max_channels", 4)
-    mesh_plot_cfg.setdefault("gt_feature_indices", [])
+    # Runtime mesh is intentionally disabled in this Cartesian project.
+    runtime_mesh_cfg = train_cfg.get("runtime_mesh", {})
+    if isinstance(runtime_mesh_cfg, bool):
+        runtime_mesh_cfg = {"enabled": bool(runtime_mesh_cfg)}
+    if not isinstance(runtime_mesh_cfg, dict):
+        raise ValueError("train.runtime_mesh must be a JSON object or bool when provided.")
+    runtime_mesh_cfg["enabled"] = False
+    train_cfg["runtime_mesh"] = runtime_mesh_cfg
     chunk_cfg = cfg.setdefault("chunk", {})
     if not isinstance(chunk_cfg, dict):
         raise ValueError("chunk must be a JSON object when provided.")
@@ -11578,70 +11269,8 @@ def main(
     debug_cfg.setdefault("sync_runtime_timing", False)
     diag_cfg_main = _resolve_diagnostics_cfg(cfg)
 
-    runtime_mesh_enabled = bool(runtime_mesh_cfg.get("enabled", False))
-    runtime_update_every = int(runtime_mesh_cfg.get("update_every_steps", 1))
-    if runtime_update_every < 1:
-        raise ValueError("train.runtime_mesh.update_every_steps must be >= 1.")
-    _runtime_mesh_plot_settings(cfg)
-
-    if runtime_mesh_enabled:
-        runtime_backend = _runtime_mesh_backend(cfg)
-        runtime_domain_mode = _runtime_mesh_domain_mode(cfg)
-        if runtime_backend in ("gradient", "gradient_fast"):
-            grad_parent_mode = str(
-                runtime_mesh_cfg.get("gradient_step0_parent_mapping_mode", "from_centers")
-            ).strip().lower()
-            if grad_parent_mode in ("dataset", "legacy", "from_dataset"):
-                grad_parent_mode = "dataset"
-            elif grad_parent_mode in ("from_centers", "centers", "runtime_like", "coarse_from_centers"):
-                grad_parent_mode = "from_centers"
-            else:
-                raise ValueError(
-                    "train.runtime_mesh.gradient_step0_parent_mapping_mode must be "
-                    f"'dataset' or 'from_centers', got {grad_parent_mode!r}"
-                )
-            cfg["train"]["runtime_mesh"]["gradient_step0_parent_mapping_mode"] = grad_parent_mode
-        if not bool(runtime_mesh_cfg.get("reset_to_coarse_each_step", True)):
-            raise RuntimeError(
-                "Runtime mesh mode requires reset_to_coarse_each_step=true "
-                "(interpreted as reset-to-starting-mesh when domain_mode='starting_mesh')."
-            )
-        if not bool(runtime_mesh_cfg.get("refine_only", True)):
-            raise RuntimeError("Runtime mesh mode requires refine_only=true for this workflow.")
-        if runtime_domain_mode == "wedge_lookup":
-            if not bool(runtime_mesh_cfg.get("wedge_clip_use_lookup", True)):
-                raise RuntimeError(
-                    "Runtime mesh mode requires train.runtime_mesh.wedge_clip_use_lookup=true "
-                    "(lookup-only wedge clipping)."
-                )
-            if bool(runtime_mesh_cfg.get("wedge_clip_lookup_fallback", False)):
-                raise RuntimeError(
-                    "Runtime mesh mode requires train.runtime_mesh.wedge_clip_lookup_fallback=false "
-                    "(no fallback path)."
-                )
-        if runtime_backend == "cnn":
-            ckpt_raw = runtime_mesh_cnn_cfg.get("checkpoint_path", "")
-            ckpt_path = os.path.abspath(os.path.expanduser(str(ckpt_raw))) if ckpt_raw else ""
-            if not ckpt_path:
-                raise RuntimeError(
-                    "Runtime mesh backend 'cnn' requires train.runtime_mesh.cnn.checkpoint_path."
-                )
-            if not os.path.exists(ckpt_path):
-                raise FileNotFoundError(f"Runtime mesh CNN checkpoint not found: {ckpt_path}")
-            cfg["train"]["runtime_mesh"]["cnn"]["checkpoint_path"] = ckpt_path
-
-        mesh_path_cfg = cfg.get("mesh", {}).get("starting_mesh_path", None)
-        if not mesh_path_cfg:
-            raise RuntimeError(
-                "Runtime mesh mode requires cfg['mesh']['starting_mesh_path'] to point to wedge_mesh_spec.pt."
-            )
-        mesh_path = os.path.abspath(os.path.expanduser(str(mesh_path_cfg)))
-        if not os.path.exists(mesh_path):
-            raise FileNotFoundError(f"Runtime mesh mode expected mesh spec at: {mesh_path}")
-        cfg.setdefault("mesh", {})["starting_mesh_path"] = mesh_path
-        if bool(step_log_cfg.get("enabled", False)):
-            _enabled, step_log_path, _append = _runtime_step_log_settings(cfg)
-            print(f"[RUNTIME-MESH] step log enabled: {step_log_path}")
+    _enforce_cartesian_project_contract(cfg)
+    runtime_mesh_enabled = _runtime_mesh_enabled_from_cfg(cfg)
 
     # Ensure dataset sees the intended columns
     if cfg.get("data", {}).get("feature_idx") and not cfg.get("features", {}).get("use_columns"):
@@ -11659,30 +11288,185 @@ def main(
     dy = (ymax - ymin) / H
 
     runtime_mesh_policy = None
-    if runtime_mesh_enabled:
-        runtime_mesh_policy = _load_runtime_mesh_policy_from_cfg(
-            cfg,
-            device=device,
-            H=H,
-            W=W,
+
+    # -------- dataset sources --------
+    pt_paths = _resolve_pt_path_list(cfg)
+    cfg.setdefault("data", {})["pt_paths"] = pt_paths
+    if len(pt_paths) == 1:
+        cfg["data"]["pt_path"] = pt_paths[0]
+    else:
+        cfg["data"]["pt_path"] = pt_paths
+
+    mesh_spec_root_cfg = cfg.get("mesh", {}).get("starting_mesh_path", None)
+    mesh_spec_root_abs = (
+        os.path.abspath(os.path.expanduser(str(mesh_spec_root_cfg)))
+        if mesh_spec_root_cfg is not None
+        else None
+    )
+
+    source_records: List[Dict[str, Any]] = []
+    data_list: List[Any] = []
+    step_source_ids: List[int] = []
+    step_mesh_spec_paths: List[str | None] = []
+
+    for sid, p_in in enumerate(pt_paths):
+        p_abs, seq = _load_series_from_pt_path(p_in)
+        mesh_spec_for_src = _resolve_mesh_spec_path_for_input(
+            mesh_spec_root_abs,
+            input_pt_path=p_abs,
+        ) if (mesh_spec_root_abs is not None) else None
+
+        angle_src = _extract_angle_from_data_obj(seq)
+        if angle_src is None:
+            angle_src = _extract_angle_from_path(p_abs)
+        if angle_src is None and mesh_spec_for_src is not None:
+            angle_src = _extract_angle_from_path(mesh_spec_for_src)
+        pressure_src = _extract_pressure_from_path(p_abs)
+
+        source_records.append(
+            {
+                "source_id": int(sid),
+                "pt_path": p_abs,
+                "series": seq,
+                "mesh_spec_path": mesh_spec_for_src,
+                "angle_deg": angle_src,
+                "pressure": pressure_src,
+            }
         )
 
-    # -------- dataset & loaders --------
-    pt_path = cfg["data"]["pt_path"]
-    if pt_path.endswith(".zip"):
-        with zipfile.ZipFile(pt_path, "r") as zf:
-            member = next(m for m in zf.namelist() if m.endswith(".pt") or m.endswith(".pth"))
-            with zf.open(member, "r") as fh:
-                buf = io.BytesIO(fh.read())
-        data_list = torch.load(buf)
-    else:
-        data_list = torch.load(pt_path)
+        data_list.extend(seq)
+        step_source_ids.extend([int(sid)] * len(seq))
+        step_mesh_spec_paths.extend([mesh_spec_for_src] * len(seq))
+
+    if len(data_list) < 2:
+        raise RuntimeError("Need at least 2 snapshots total across input files.")
+
+    from_h5_inputs = any(str(p).lower().endswith((".h5", ".hdf5")) for p in pt_paths)
+    if from_h5_inputs and isinstance(data_list[0], dict):
+        first_snap = data_list[0]
+
+        # Auto-wire channel names for primitive-state semantics.
+        ch_names = first_snap.get("channel_names", None)
+        if isinstance(ch_names, (list, tuple)) and len(ch_names) > 0:
+            cfg.setdefault("features", {})["names"] = [str(v) for v in ch_names]
+            if not cfg.get("features", {}).get("use_columns"):
+                cfg["features"]["use_columns"] = list(range(len(ch_names)))
+            cfg["features"]["num_features"] = int(len(ch_names))
+            print(f"[DATA] HDF5 channels -> features.names: {cfg['features']['names']}")
+
+        # Auto-sync H/W with the file payload when present.
+        h_file = first_snap.get("H", None)
+        w_file = first_snap.get("W", None)
+        if h_file is not None and w_file is not None:
+            h_file = int(h_file); w_file = int(w_file)
+            if h_file != H or w_file != W:
+                print(
+                    f"[DATA][WARN] Overriding cfg data.H/W ({H},{W}) with HDF5 payload ({h_file},{w_file})."
+                )
+            H, W = h_file, w_file
+            cfg.setdefault("data", {})["H"] = int(H)
+            cfg.setdefault("data", {})["W"] = int(W)
+
+        # Auto-sync bbox from xy/pos payload.
+        pos0 = first_snap.get("pos", None)
+        if torch.is_tensor(pos0) and pos0.ndim == 2 and pos0.size(1) >= 2 and pos0.numel() > 0:
+            pos0_cpu = pos0.detach().to(device="cpu", dtype=torch.float64)
+            xb0 = float(pos0_cpu[:, 0].min().item())
+            xb1 = float(pos0_cpu[:, 0].max().item())
+            yb0 = float(pos0_cpu[:, 1].min().item())
+            yb1 = float(pos0_cpu[:, 1].max().item())
+            cfg.setdefault("data", {})["bbox"] = [xb0, xb1, yb0, yb1]
+            xmin, xmax, ymin, ymax = xb0, xb1, yb0, yb1
+            dx = (xmax - xmin) / float(W)
+            dy = (ymax - ymin) / float(H)
+            print(f"[DATA] HDF5 bbox -> data.bbox=[{xb0:.6g}, {xb1:.6g}, {yb0:.6g}, {yb1:.6g}]")
+
+    if len(source_records) > 1:
+        print(f"[DATA] Loaded {len(source_records)} input simulation files (total snapshots={len(data_list)}).")
+    for rec in source_records:
+        print(
+            f"[DATA] source_id={rec['source_id']} snapshots={len(rec['series'])} "
+            f"pt={rec['pt_path']} mesh_spec={rec['mesh_spec_path']}"
+        )
+
+    unique_mesh_specs = sorted({p for p in step_mesh_spec_paths if p})
+    if len(unique_mesh_specs) == 1:
+        cfg.setdefault("mesh", {})["starting_mesh_path"] = unique_mesh_specs[0]
+    if (mesh_mode == "uniform") and (len(unique_mesh_specs) > 1):
+        raise RuntimeError(
+            "train.mesh_mode='uniform' with multiple input files currently requires one shared mesh spec file. "
+            f"Resolved multiple specs: {unique_mesh_specs}"
+        )
+
+    if runtime_mesh_enabled:
+        raise RuntimeError("Internal error: runtime mesh must remain disabled in Cartesian mode.")
+
+    ramp_feature_ctx = _build_ramp_feature_context(
+        cfg,
+        data_obj=data_list,
+        pt_path=source_records[0]["pt_path"],
+        mesh_spec_path=(
+            unique_mesh_specs[0]
+            if len(unique_mesh_specs) == 1
+            else mesh_spec_root_abs
+        ),
+    )
+
+    include_ramp_angle = bool(ramp_feature_ctx.get("include_ramp_angle", False))
+    include_signed_dist = bool(ramp_feature_ctx.get("include_signed_distance_to_ramp", False))
+    if len(source_records) > 1 and (include_ramp_angle or include_signed_dist):
+        angle_by_source: Dict[int, float] = {}
+        dist_by_source: Dict[int, Dict[str, Any]] = {}
+        angle_units = str(ramp_feature_ctx.get("angle_units", "radians")).lower()
+        for rec in source_records:
+            sid = int(rec["source_id"])
+            ctx_i = _build_ramp_feature_context(
+                cfg,
+                data_obj=rec["series"],
+                pt_path=rec["pt_path"],
+                mesh_spec_path=rec["mesh_spec_path"],
+            )
+            if include_ramp_angle:
+                aval = ctx_i.get("angle_feature_value", None)
+                if aval is None:
+                    raise RuntimeError(
+                        f"Could not build per-source ramp angle feature for source_id={sid} ({rec['pt_path']})."
+                    )
+                angle_by_source[sid] = float(aval)
+            if include_signed_dist:
+                p0 = ctx_i.get("distance_point", None)
+                n = ctx_i.get("distance_normal", None)
+                sc = float(ctx_i.get("distance_scale", 1.0))
+                if (p0 is None) or (n is None):
+                    raise RuntimeError(
+                        f"Could not build per-source signed-distance feature for source_id={sid} ({rec['pt_path']})."
+                    )
+                dist_by_source[sid] = {"point": p0, "normal": n, "scale": sc}
+
+        ramp_feature_ctx["source_id_by_t"] = [int(v) for v in step_source_ids]
+        if include_ramp_angle:
+            ramp_feature_ctx["angle_feature_by_source"] = angle_by_source
+            ramp_feature_ctx["angle_units"] = angle_units
+        if include_signed_dist:
+            ramp_feature_ctx["distance_by_source"] = dist_by_source
+
+    if bool(ramp_feature_ctx.get("include_ramp_angle", False)):
+        print(
+            "[GEOM-FEAT] include_ramp_angle=1 "
+            f"(deg={float(ramp_feature_ctx.get('angle_deg')):.6g}, "
+            f"units={ramp_feature_ctx.get('angle_units', 'radians')})"
+        )
+    if bool(ramp_feature_ctx.get("include_signed_distance_to_ramp", False)):
+        print(
+            "[GEOM-FEAT] include_signed_distance_to_ramp=1 "
+            f"(distance_scale={float(ramp_feature_ctx.get('distance_scale', 1.0)):.6g})"
+        )
 
     model = build_model_from_cfg(cfg, device)
 
     # After model is created, before optimizer is created:
     loss_cfg = cfg.get("loss", {}) or {}
-    parc_use = bool(loss_cfg.get("parc", False) or loss_cfg.get("parc_inputs", False))
+    parc_use = _physics_inputs_active_from_loss_cfg(loss_cfg)
     use_adapter = bool(loss_cfg.get("parc_use_adapter", False))
 
     if parc_use and use_adapter:
@@ -11823,6 +11607,8 @@ def main(
 
         # inclusive -> Python slice end-exclusive
         data_list = data_list[start : end + 1]
+        step_source_ids = step_source_ids[start : end + 1]
+        step_mesh_spec_paths = step_mesh_spec_paths[start : end + 1]
         if len(data_list) < 2:
             raise ValueError(
                 "Selected precompute range is too small. Need at least two snapshots "
@@ -11836,25 +11622,45 @@ def main(
             f"[PRECOMP-RANGE] using raw snapshots [{start}, {end}] "
             f"(count={len(data_list)} of original {n_total})"
         )
+        if "source_id_by_t" in ramp_feature_ctx:
+            src_map = ramp_feature_ctx.get("source_id_by_t", [])
+            if isinstance(src_map, (list, tuple)) and len(src_map) >= (end + 1):
+                ramp_feature_ctx["source_id_by_t"] = [int(v) for v in src_map[start : end + 1]]
 
     # -------------------------------
     # NEW: build dt transitions (t -> t+1) from the raw snapshots
     # -------------------------------
-    # Each snapshot has snapshot["time"] saved by the reader. :contentReference[oaicite:1]{index=1}
-    times = torch.stack([
-        (snap["time"].detach().cpu().float() if torch.is_tensor(snap["time"]) else torch.tensor(float(snap["time"])))
-        for snap in data_list
-    ]).view(-1)  # shape (T,)
+    # For multi-file training we allow time to reset at file boundaries.
+    def _snapshot_time_value(snap: Any) -> float:
+        if isinstance(snap, dict):
+            tv = snap.get("time", snap.get("t", None))
+        else:
+            tv = getattr(snap, "time", getattr(snap, "t", None))
+        if tv is None:
+            raise RuntimeError("Each snapshot must provide 'time' (or 't') to build dt transitions.")
+        if torch.is_tensor(tv):
+            if tv.numel() != 1:
+                raise RuntimeError(f"Snapshot time must be scalar, got shape={tuple(tv.shape)}")
+            return float(tv.detach().cpu().item())
+        return float(tv)
 
-    # Sanity check: times should be nondecreasing
-    if torch.any(times[1:] < times[:-1]):
-        raise RuntimeError("Snapshot times are not monotonically increasing; cannot form dt reliably.")
-
-    dt_transitions = (times[1:] - times[:-1]).contiguous()  # shape (T-1,)
+    times_np = np.asarray([_snapshot_time_value(s) for s in data_list], dtype=np.float64)
     eps_dt = 1e-12
-    if torch.any(dt_transitions <= 0):
-        # You can decide whether to raise or clamp; clamping avoids divide-by-zero explosions.
-        dt_transitions = dt_transitions.clamp_min(eps_dt)
+    src_ids_np = np.asarray(step_source_ids, dtype=np.int64)
+    dt_list: List[float] = []
+    positive_same_src: List[float] = []
+    for i in range(len(times_np) - 1):
+        if src_ids_np[i] == src_ids_np[i + 1]:
+            dti = float(times_np[i + 1] - times_np[i])
+            if dti > eps_dt:
+                positive_same_src.append(dti)
+            dt_list.append(dti)
+        else:
+            # Placeholder for boundary transition; windows crossing boundaries are filtered out.
+            dt_list.append(float("nan"))
+    fallback_dt = float(np.median(positive_same_src)) if len(positive_same_src) > 0 else 1.0
+    dt_list = [fallback_dt if (not np.isfinite(v) or (v <= eps_dt)) else float(v) for v in dt_list]
+    dt_transitions = torch.as_tensor(dt_list, dtype=torch.float32).contiguous()
 
     # Optional: choose a reference dt to keep magnitudes stable (recommended but not required)
     dt_ref = dt_transitions.median()  # scalar
@@ -11868,8 +11674,64 @@ def main(
         # is_processed_file can be left None; passing raw list triggers in-memory preprocess
     )
 
-    T = len(full_ds)  # number of windows, not raw timesteps
-    idxs = np.arange(T)
+    if len(full_ds.steps) != len(step_source_ids):
+        raise RuntimeError(
+            f"Internal mismatch: full_ds.steps={len(full_ds.steps)} vs source-id map={len(step_source_ids)}."
+        )
+    for ii, step in enumerate(full_ds.steps):
+        if isinstance(step, dict):
+            step["__source_id"] = int(step_source_ids[ii])
+            step["__mesh_spec_path"] = step_mesh_spec_paths[ii]
+            step["__source_pt_path"] = source_records[int(step_source_ids[ii])]["pt_path"]
+
+    # Build contiguous source segments on the current (possibly sliced) timeline.
+    source_segments: List[Dict[str, Any]] = []
+    if len(step_source_ids) > 0:
+        seg_start = 0
+        seg_sid = int(step_source_ids[0])
+        for i in range(1, len(step_source_ids)):
+            sid_i = int(step_source_ids[i])
+            if sid_i != seg_sid:
+                source_segments.append(
+                    {
+                        "source_id": int(seg_sid),
+                        "t_start": int(seg_start),
+                        "t_end": int(i - 1),
+                    }
+                )
+                seg_start = i
+                seg_sid = sid_i
+        source_segments.append(
+            {
+                "source_id": int(seg_sid),
+                "t_start": int(seg_start),
+                "t_end": int(len(step_source_ids) - 1),
+            }
+        )
+
+    if len(source_segments) > 1:
+        print(
+            "[DATA] source segments:",
+            [
+                (int(s["source_id"]), int(s["t_start"]), int(s["t_end"]))
+                for s in source_segments
+            ],
+        )
+
+    # Filter out windows that cross source boundaries.
+    n_windows_all = len(full_ds)
+    all_win_idx = np.arange(n_windows_all, dtype=np.int64)
+    t0_all = all_win_idx * int(stride)
+    tlast_all = t0_all + (int(K) - 1)
+    valid_mask = (src_ids_np[t0_all] == src_ids_np[tlast_all])
+    valid_window_idx = all_win_idx[valid_mask]
+    if valid_window_idx.size == 0:
+        raise RuntimeError(
+            "No valid windows remain after filtering cross-source boundaries. "
+            "Check data.window_size/stride and input sequence lengths."
+        )
+    T = int(valid_window_idx.size)
+    idxs = valid_window_idx.copy()
 
     # ---- RANDOMLY SHUFFLE IDXs BEFORE SPLIT ----
     seed = int(cfg.get("seed", 1337))
@@ -11891,48 +11753,115 @@ def main(
     val_ds   = Subset(full_ds, val_idx.tolist())
     test_ds  = Subset(full_ds, test_idx.tolist())
 
+    if len(source_records) > 1:
+        counts_by_src = {}
+        for wi in valid_window_idx.tolist():
+            s0 = int(src_ids_np[int(wi) * int(stride)])
+            counts_by_src[s0] = int(counts_by_src.get(s0, 0) + 1)
+        print(
+            f"[DATA] valid windows after boundary filtering: {int(T)} "
+            f"(per source: {counts_by_src})"
+        )
+
     precomp = None
-    runtime_warm_start_precomp = bool(runtime_mesh_cfg.get("warm_start_from_precompute", True))
-    use_precomp_collate = (not runtime_mesh_enabled) or runtime_warm_start_precomp
+    precomp_path_for_sidecar = ""
+    use_precomp_collate = bool((cfg.get("train", {}) or {}).get("use_precompute", False))
 
     if use_precomp_collate:
-        mesh_mode = str(cfg.get("train", {}).get("mesh_mode", "predicted")).strip().lower()
-        cache_path = cfg["train"].get("precomp_cache_path", None)
-        force_recompute = bool(cfg["train"].get("precomp_force_recompute", False))
-        if mesh_mode == "uniform":
-            if cache_path is None:
-                cache_dir = cfg.get("train", {}).get("cache_dir", cfg.get("train", {}).get("save_dir", "."))
-                cache_path = os.path.join(cache_dir, "precomp_uniform.h5")
-            print(f"[PRECOMP] train.mesh_mode=uniform: static-mesh precompute with cache_path={cache_path}")
-            precomp = precompute_uniform_mesh_in_memory(
-                full_ds.steps,
-                cfg,
-                H,
-                W,
-                dx,
-                dy,
-                device=device,
-                progress=True,
-                cache_path=cache_path,
-                force_recompute=force_recompute,
-                require_existing_cache_when_not_forced=True,
+        mesh_mode = str(cfg.get("train", {}).get("mesh_mode", "uniform")).strip().lower()
+        if mesh_mode != "uniform":
+            raise RuntimeError(
+                "Cartesian project contract violation: train.mesh_mode must be 'uniform'. "
+                f"Got {mesh_mode!r}."
             )
-        else:
-            precomp = precompute_pred_mesh_and_interps_for_rollout(
-                full_ds.steps,
+        force_recompute = bool(cfg["train"].get("precomp_force_recompute", False))
+        cache_dir = cfg.get("train", {}).get("cache_dir", cfg.get("train", {}).get("save_dir", "."))
+
+        def _build_precomp_for_steps(step_list_slice, *, cache_path_slice, progress_slice):
+            return precompute_uniform_mesh_in_memory(
+                step_list_slice,
                 cfg,
                 H,
                 W,
                 dx,
                 dy,
                 device=device,
-                progress=True,
-                cache_path=cache_path,
+                progress=progress_slice,
+                cache_path=cache_path_slice,
                 force_recompute=force_recompute,
-                require_existing_cache_when_not_forced=True,
+                require_existing_cache_when_not_forced=False,
             )
 
-        precomp = move_precomp_to_device(precomp, device="cpu")
+        used_cache_paths: List[str] = []
+        if len(source_segments) <= 1:
+            cache_path = os.path.join(cache_dir, "precomp_uniform.h5")
+
+            if mesh_mode == "uniform":
+                print(f"[PRECOMP] train.mesh_mode=uniform: static-mesh precompute with cache_path={cache_path}")
+            precomp = _build_precomp_for_steps(
+                full_ds.steps,
+                cache_path_slice=cache_path,
+                progress_slice=True,
+            )
+            precomp = move_precomp_to_device(precomp, device="cpu")
+            if cache_path:
+                used_cache_paths.append(str(cache_path))
+        else:
+            print(
+                f"[PRECOMP] Multi-source run detected ({len(source_segments)} segments); "
+                "building/loading precompute per source-segment."
+            )
+            seg_views: List[Dict[str, Any]] = []
+            for seg in source_segments:
+                sid = int(seg["source_id"])
+                s0 = int(seg["t_start"])
+                s1 = int(seg["t_end"])
+                cache_seg = None
+                steps_seg = full_ds.steps[s0 : s1 + 1]
+                if cache_seg is None:
+                    # Keep deterministic, segment-specific default names to avoid collisions.
+                    cache_seg = os.path.join(
+                        cache_dir,
+                        f"precomp_uniform_source-{sid}_t{s0:05d}-{s1:05d}.h5",
+                    )
+
+                print(
+                    f"[PRECOMP][SEG] source_id={sid} t=[{s0},{s1}] "
+                    f"len={len(steps_seg)} cache_path={cache_seg}"
+                )
+                pre_seg = _build_precomp_for_steps(
+                    steps_seg,
+                    cache_path_slice=cache_seg,
+                    progress_slice=True,
+                )
+                pre_seg = move_precomp_to_device(pre_seg, device="cpu")
+                seg_views.append(
+                    {
+                        "source_id": sid,
+                        "t_start": s0,
+                        "t_end": s1,
+                        "precomp": pre_seg,
+                    }
+                )
+                if cache_seg:
+                    used_cache_paths.append(str(cache_seg))
+
+            precomp = SegmentedPrecompView(
+                segments=seg_views,
+                T=len(full_ds.steps),
+                H=H,
+                W=W,
+            )
+
+        used_cache_paths = sorted({p for p in used_cache_paths if str(p).strip() != ""})
+        if len(used_cache_paths) == 1:
+            precomp_path_for_sidecar = used_cache_paths[0]
+        elif len(used_cache_paths) > 1:
+            precomp_path_for_sidecar = ""
+            print(
+                "[CHUNK][INFO] Multiple precomp cache files are active in this run; "
+                "sidecar auto-load is disabled."
+            )
 
         # --- DEBUG: verify DEC edge attributes exist in precomp ---
         if cfg.get("debug", {}).get("print_dec_checks", False):
@@ -11964,25 +11893,32 @@ def main(
         ):
             # After move_precomp_to_device(precomp, device)
             # precomp must include a list aligned to pred_ei_list, e.g. key "pred_ea_list" or "pred_edge_attr_list"
-            if (not runtime_mesh_enabled) and isinstance(precomp, dict):
+            if isinstance(precomp, dict):
                 if ("pred_edge_attr" not in precomp) and ("pred_ea" not in precomp):
                     raise RuntimeError(
                         "DEC enabled but precomp is missing pred_ea_list/pred_edge_attr_list. "
                         "Update H5->precomp loader and CollateWithPrecompute to read/store pred_edge_attr."
                     )
 
-        if runtime_mesh_enabled:
-            print(
-                "[RUNTIME-MESH] warm-start enabled: using precomputed step-0 meshes/maps, "
-                "then runtime remeshing for later steps."
-            )
-
         collate = CollateWithPrecompute(precomp, dt_transitions=dt_transitions, dt_ref=dt_ref)
     else:
-        print(
-            "[RUNTIME-MESH] enabled: skipping precompute and using dt-only collate."
+        mesh_mode = str(cfg.get("train", {}).get("mesh_mode", "uniform")).strip().lower()
+        if mesh_mode != "uniform":
+            raise RuntimeError(
+                "Cartesian project contract violation: train.mesh_mode must be 'uniform'. "
+                f"Got {mesh_mode!r}."
+            )
+        print("[PRECOMP] disabled (train.use_precompute=false): using on-the-fly uniform static collate.")
+        collate = CollateWithUniformStaticNoPrecomp(
+            cfg=cfg,
+            H=H,
+            W=W,
+            dx=dx,
+            dy=dy,
+            dt_transitions=dt_transitions,
+            dt_ref=dt_ref,
+            device="cpu",
         )
-        collate = CollateWithDtOnly(dt_transitions=dt_transitions, dt_ref=dt_ref)
 
     train_loader = DataLoader(
         train_ds, batch_size=1, sampler=RandomSampler(train_ds),
@@ -12001,7 +11937,6 @@ def main(
     chunk_cfg_main = cfg.get("chunk", {}) or {}
     if bool(chunk_cfg_main.get("enabled", False)):
         chunk_builder_cfg_main = chunk_cfg_main.get("builder", {}) or {}
-        precomp_path_for_sidecar = str(cfg.get("train", {}).get("precomp_cache_path", "")).strip()
         sidecar_path_cfg = str(chunk_builder_cfg_main.get("sidecar_path", "")).strip()
         if precomp_path_for_sidecar:
             sidecar_path = derive_sidecar_path(precomp_path_for_sidecar, sidecar_path_cfg)
@@ -12018,7 +11953,7 @@ def main(
                 )
         else:
             print(
-                "[CHUNK][INFO] train.precomp_cache_path is empty; "
+                "[CHUNK][INFO] precompute cache path was not resolved for this run; "
                 "chunking will use on-the-fly partitioning."
             )
 
@@ -12257,6 +12192,7 @@ def main(
             H=H, W=W, dx=dx, dy=dy, mu=mu, sigma=sigma, epoch_idx=epoch,
             runtime_mesh_policy=runtime_mesh_policy,
             chunk_sidecar=chunk_sidecar_reader,
+            ramp_feature_ctx=ramp_feature_ctx,
         )
         run_validation = ((epoch % val_every) == 0) or (epoch == total_epochs)
         vl_loss = float("nan")
@@ -12267,6 +12203,7 @@ def main(
                 H=H, W=W, dx=dx, dy=dy, mu=mu, sigma=sigma,
                 collect_examples=False, epoch_idx=epoch,
                 runtime_mesh_policy=runtime_mesh_policy,
+                ramp_feature_ctx=ramp_feature_ctx,
             )
 
         TR.append(tr_loss)
@@ -12303,12 +12240,6 @@ def main(
                 f"val {vl_loss:.6f} | "
                 f"{dt:.1f}s | lr={_get_lr(opt):.3e}"
             )
-            tr_diag_line = _format_split_diagnostic_summary("train", tr_stats, diag_cfg_main)
-            if tr_diag_line is not None:
-                print(tr_diag_line)
-            vl_diag_line = _format_split_diagnostic_summary("val", vl_stats, diag_cfg_main)
-            if vl_diag_line is not None:
-                print(vl_diag_line)
         else:
             next_val_epoch = epoch + (val_every - (epoch % val_every))
             if next_val_epoch > total_epochs:
@@ -12319,9 +12250,6 @@ def main(
                 f"val skipped (every {val_every}; next {next_val_epoch:03d}) | "
                 f"{dt:.1f}s | lr={_get_lr(opt):.3e}"
             )
-            tr_diag_line = _format_split_diagnostic_summary("train", tr_stats, diag_cfg_main)
-            if tr_diag_line is not None:
-                print(tr_diag_line)
 
         do_periodic_ckpt = (checkpoint_every > 0) and (
             (epoch % checkpoint_every) == 0 or (epoch == total_epochs)
@@ -12362,12 +12290,10 @@ def main(
         sigma=sigma,
         collect_examples=False,
         runtime_mesh_policy=runtime_mesh_policy,
+        ramp_feature_ctx=ramp_feature_ctx,
     )
 
     print(f"[TEST] loss={test_loss:.4e}")
-    test_diag_line = _format_split_diagnostic_summary("test", _test_stats, diag_cfg_main)
-    if test_diag_line is not None:
-        print(test_diag_line.replace("[DIAG]", "[TEST-DIAG]", 1))
 
     step_log_enabled, step_log_path, _step_log_append = _runtime_step_log_settings(cfg)
     if step_log_enabled:

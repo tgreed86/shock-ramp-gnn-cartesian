@@ -89,6 +89,111 @@ def gas_gamma_from_cfg(cfg: dict, default: float = 1.4) -> float:
             return float(gamma)
     return float(default)
 
+def state_representation_from_cfg(cfg: dict, Fdim: int) -> str:
+    """
+    Infer whether state channels are conservative or primitive.
+    Returns one of:
+      - "conservative"
+      - "primitive_uvrhope"  (U, V, RHO, P, E_internal)
+    """
+    names = _get_feature_name_list(cfg)
+    if not names:
+        return "primitive_uvrhope" if int(Fdim) >= 5 else "conservative"
+
+    lower = [str(n).strip().lower() for n in names]
+
+    def _has_exact_or_prefixed(keys: tuple[str, ...]) -> bool:
+        for n in lower:
+            if n in keys:
+                return True
+            for k in keys:
+                if n.startswith(k + "_") or n.endswith("_" + k):
+                    return True
+        return False
+
+    def _has_substr(keys: tuple[str, ...]) -> bool:
+        return any(any(k in n for k in keys) for n in lower)
+
+    has_u = _has_exact_or_prefixed(("u", "ux", "velx", "velocityx", "xvelocity")) or _has_substr(("x velocity", "velocity x"))
+    has_v = _has_exact_or_prefixed(("v", "uy", "vely", "velocityy", "yvelocity")) or _has_substr(("y velocity", "velocity y"))
+    has_rho = _has_substr(("rho", "dens"))
+    has_p = _has_exact_or_prefixed(("p", "press", "pressure")) or _has_substr(("pressure",))
+    has_mx = _has_substr(("xmom", "momx", "mx", "x_momentum", "momentum_x"))
+    has_my = _has_substr(("ymom", "momy", "my", "y_momentum", "momentum_y"))
+
+    if has_u and has_v and has_rho and has_p and not (has_mx or has_my):
+        return "primitive_uvrhope"
+    return "conservative"
+
+def _state_views(
+    x_abs: torch.Tensor,
+    cfg: dict,
+    *,
+    eps: float = 1e-12,
+) -> dict[str, torch.Tensor]:
+    """
+    Returns a canonical view dictionary with both conservative and primitive fields.
+    Keys: rho,mx,my,E_tot,u,v,p,e_int
+    """
+    idx = infer_feature_indices(cfg, x_abs.size(1))
+    rep = state_representation_from_cfg(cfg, x_abs.size(1))
+    gamma = gas_gamma_from_cfg(cfg)
+
+    if rep == "primitive_uvrhope":
+        rho = x_abs[:, idx["rho"]]
+        u = x_abs[:, idx["u"]]
+        v = x_abs[:, idx["v"]]
+        e_int = x_abs[:, idx["E"]]
+        rho_safe = rho.abs().clamp_min(eps)
+        mx = rho * u
+        my = rho * v
+        p_idx = idx.get("p", None)
+        if p_idx is not None:
+            p = x_abs[:, int(p_idx)]
+        else:
+            p = (gamma - 1.0) * rho_safe * e_int
+        E_tot = rho_safe * e_int + 0.5 * rho_safe * (u * u + v * v)
+        return {
+            "rho": rho,
+            "mx": mx,
+            "my": my,
+            "E_tot": E_tot,
+            "u": u,
+            "v": v,
+            "p": p,
+            "e_int": e_int,
+        }
+
+    rho = x_abs[:, idx["rho"]]
+    mx = x_abs[:, idx["mx"]]
+    my = x_abs[:, idx["my"]]
+    E_tot = x_abs[:, idx["E"]]
+    rho_safe = rho.abs().clamp_min(eps)
+    u = mx / rho_safe
+    v = my / rho_safe
+    kinetic = 0.5 * (mx * mx + my * my) / rho_safe
+    p = (gamma - 1.0) * (E_tot - kinetic)
+    e_int = (E_tot / rho_safe) - 0.5 * (u * u + v * v)
+    return {
+        "rho": rho,
+        "mx": mx,
+        "my": my,
+        "E_tot": E_tot,
+        "u": u,
+        "v": v,
+        "p": p,
+        "e_int": e_int,
+    }
+
+def state_views(
+    x_abs: torch.Tensor,
+    cfg: dict,
+    *,
+    eps: float = 1e-12,
+) -> dict[str, torch.Tensor]:
+    """Public wrapper for canonical conservative/primitive state views."""
+    return _state_views(x_abs, cfg, eps=eps)
+
 def pressure_from_conservative_state(
     x_abs: torch.Tensor,  # [N,F] with channels rho,mx,my,E
     cfg: dict,
@@ -102,17 +207,8 @@ def pressure_from_conservative_state(
 
     Assumes E is total energy density.
     """
-    idx = infer_feature_indices(cfg, x_abs.size(1))
-    rho = x_abs[:, idx["rho"]]
-    mx  = x_abs[:, idx["mx"]]
-    my  = x_abs[:, idx["my"]]
-    E   = x_abs[:, idx["E"]]
-
-    gamma = gas_gamma_from_cfg(cfg)
-
-    rho_safe = rho.abs().clamp_min(eps)
-    kinetic = 0.5 * (mx * mx + my * my) / rho_safe
-    p = (gamma - 1.0) * (E - kinetic)
+    state = _state_views(x_abs, cfg, eps=eps)
+    p = state["p"]
 
     if clamp_min is not None:
         p = p.clamp_min(float(clamp_min))
@@ -130,15 +226,8 @@ def specific_internal_energy_from_conservative_state(
 
     Assumes E is total energy density.
     """
-    idx = infer_feature_indices(cfg, x_abs.size(1))
-    rho = x_abs[:, idx["rho"]]
-    mx  = x_abs[:, idx["mx"]]
-    my  = x_abs[:, idx["my"]]
-    E   = x_abs[:, idx["E"]]
-
-    rho_safe = rho.abs().clamp_min(eps)
-    kinetic_specific = 0.5 * (mx * mx + my * my) / (rho_safe * rho_safe)
-    return (E / rho_safe) - kinetic_specific
+    state = _state_views(x_abs, cfg, eps=eps)
+    return state["e_int"]
 
 def specific_entropy_from_conservative_state(
     x_abs: torch.Tensor,  # [N,F] with channels rho,mx,my,E
@@ -151,8 +240,8 @@ def specific_entropy_from_conservative_state(
     Ideal-gas specific entropy proxy (up to an additive constant):
       s ~ log(p) - gamma*log(rho)
     """
-    idx = infer_feature_indices(cfg, x_abs.size(1))
-    rho = x_abs[:, idx["rho"]].abs().clamp_min(eps)
+    state = _state_views(x_abs, cfg, eps=eps)
+    rho = state["rho"].abs().clamp_min(eps)
     p_min = max(float(eps), float(p_floor if p_floor is not None else eps))
     p = pressure_from_conservative_state(x_abs, cfg, eps=eps, clamp_min=p_min)
     gamma = gas_gamma_from_cfg(cfg)
@@ -318,16 +407,16 @@ def dec_divergence_euler_flux(
     gamma = float(loss.get("gamma", 1.4))
 
     N, Fdim = x_abs.shape
-    idx = infer_feature_indices(cfg, Fdim)
 
     src = edge_index[0].long()
     dst = edge_index[1].long()
     rec_kind = _normalize_reconstruction_kind(reconstruction)
 
-    rho_node = x_abs[:, idx["rho"]].abs().clamp_min(eps)
-    mx_node = x_abs[:, idx["mx"]]
-    my_node = x_abs[:, idx["my"]]
-    E_node = x_abs[:, idx["E"]]
+    state = _state_views(x_abs, cfg, eps=eps)
+    rho_node = state["rho"].abs().clamp_min(eps)
+    mx_node = state["mx"]
+    my_node = state["my"]
+    E_node = state["E_tot"]
     U_nodes = torch.stack([rho_node, mx_node, my_node, E_node], dim=1)  # [N,4]
 
     if rec_kind == "muscl":
@@ -418,35 +507,88 @@ def infer_feature_indices(cfg: dict, Fdim: int):
     """
     names = _get_feature_name_list(cfg)
     if not names:
-        # fallback guess: [density, xmom, ymom, energy] OR your stated order [energy,xmom,ymom,density]
-        # Try to keep robust: assume density is last if F=4 and user stated that order.
+        if Fdim >= 5:
+            # Default primitive order: [U,V,RHO,P,Eint]
+            return {"rho": 2, "mx": 0, "my": 1, "E": 4, "u": 0, "v": 1, "p": 3}
         if Fdim == 4:
-            return {"rho": 3, "mx": 1, "my": 2, "E": 0}
-        return {"rho": 0, "mx": 1 if Fdim > 1 else 0, "my": 2 if Fdim > 2 else 0, "E": 3 if Fdim > 3 else 0}
+            return {"rho": 0, "mx": 1, "my": 2, "E": 3, "u": 1, "v": 2, "p": None}
+        return {
+            "rho": 0,
+            "mx": 1 if Fdim > 1 else 0,
+            "my": 2 if Fdim > 2 else 0,
+            "E": min(Fdim - 1, 3),
+            "u": 1 if Fdim > 1 else 0,
+            "v": 2 if Fdim > 2 else 0,
+            "p": None,
+        }
 
-    lower = [n.lower() for n in names]
-    def find_any(keys):
+    lower = [str(n).strip().lower() for n in names]
+
+    def find_any(keys: tuple[str, ...]) -> int | None:
         for i, n in enumerate(lower):
             if any(k in n for k in keys):
                 return i
         return None
 
-    rho = find_any(["dens", "rho"])
-    mx  = find_any(["x-mom", "xmom", "momx", "px", "mx"])
-    my  = find_any(["y-mom", "ymom", "momy", "py", "my"])
-    En  = find_any(["ener", "total e", "etot", "e " , " e_","energy"])
+    def find_exact_or_prefixed(keys: tuple[str, ...]) -> int | None:
+        for i, n in enumerate(lower):
+            if n in keys:
+                return i
+            for k in keys:
+                if n.startswith(k + "_") or n.endswith("_" + k):
+                    return i
+        return None
 
-    # fallback by position if any missing
-    if rho is None and Fdim == 4: rho = 3
-    if mx  is None and Fdim == 4: mx  = 1
-    if my  is None and Fdim == 4: my  = 2
-    if En  is None and Fdim == 4: En  = 0
+    rho = find_any(("dens", "rho"))
+    mx = find_any(("x-mom", "xmom", "momx", "px", "mx", "x_momentum", "momentum_x"))
+    my = find_any(("y-mom", "ymom", "momy", "py", "my", "y_momentum", "momentum_y"))
+    En = find_any(("ener", "total e", "etot", "energy", "internal_energy", "specific_energy", "eint"))
+    if En is None:
+        En = find_exact_or_prefixed(("e",))
+
+    u = find_exact_or_prefixed(("u", "ux", "velx", "velocityx", "xvelocity"))
+    v = find_exact_or_prefixed(("v", "uy", "vely", "velocityy", "yvelocity"))
+    p = find_exact_or_prefixed(("p", "press", "pressure"))
+    if p is None:
+        p = find_any(("pressure",))
+
+    rep = state_representation_from_cfg(cfg, Fdim)
+
+    if rep == "primitive_uvrhope":
+        if u is None:
+            u = 0 if Fdim > 0 else None
+        if v is None:
+            v = 1 if Fdim > 1 else u
+        if rho is None:
+            rho = 2 if Fdim > 2 else 0
+        if p is None:
+            p = 3 if Fdim > 3 else None
+        if En is None:
+            En = 4 if Fdim > 4 else (Fdim - 1)
+        return {
+            "rho": int(rho),
+            "mx": int(u),
+            "my": int(v),
+            "E": int(En),
+            "u": int(u),
+            "v": int(v),
+            "p": (None if p is None else int(p)),
+        }
+
+    if rho is None and Fdim == 4:
+        rho = 0
+    if mx is None and Fdim == 4:
+        mx = 1
+    if my is None and Fdim == 4:
+        my = 2
+    if En is None and Fdim == 4:
+        En = 3
 
     rho = 0 if rho is None else int(rho)
-    mx  = 0 if mx  is None else int(mx)
-    my  = 0 if my  is None else int(my)
-    En  = 0 if En  is None else int(En)
-    return {"rho": rho, "mx": mx, "my": my, "E": En}
+    mx = 1 if mx is None else int(mx)
+    my = 2 if my is None else int(my)
+    En = min(Fdim - 1, 3) if En is None else int(En)
+    return {"rho": rho, "mx": mx, "my": my, "E": En, "u": mx, "v": my, "p": None}
 
 # -----------------------------
 # PARC / Variant-B helpers
@@ -456,7 +598,7 @@ def dec_advdiff_terms_abs(
     x_abs: torch.Tensor,         # [N,F] absolute state on the pred mesh at this step
     edge_index: torch.Tensor,    # [2,E]
     pred_ea: torch.Tensor,       # [E,>=5] includes tau in last col
-    levels: torch.Tensor,        # [N]
+    levels: torch.Tensor | None,        # [N] or None for uniform
     *,
     dx0: float,
     dy0: float,
@@ -492,6 +634,15 @@ def dec_advdiff_terms_abs(
             n = str(name).lower()
             if ("dens" in n) or (n == "rho"):
                 j = idx["rho"]
+            elif n in ("u", "ux", "x_velocity", "velocity_x", "velx"):
+                j = idx.get("u", idx["mx"])
+            elif n in ("v", "uy", "y_velocity", "velocity_y", "vely"):
+                j = idx.get("v", idx["my"])
+            elif ("press" in n) or (n == "p") or (n == "pressure"):
+                p_idx = idx.get("p", None)
+                if p_idx is None:
+                    continue
+                j = int(p_idx)
             elif ("ener" in n) or (n == "e"):
                 j = idx["E"]
             elif ("x" in n and "mom" in n) or (n in ("mx", "x_momentum", "mom_x")):
@@ -506,9 +657,12 @@ def dec_advdiff_terms_abs(
         return out if len(out) > 0 else list(default)
 
     # --- geometry / weights ---
-    area = cell_area_from_levels(
-        levels, dx0=dx0, dy0=dy0, dtype=x_abs.dtype, device=x_abs.device, refine_ratio=rr
-    )  # [N]
+    if levels is None:
+        area = x_abs.new_full((N,), float(dx0) * float(dy0))
+    else:
+        area = cell_area_from_levels(
+            levels, dx0=dx0, dy0=dy0, dtype=x_abs.dtype, device=x_abs.device, refine_ratio=rr
+        )  # [N]
 
     # --- edge geometry ---
     # pred_ea layout: [nx, ny, face_len, dual_len, tau]
@@ -529,15 +683,34 @@ def dec_advdiff_terms_abs(
                   or legacy)
 
     advection_type = str(loss.get("advection_type", "scalar")).lower()
+    state_rep = state_representation_from_cfg(cfg, Fdim)
+    if advection_type == "euler" and state_rep == "primitive_uvrhope":
+        # Euler conservative divergence does not map directly to primitive channels.
+        # Fall back to scalar advection on selected primitive fields.
+        advection_type = "scalar"
     advection_reconstruction = str(loss.get("advection_reconstruction", "first_order"))
     muscl_limiter = str(loss.get("muscl_limiter", "minmod"))
 
     # defaults:
     # - scalar advection default: rho + E (your prior behavior)
     # - euler advection default: full conservative state
-    default_adv_scalar = [idx["rho"], idx["E"]]
+    if state_rep == "primitive_uvrhope":
+        p_idx = idx.get("p", None)
+        default_adv_scalar = [idx["u"], idx["v"], idx["rho"]]
+        if p_idx is not None:
+            default_adv_scalar.append(int(p_idx))
+        default_adv_scalar.append(idx["E"])
+    else:
+        default_adv_scalar = [idx["rho"], idx["E"]]
     default_adv_euler  = [idx["rho"], idx["mx"], idx["my"], idx["E"]]
-    default_diff       = [idx["rho"], idx["E"]]
+    if state_rep == "primitive_uvrhope":
+        p_idx = idx.get("p", None)
+        default_diff = [idx["rho"]]
+        if p_idx is not None:
+            default_diff.append(int(p_idx))
+        default_diff.append(idx["E"])
+    else:
+        default_diff = [idx["rho"], idx["E"]]
 
     sel_adv  = _names_to_indices(adv_names,  default=(default_adv_euler if advection_type == "euler" else default_adv_scalar))
     sel_diff = _names_to_indices(diff_names, default=default_diff)
@@ -620,6 +793,14 @@ def _channels_to_indices(cfg: dict, Fdim: int, names, *, default: list[int]) -> 
         n = str(name).lower()
         if ("dens" in n) or (n == "rho"):
             out.append(idx["rho"])
+        elif n in ("u", "ux", "x_velocity", "velocity_x", "velx"):
+            out.append(int(idx.get("u", idx["mx"])))
+        elif n in ("v", "uy", "y_velocity", "velocity_y", "vely"):
+            out.append(int(idx.get("v", idx["my"])))
+        elif ("press" in n) or (n == "p") or (n == "pressure"):
+            p_idx = idx.get("p", None)
+            if p_idx is not None:
+                out.append(int(p_idx))
         elif ("ener" in n) or (n == "e"):
             out.append(idx["E"])
         elif (("x" in n) and ("mom" in n)) or (n in ("mx", "momx", "mom_x", "xmom", "x_momentum")):
@@ -654,6 +835,14 @@ def _names_to_indices(cfg: dict, Fdim: int, names, default: list[int]) -> list[i
         n = str(name).lower()
         if ("dens" in n) or (n == "rho") or (n == "density"):
             out.append(idx["rho"])
+        elif n in ("u", "ux", "x_velocity", "velocity_x", "velx"):
+            out.append(int(idx.get("u", idx["mx"])))
+        elif n in ("v", "uy", "y_velocity", "velocity_y", "vely"):
+            out.append(int(idx.get("v", idx["my"])))
+        elif ("press" in n) or (n == "p") or (n == "pressure"):
+            p_idx = idx.get("p", None)
+            if p_idx is not None:
+                out.append(int(p_idx))
         elif ("ener" in n) or (n == "e") or (n == "energy"):
             out.append(idx["E"])
         elif (("x" in n) and ("mom" in n)) or (n in ("mx", "mom_x", "x_momentum")):
@@ -685,7 +874,14 @@ def parc_select_feature_indices_adv(cfg: dict, Fdim: int) -> list[int]:
     """
     loss = cfg.get("loss", {}) or {}
     idx = infer_feature_indices(cfg, Fdim)
-    default = [idx["rho"], idx["E"]]
+    if state_representation_from_cfg(cfg, Fdim) == "primitive_uvrhope":
+        p_idx = idx.get("p", None)
+        default = [idx["u"], idx["v"], idx["rho"]]
+        if p_idx is not None:
+            default.append(int(p_idx))
+        default.append(idx["E"])
+    else:
+        default = [idx["rho"], idx["E"]]
 
     names = (loss.get("parc_input_channels_adv", None)
              or loss.get("adv_channels", None)
@@ -709,7 +905,14 @@ def parc_select_feature_indices_diff(cfg: dict, Fdim: int) -> list[int]:
     """
     loss = cfg.get("loss", {}) or {}
     idx = infer_feature_indices(cfg, Fdim)
-    default = [idx["rho"], idx["E"]]
+    if state_representation_from_cfg(cfg, Fdim) == "primitive_uvrhope":
+        p_idx = idx.get("p", None)
+        default = [idx["rho"]]
+        if p_idx is not None:
+            default.append(int(p_idx))
+        default.append(idx["E"])
+    else:
+        default = [idx["rho"], idx["E"]]
 
     names = (loss.get("parc_input_channels_diff", None)
              or loss.get("diff_channels", None)
@@ -750,10 +953,17 @@ def parc_select_feature_indices(cfg: dict, Fdim: int) -> list[int]:
         names = loss.get("channels", None)
 
     idx = infer_feature_indices(cfg, Fdim)
+    if state_representation_from_cfg(cfg, Fdim) == "primitive_uvrhope":
+        p_idx = idx.get("p", None)
+        default = [idx["rho"]]
+        if p_idx is not None:
+            default.append(int(p_idx))
+        default.append(idx["E"])
+    else:
+        default = [idx["rho"], idx["E"]]
     if not names:
-        return [idx["rho"], idx["E"]]
+        return default
 
-    default = [idx["rho"], idx["E"]]
     return _channels_to_indices(cfg, Fdim, names, default=default)
 
 def parc_terms_to_node_inputs(
@@ -997,18 +1207,10 @@ def compute_velocity_from_state(x_abs: torch.Tensor, cfg: dict, eps: float = 1e-
     rho_floor = float(loss.get("rho_floor", 1e-6))
     u_clip    = float(loss.get("u_clip", 1e3))   # start generous; normal |u| is ~O(10-40)
 
-    Fdim = x_abs.size(1)
-    idx = infer_feature_indices(cfg, Fdim)
-
-    rho = x_abs[:, idx["rho"]]
-    mx  = x_abs[:, idx["mx"]]
-    my  = x_abs[:, idx["my"]]
-
-    # avoid division by tiny/negative rho
-    rho_safe = rho.clamp_min(max(eps, rho_floor))
-
-    ux = mx / rho_safe
-    uy = my / rho_safe
+    _ = float(rho_floor)  # retained for backward-compatible config surface
+    state = _state_views(x_abs, cfg, eps=eps)
+    ux = state["u"]
+    uy = state["v"]
 
     # Smooth clip (preferred) to avoid hard kinks
     if u_clip > 0:
@@ -1045,6 +1247,14 @@ def build_channel_mask_from_loss(cfg: dict, Fdim: int, *, device, dtype):
         n = str(name).lower()
         if "dens" in n or n == "rho":
             mask[idx["rho"]] = 1.0
+        elif n in ("u", "ux", "x_velocity", "velocity_x", "velx"):
+            mask[int(idx.get("u", idx["mx"]))] = 1.0
+        elif n in ("v", "uy", "y_velocity", "velocity_y", "vely"):
+            mask[int(idx.get("v", idx["my"]))] = 1.0
+        elif ("press" in n) or (n == "p"):
+            p_idx = idx.get("p", None)
+            if p_idx is not None:
+                mask[int(p_idx)] = 1.0
         elif "ener" in n or n == "e":
             mask[idx["E"]] = 1.0
         elif "x" in n and "mom" in n:
@@ -1057,7 +1267,7 @@ def dec_advdiff_rate(
     x_abs: torch.Tensor,          # [N,F] absolute state (at time t on pred mesh)
     edge_index: torch.Tensor,     # [2,E]
     pred_ea: torch.Tensor,        # [E,5] edge_attr
-    levels: torch.Tensor,         # [N]
+    levels: torch.Tensor | None,         # [N] or None for uniform
     *,
     dx0: float,
     dy0: float,
@@ -1077,9 +1287,12 @@ def dec_advdiff_rate(
 
     nx, ny, face_len, dual_len, tau = edge_attr_unpack(pred_ea)
 
-    area = cell_area_from_levels(
-        levels, dx0=dx0, dy0=dy0, dtype=x_abs.dtype, device=x_abs.device, refine_ratio=rr
-    )  # [N]
+    if levels is None:
+        area = x_abs.new_full((x_abs.size(0),), float(dx0) * float(dy0))
+    else:
+        area = cell_area_from_levels(
+            levels, dx0=dx0, dy0=dy0, dtype=x_abs.dtype, device=x_abs.device, refine_ratio=rr
+        )  # [N]
     vel = compute_velocity_from_state(x_abs, cfg, eps=rho_eps)  # [N,2]
 
     # div(u*phi)

@@ -16,8 +16,8 @@ This file should be specified in the config file under:
 With the above steps complete, I can move to the mesh prediction. This can be done by running the main file,
 train.py, with "precomp_force_recompute": true in the config file under "train". This automatically
 runs the training after the mesh prediction and interpolation steps have completed. 
-An h5 file with the info from the pre-training steps is saved to cache/, with the
-name specified by "precomp_cache_path": under "train" in the config file. 
+An h5 file with the info from the pre-training steps is saved to cache/
+(or train.cache_dir if provided), using the default name precomp_uniform.h5. 
 
 The training can be run again without the pre-training steps by setting "precomp_force_recompute": false
 in the config file. This will read from the saved h5 file in cache.  

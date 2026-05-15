@@ -453,6 +453,26 @@ def _parents_from_level_ij(levels: torch.Tensor,
 
 
 @torch.no_grad()
+def _parents_from_pos(
+    centers_xy: torch.Tensor,
+    H: int,
+    W: int,
+    bbox: tuple[float, float, float, float],
+) -> torch.Tensor:
+    """
+    Map physical center coordinates to coarse parent-cell indices on an HxW grid.
+    """
+    xmin, xmax, ymin, ymax = [float(v) for v in bbox]
+    xspan = max(float(xmax - xmin), 1e-12)
+    yspan = max(float(ymax - ymin), 1e-12)
+
+    xy = centers_xy[:, :2].to(torch.float32)
+    col = torch.floor((xy[:, 0] - xmin) * float(W) / xspan).to(torch.long).clamp_(0, int(W) - 1)
+    row = torch.floor((xy[:, 1] - ymin) * float(H) / yspan).to(torch.long).clamp_(0, int(H) - 1)
+    return (row * int(W) + col).to(torch.long)
+
+
+@torch.no_grad()
 def _coarse_mask_from_level_parents(levels: torch.Tensor,
                                     parents: torch.Tensor,
                                     H: int, W: int) -> torch.Tensor:
@@ -930,6 +950,7 @@ class CellRefineTemporalDataset(Dataset):
             fallback_ratio=2,
             log_prefix="[TEMPORAL][GT-RR]",
         )
+        bbox = tuple(self.cfg.get("data", {}).get("bbox", [0.0, 1.0, 0.0, 1.0]))
 
         # Prebuild a lightweight cache of (t, t+1) pairs
         self.cache: List[Dict[str, Tensor]] = []
@@ -948,24 +969,45 @@ class CellRefineTemporalDataset(Dataset):
             level_tp1= getattr(dt1, "level",  torch.zeros(centers_tp1.size(0), dtype=torch.long))
             ij_t     = getattr(dt,  "ij",     None)
             ij_tp1   = getattr(dt1, "ij",     None)
-            if ij_t is None or ij_tp1 is None:
-                raise RuntimeError("Expected 'ij' indices per center in amr_cells.pt for robust parent/mask logic.")
+            parents_t_raw = getattr(dt, "parents", None)
+            parents_tp1_raw = getattr(dt1, "parents", None)
 
-            dyn_parents = _parents_from_level_ij(
-                level_t,
-                ij_t,
-                self.H,
-                self.W,
-                refine_ratio=self.gt_refine_ratio,
-            )      # (N_t,)
+            if parents_t_raw is not None:
+                dyn_parents = torch.as_tensor(parents_t_raw).to(torch.long)
+            elif ij_t is not None:
+                dyn_parents = _parents_from_level_ij(
+                    level_t,
+                    ij_t,
+                    self.H,
+                    self.W,
+                    refine_ratio=self.gt_refine_ratio,
+                )
+            else:
+                dyn_parents = _parents_from_pos(centers_t, self.H, self.W, bbox)
+
+            if parents_tp1_raw is not None:
+                parents_tp1 = torch.as_tensor(parents_tp1_raw).to(torch.long)
+            elif ij_tp1 is not None:
+                parents_tp1 = _parents_from_level_ij(
+                    level_tp1,
+                    ij_tp1,
+                    self.H,
+                    self.W,
+                    refine_ratio=self.gt_refine_ratio,
+                )
+            else:
+                parents_tp1 = _parents_from_pos(centers_tp1, self.H, self.W, bbox)
+
+            if ij_t is None:
+                row_t = torch.div(dyn_parents, int(self.W), rounding_mode="floor")
+                col_t = torch.remainder(dyn_parents, int(self.W))
+                ij_t = torch.stack([row_t, col_t], dim=1)
+            if ij_tp1 is None:
+                row_tp1 = torch.div(parents_tp1, int(self.W), rounding_mode="floor")
+                col_tp1 = torch.remainder(parents_tp1, int(self.W))
+                ij_tp1 = torch.stack([row_tp1, col_tp1], dim=1)
+
             mask_t      = _coarse_mask_from_level_parents(level_t,  dyn_parents, self.H, self.W)  # (H*W,)
-            parents_tp1 = _parents_from_level_ij(
-                level_tp1,
-                ij_tp1,
-                self.H,
-                self.W,
-                refine_ratio=self.gt_refine_ratio,
-            )  # only for mask at t+1
             mask_tp1    = _coarse_mask_from_level_parents(level_tp1, parents_tp1, self.H, self.W)
 
             # --- edges (center graph) ---
@@ -1051,6 +1093,7 @@ def preprocess_timesteps_once(
         fallback_ratio=2,
         log_prefix="[PREPROCESS][GT-RR]",
     )
+    bbox = tuple(cfg.get("data", {}).get("bbox", [0.0, 1.0, 0.0, 1.0]))
     processed: List[Data] = []
 
     for k, dt in enumerate(ds_in):
@@ -1059,10 +1102,18 @@ def preprocess_timesteps_once(
 
         level = getattr(dt, "level", torch.zeros(centers.size(0), dtype=torch.long))
         ij    = getattr(dt, "ij",    None)
+        parents_raw = getattr(dt, "parents", None)
+        if parents_raw is not None:
+            parents = torch.as_tensor(parents_raw).to(torch.long)
+        elif ij is not None:
+            parents = _parents_from_level_ij(level, ij, H, W, refine_ratio=gt_refine_ratio)
+        else:
+            parents = _parents_from_pos(centers, H, W, bbox)
         if ij is None:
-            raise RuntimeError("Expected 'ij' per center for robust parent/mask logic.")
+            row = torch.div(parents, int(W), rounding_mode="floor")
+            col = torch.remainder(parents, int(W))
+            ij = torch.stack([row, col], dim=1)
 
-        parents = _parents_from_level_ij(level, ij, H, W, refine_ratio=gt_refine_ratio)
         mask    = _coarse_mask_from_level_parents(level, parents, H, W)
         ei      = _safe_edge_index(dt)
         if ei.dtype != torch.long: ei = ei.long()
@@ -1148,19 +1199,15 @@ class CellRefineWindowDataset(Dataset):
             is_proc = False if is_processed_file is None else not is_processed_file
 
         self.H, self.W = _ensure_hw_from_cfg_or_data(self.steps[0], cfg, self.H, self.W)
-        self.gt_refine_ratio = _infer_gt_refine_ratio_from_steps(
-            self.steps,
-            self.cfg,
-            self.H,
-            self.W,
-            fallback_ratio=2,
-            log_prefix="[WINDOW][GT-RR]",
-        )
+        # Uniform Cartesian windows do not use AMR refine-ratio metadata.
+        # Keep a fixed compatibility value and skip ratio inference/logging.
+        self.gt_refine_ratio = 1
 
         # inside CellRefineWindowDataset.__init__ ...
         # after we've set: self.steps = series_or_loaded_list; self.H, self.W established
 
         if not is_proc:
+            bbox = tuple(self.cfg.get("data", {}).get("bbox", [0.0, 1.0, 0.0, 1.0]))
             proc = []
             for k, dt in enumerate(self.steps):
                 # allow either PyG Data-like or dict-like inputs
@@ -1172,7 +1219,6 @@ class CellRefineWindowDataset(Dataset):
 
                 centers = _get("pos")
                 x_full  = _get("x")
-                level   = _get("level")
                 ij      = _get("ij")
                 ei      = _get("edge_index")
 
@@ -1182,23 +1228,27 @@ class CellRefineWindowDataset(Dataset):
                 centers = centers[:, :2].contiguous()
                 x_sel   = _select_feature_columns(x_full, self.cfg)  # your existing helper
 
-                if level is None:
-                    level = torch.zeros(centers.size(0), dtype=torch.long)
-                else:
-                    level = level.long()
+                # Uniform Cartesian contract: keep a zero level vector only as
+                # compatibility metadata for downstream code paths.
+                level = torch.zeros(centers.size(0), dtype=torch.long)
 
+                parents_raw = _get("parents")
+                if parents_raw is not None:
+                    parents = torch.as_tensor(parents_raw).to(torch.long)
+                elif ij is not None:
+                    ij = ij.long()
+                    row = ij[:, 0].clamp(0, int(self.H) - 1)
+                    col = ij[:, 1].clamp(0, int(self.W) - 1)
+                    parents = (row * int(self.W) + col).to(torch.long)
+                else:
+                    parents = _parents_from_pos(centers, self.H, self.W, bbox)
                 if ij is None:
-                    raise RuntimeError("expected 'ij' indices per center for robust parent/mask logic.")
+                    row = torch.div(parents, int(self.W), rounding_mode="floor")
+                    col = torch.remainder(parents, int(self.W))
+                    ij = torch.stack([row, col], dim=1)
                 ij = ij.long()
 
-                parents = _parents_from_level_ij(
-                    level,
-                    ij,
-                    self.H,
-                    self.W,
-                    refine_ratio=self.gt_refine_ratio,
-                )
-                mask    = _coarse_mask_from_level_parents(level, parents, self.H, self.W)
+                mask = torch.zeros((self.H * self.W,), dtype=torch.bool)
 
                 if ei is None or (torch.is_tensor(ei) and ei.numel() == 0):
                     # your existing edge builder / sanitizer

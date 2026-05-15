@@ -10,7 +10,10 @@ import h5py
 import matplotlib.pyplot as plt
 from matplotlib.path import Path
 from matplotlib.collections import LineCollection
-from utils.extract_dmr_boundaries import build_amr_mesh_for_wedge
+try:
+    from utils.extract_dmr_boundaries import build_amr_mesh_for_wedge
+except Exception:
+    build_amr_mesh_for_wedge = None
 
 from amr_policy import (
     predict_masks_hierarchical_from_gt_gradients, 
@@ -1167,6 +1170,25 @@ def _build_starting_mesh_from_spec(
     spec = _load_mesh_spec(mesh_spec_path) if mesh_spec_path is not None else mesh_spec_path_or_spec
     if not isinstance(spec, dict):
         raise RuntimeError(f"Expected dict mesh spec, got {type(spec)}")
+
+    # If the mesh spec already contains explicit mesh arrays, use them directly.
+    has_explicit_centers = any(k in spec for k in ("centers", "pred_centers", "pos", "xy", "cell_centers"))
+    has_explicit_levels = any(k in spec for k in ("levels", "pred_levels", "level", "cell_levels"))
+    if has_explicit_centers and has_explicit_levels:
+        return _normalize_builder_output_to_mesh(
+            spec,
+            cfg=cfg,
+            H=H,
+            W=W,
+            device=torch.device(device) if not isinstance(device, torch.device) else device,
+            refine_ratio=_get_refine_ratio(cfg),
+        )
+
+    if build_amr_mesh_for_wedge is None:
+        raise ImportError(
+            "Could not import utils.extract_dmr_boundaries.build_amr_mesh_for_wedge and "
+            "mesh spec does not contain explicit centers/levels arrays."
+        )
 
     bbox = tuple(map(float, cfg["data"]["bbox"]))
     n0_x = int(spec.get("n0_x", spec.get("n0", W)))
@@ -2969,14 +2991,51 @@ def precompute_pred_mesh_and_interps_for_rollout(
 
     # ----------------- load wedge polygon -----------------
     mesh_cfg = cfg.get("mesh", {})
-    mesh_spec_path = mesh_cfg.get("starting_mesh_path", None)
+    mesh_spec_path_cfg = mesh_cfg.get("starting_mesh_path", None)
+    mesh_spec_path = (
+        os.path.abspath(os.path.expanduser(str(mesh_spec_path_cfg)))
+        if mesh_spec_path_cfg is not None
+        else None
+    )
 
-    wedge_path = None
-    if mesh_spec_path is not None:
-        wedge_path = _load_wedge_path_from_spec(mesh_spec_path, cfg=cfg)
-        print(f"[GEOM] Wedge path loaded from mesh spec (rescaled): {mesh_spec_path}")
+    def _step_mesh_spec_path(step_obj) -> str | None:
+        v = None
+        if isinstance(step_obj, dict):
+            v = step_obj.get("__mesh_spec_path", step_obj.get("mesh_spec_path", None))
+        else:
+            v = getattr(step_obj, "__mesh_spec_path", getattr(step_obj, "mesh_spec_path", None))
+        if v is None:
+            return None
+        return os.path.abspath(os.path.expanduser(str(v)))
+
+    step_mesh_spec_paths = sorted(
+        {
+            p for p in (_step_mesh_spec_path(s) for s in steps)
+            if p is not None
+        }
+    )
+
+    default_mesh_spec_path = None
+    if mesh_spec_path is not None and os.path.isfile(mesh_spec_path):
+        default_mesh_spec_path = mesh_spec_path
+    elif len(step_mesh_spec_paths) == 1:
+        default_mesh_spec_path = step_mesh_spec_paths[0]
+
+    wedge_path_cache: Dict[str, Any] = {}
+
+    def _get_wedge_path_for_mesh_spec(spec_path: str | None):
+        if spec_path is None:
+            return None
+        p = os.path.abspath(os.path.expanduser(str(spec_path)))
+        if p not in wedge_path_cache:
+            wedge_path_cache[p] = _load_wedge_path_from_spec(p, cfg=cfg)
+        return wedge_path_cache[p]
+
+    wedge_path = _get_wedge_path_for_mesh_spec(default_mesh_spec_path)
+    if wedge_path is not None:
+        print(f"[GEOM] Wedge path loaded from mesh spec (rescaled): {default_mesh_spec_path}")
     else:
-        print("[GEOM] No starting_mesh_path provided; wedge clipping disabled.")
+        print("[GEOM] No default wedge mesh spec file provided; using per-step mesh spec when available.")
 
     # ----------------- choose IDW mapping device (GT→pred) -----------------
     speed = cfg.get("speed", {})
@@ -2993,11 +3052,19 @@ def precompute_pred_mesh_and_interps_for_rollout(
     # In starting_refine mode, build ONE static pred mesh now
     static_pred = None
     if geometry_mode in ("starting_refine", "starting", "static_refine", "refine_test"):
-        if mesh_spec_path is None:
+        static_mesh_spec_path = default_mesh_spec_path
+        if (static_mesh_spec_path is None) and (len(step_mesh_spec_paths) == 1):
+            static_mesh_spec_path = step_mesh_spec_paths[0]
+        if len(step_mesh_spec_paths) > 1:
+            raise RuntimeError(
+                "starting_refine mode requires a single mesh spec, but per-step mesh specs contain "
+                f"multiple files: {step_mesh_spec_paths}"
+            )
+        if static_mesh_spec_path is None:
             raise RuntimeError("starting_refine mode requires cfg['mesh']['starting_mesh_path'].")
 
         base_c, base_l, base_p, base_ei, base_mask_parent = _build_starting_mesh_from_spec(
-            mesh_spec_path, cfg, H, W, dx, dy, device=dev
+            static_mesh_spec_path, cfg, H, W, dx, dy, device=dev
         )
         #base_c, base_l, base_p, base_ei = _load_starting_mesh_from_spec(mesh_spec_path)
 
@@ -3013,14 +3080,15 @@ def precompute_pred_mesh_and_interps_for_rollout(
         mask_p = _mask_from_parents(pred_p.to(dev), H, W).to(torch.bool)
 
         # optional clip to wedge (keeps behavior aligned with your pipeline)
-        if wedge_path is not None:
+        wedge_path_static = _get_wedge_path_for_mesh_spec(static_mesh_spec_path)
+        if wedge_path_static is not None:
             pred_c, pred_l, pred_p, pred_e, mask_p = _clip_pred_mesh_to_wedge(
                 pred_c.to(dev),
                 pred_l.to(dev),
                 pred_p.to(dev),
                 pred_e.to(dev),
                 H, W,
-                wedge_path=wedge_path,
+                wedge_path=wedge_path_static,
                 cfg=cfg,
                 device=dev,
             )
@@ -3136,6 +3204,8 @@ def precompute_pred_mesh_and_interps_for_rollout(
             feat_tp1 = feat_tp1 if torch.is_tensor(feat_tp1) else torch.as_tensor(feat_tp1)
             level_tp1 = s_next.get("level")
             ij_tp1 = s_next.get("ij")
+            mesh_spec_path_step = _step_mesh_spec_path(s_next) or _step_mesh_spec_path(s) or default_mesh_spec_path
+            wedge_path_step = _get_wedge_path_for_mesh_spec(mesh_spec_path_step)
 
             centers_tp1 = centers_tp1.to(dev)
             feat_tp1 = feat_tp1.to(dev, dtype=torch.float32)
@@ -3218,7 +3288,7 @@ def precompute_pred_mesh_and_interps_for_rollout(
                     pred_e_rect,
                     H,
                     W,
-                    wedge_path=wedge_path,
+                    wedge_path=wedge_path_step,
                     cfg=cfg,
                     device=dev,
                 )
@@ -3981,17 +4051,7 @@ def precompute_uniform_mesh_in_memory(
         s = steps[int(abs_t)]
         centers_t = (s["pos"] if torch.is_tensor(s["pos"]) else torch.as_tensor(s["pos"])).to(map_dev, dtype=torch.float32)
         feat_t = (s["x"] if torch.is_tensor(s["x"]) else torch.as_tensor(s["x"])).to(map_dev, dtype=torch.float32)
-        level_t = s.get("level", None)
-        ij_t = s.get("ij", None)
-        if level_t is not None and ij_t is not None:
-            parents_t = _parents_from_level_ij(
-                level_t.to(map_dev),
-                ij_t.to(map_dev),
-                H,
-                W,
-                refine_ratio=gt_refine_ratio,
-            )
-        elif "parents" in s:
+        if "parents" in s:
             parents_t = (s["parents"] if torch.is_tensor(s["parents"]) else torch.as_tensor(s["parents"])).to(
                 map_dev,
                 dtype=torch.long,
@@ -4268,4 +4328,659 @@ class CollateWithDtOnly:
         ex["dt_list"] = dt_list
         if self.dt_ref is not None:
             ex["dt_ref"] = float(self.dt_ref) if not torch.is_tensor(self.dt_ref) else float(self.dt_ref.item())
+        return ex
+
+
+class CollateWithUniformStaticNoPrecomp:
+    """
+    Uniform no-precompute collate.
+
+    Modes:
+      1) Static-spec mode (legacy): when cfg['mesh']['starting_mesh_path'] is set,
+         build one static prediction mesh and map GT features to it.
+      2) Dataset-native mode: when starting_mesh_path is missing/empty, use each
+         window's mesh geometry directly from the dataset sample.
+    """
+
+    def __init__(
+        self,
+        *,
+        cfg: Dict[str, Any],
+        H: int,
+        W: int,
+        dx: float,
+        dy: float,
+        dt_transitions,
+        dt_ref=None,
+        device: str | torch.device = "cpu",
+    ):
+        self.cfg = cfg
+        self.H = int(H)
+        self.W = int(W)
+        self.dx = float(dx)
+        self.dy = float(dy)
+        self.dev = torch.device(device)
+        self.dt_ref = dt_ref
+        if torch.is_tensor(dt_transitions):
+            self.dt_transitions = dt_transitions.detach().cpu()
+        else:
+            self.dt_transitions = torch.as_tensor(dt_transitions, dtype=torch.float32, device="cpu")
+
+        mesh_cfg = self.cfg.get("mesh", {}) or {}
+        mesh_spec_raw = mesh_cfg.get("starting_mesh_path", None)
+        mesh_spec_text = "" if mesh_spec_raw is None else str(mesh_spec_raw).strip()
+        self.use_dataset_native_mesh = (mesh_spec_text == "")
+        self.rr = int(_get_refine_ratio(cfg)) if not self.use_dataset_native_mesh else 2
+        self._fallback_ei_cache_by_t: Dict[int, torch.Tensor] = {}
+        self._printed_ei_fallback_once = False
+        self._printed_ei_chain_fallback_once = False
+
+        if not self.use_dataset_native_mesh:
+            self._build_static_mesh()
+        self._configure_mapping_backend()
+
+    def _build_static_mesh(self) -> None:
+        mesh_cfg = self.cfg.get("mesh", {}) or {}
+        mesh_spec_raw = mesh_cfg.get("starting_mesh_path", None)
+        if not mesh_spec_raw:
+            raise RuntimeError("Uniform static collate requires cfg['mesh']['starting_mesh_path'].")
+        mesh_spec_path = os.path.abspath(os.path.expanduser(str(mesh_spec_raw)))
+        if not os.path.exists(mesh_spec_path):
+            raise FileNotFoundError(f"Uniform static collate expected mesh spec at: {mesh_spec_path}")
+
+        pol = self.cfg.get("policy", {}) or {}
+        refine_to_level = int(pol.get("starting_refine_to_level", 0))
+        refine_policy = str(pol.get("starting_refine_policy", "min_level")).strip().lower()
+        if refine_policy not in ("min_level", "level0_only"):
+            raise ValueError(f"Unknown starting_refine_policy='{refine_policy}'")
+
+        def _refine_cells_one_level(
+            centers: torch.Tensor,
+            levels: torch.Tensor,
+            parents: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            lv = levels.to(torch.int64)
+            rr_t = torch.tensor(float(self.rr), device=lv.device)
+            dx_L = (
+                torch.tensor(float(self.dx), device=lv.device)
+                / torch.pow(rr_t, lv.to(torch.float32))
+            ).to(torch.float32)
+            dy_L = (
+                torch.tensor(float(self.dy), device=lv.device)
+                / torch.pow(rr_t, lv.to(torch.float32))
+            ).to(torch.float32)
+
+            c = centers.to(torch.float32)
+            x0 = c[:, 0]
+            y0 = c[:, 1]
+
+            frac = ((torch.arange(self.rr, dtype=torch.float32, device=c.device) + 0.5) / float(self.rr)) - 0.5
+            gx, gy = torch.meshgrid(frac, frac, indexing="xy")
+            child = torch.empty((c.shape[0], self.rr, self.rr, 2), dtype=torch.float32, device=c.device)
+            child[..., 0] = x0.view(-1, 1, 1) + dx_L.view(-1, 1, 1) * gx.view(1, self.rr, self.rr)
+            child[..., 1] = y0.view(-1, 1, 1) + dy_L.view(-1, 1, 1) * gy.view(1, self.rr, self.rr)
+
+            child_centers = child.reshape(-1, 2)
+            child_count = self.rr * self.rr
+            child_levels = (lv + 1).repeat_interleave(child_count)
+            child_parents = parents.repeat_interleave(child_count)
+            return child_centers, child_levels, child_parents
+
+        def _refine_mesh_to_target(
+            centers: torch.Tensor,
+            levels: torch.Tensor,
+            parents: torch.Tensor,
+            target_level: int,
+            policy_name: str,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            target_level = int(target_level)
+            if target_level <= 0:
+                return centers, levels.to(torch.int64), parents.to(torch.int64)
+
+            c = centers.clone().to(torch.float32)
+            l = levels.clone().to(torch.int64)
+            p = parents.clone().to(torch.int64)
+
+            if policy_name == "level0_only":
+                base_is_level0 = (l == 0)
+
+            while True:
+                if policy_name == "min_level":
+                    need = (l < target_level)
+                else:
+                    need = base_is_level0 & (l < target_level)
+                if not bool(need.any().item()):
+                    break
+
+                keep = ~need
+                c_keep, l_keep, p_keep = c[keep], l[keep], p[keep]
+                c_need, l_need, p_need = c[need], l[need], p[need]
+                c_child, l_child, p_child = _refine_cells_one_level(c_need, l_need, p_need)
+
+                c = torch.cat([c_keep, c_child], dim=0)
+                l = torch.cat([l_keep, l_child], dim=0)
+                p = torch.cat([p_keep, p_child], dim=0)
+
+                if policy_name == "level0_only":
+                    base_keep = base_is_level0[keep]
+                    base_child = torch.ones((c_child.shape[0],), dtype=torch.bool, device=base_keep.device)
+                    base_is_level0 = torch.cat([base_keep, base_child], dim=0)
+
+            return c, l, p
+
+        build_dev = torch.device("cpu")
+        base_c, base_l, base_p, base_ei, _base_mask_parent = _build_starting_mesh_from_spec(
+            mesh_spec_path,
+            self.cfg,
+            self.H,
+            self.W,
+            self.dx,
+            self.dy,
+            device=build_dev,
+        )
+        pred_c, pred_l, pred_p = _refine_mesh_to_target(
+            base_c,
+            base_l,
+            base_p,
+            refine_to_level,
+            refine_policy,
+        )
+
+        if (refine_to_level <= 0) and (base_ei is not None):
+            pred_e = base_ei.to(torch.int64)
+        else:
+            edge_method = str(self.cfg.get("edges", {}).get("method", "face")).lower()
+            if "face" in edge_method:
+                pred_e = build_amr_face_adjacency_edges(
+                    pred_c,
+                    pred_l,
+                    self.H,
+                    self.W,
+                    bbox=tuple(self.cfg["data"]["bbox"]),
+                    return_edge_attr=False,
+                    refine_ratio=self.rr,
+                ).to(torch.int64)
+            else:
+                pred_e = build_amr_local_knn_edges(
+                    pred_c,
+                    pred_p,
+                    self.H,
+                    self.W,
+                    k_local=int(self.cfg.get("edges", {}).get("k_local", 4)),
+                    max_local=int(self.cfg.get("edges", {}).get("max_local", 2048)),
+                ).to(torch.int64)
+
+        wedge_path = _load_wedge_path_from_spec(mesh_spec_path, cfg=self.cfg)
+        pred_c, pred_l, pred_p, pred_e, mask_p = _clip_pred_mesh_to_wedge(
+            pred_c.to(build_dev),
+            pred_l.to(build_dev),
+            pred_p.to(build_dev),
+            pred_e.to(build_dev),
+            self.H,
+            self.W,
+            wedge_path=wedge_path,
+            cfg=self.cfg,
+            device=build_dev,
+        )
+
+        self.pred_c_cpu = pred_c.detach().cpu().to(torch.float32)
+        self.pred_l_cpu = pred_l.detach().cpu().to(torch.int64)
+        self.pred_p_cpu = pred_p.detach().cpu().to(torch.int64)
+        self.pred_e_cpu = pred_e.detach().cpu().to(torch.int64)
+        self.mask_p_cpu = mask_p.detach().cpu().view(-1).to(torch.bool)
+
+        if self.pred_c_cpu.numel() == 0 or self.pred_e_cpu.numel() == 0:
+            raise RuntimeError("Uniform static collate produced empty mesh geometry.")
+
+        w_cpu, h_cpu, area_cpu, *_ = amr_cell_wh_area_from_levels(
+            self.pred_l_cpu,
+            dx0=float(self.dx),
+            dy0=float(self.dy),
+            refine_ratio=self.rr,
+        )
+        self.cell_wh_cpu = torch.stack([w_cpu, h_cpu], dim=1).to(torch.float32)
+        self.cell_area_cpu = area_cpu.to(torch.float32)
+        self.edge_attr_cpu = dec_edge_attr_for_dyadic_quads(
+            self.pred_c_cpu,
+            self.pred_l_cpu,
+            self.pred_e_cpu,
+            dx0=float(self.dx),
+            dy0=float(self.dy),
+            refine_ratio=self.rr,
+        ).to(torch.float32)
+
+        k_interp = int(self.cfg.get("loss", {}).get("interp_k", 8))
+        if k_interp < 1:
+            raise ValueError("loss.interp_k must be >=1 for uniform static collate.")
+        n_pred = int(self.pred_c_cpu.shape[0])
+        self.idx_id_cpu = torch.arange(n_pred, dtype=torch.int64).view(-1, 1).repeat(1, k_interp)
+        self.w_id_cpu = torch.full((n_pred, k_interp), fill_value=(1.0 / float(k_interp)), dtype=torch.float32)
+
+    def _configure_mapping_backend(self) -> None:
+        speed = self.cfg.get("speed", {}) or {}
+        idw_cfg = self.cfg.get("idw", {}) or {}
+        if not isinstance(idw_cfg, dict):
+            raise ValueError("cfg['idw'] must be an object when provided.")
+
+        raw_backend = str(idw_cfg.get("backend", "exact")).strip().lower()
+        backend_aliases = {
+            "torch": "exact",
+            "cdist": "exact",
+            "exact": "exact",
+            "flat": "faiss_flat",
+            "faiss_flat": "faiss_flat",
+            "faiss": "faiss_ivf",
+            "ivf": "faiss_ivf",
+            "faiss_ivf": "faiss_ivf",
+            "ann": "faiss_ivf",
+            "approx": "faiss_ivf",
+        }
+        map_knn_backend = backend_aliases.get(raw_backend, raw_backend)
+        if map_knn_backend not in ("exact", "faiss_flat", "faiss_ivf"):
+            raise ValueError("cfg['idw']['backend'] must be one of: exact, faiss_flat, faiss_ivf.")
+
+        map_knn_backend_kwargs: Dict[str, Any] = {}
+        if map_knn_backend in ("faiss_flat", "faiss_ivf"):
+            map_knn_backend_kwargs["faiss_nlist"] = max(1, int(idw_cfg.get("faiss_nlist", 256)))
+            map_knn_backend_kwargs["faiss_nprobe"] = max(1, int(idw_cfg.get("faiss_nprobe", 16)))
+            map_knn_backend_kwargs["faiss_cache"] = bool(idw_cfg.get("faiss_cache", True))
+            map_knn_backend_kwargs["faiss_cache_max_entries"] = max(1, int(idw_cfg.get("faiss_cache_max_entries", 4)))
+            allow_fallback = bool(idw_cfg.get("allow_fallback_to_exact", True))
+            try:
+                import faiss  # type: ignore  # noqa: F401
+            except Exception:
+                if allow_fallback:
+                    print(
+                        "[UNIFORM-NOPRECOMP] idw.backend requested FAISS but import failed; "
+                        "falling back to exact.",
+                        flush=True,
+                    )
+                    map_knn_backend = "exact"
+                    map_knn_backend_kwargs = {}
+                else:
+                    raise RuntimeError(
+                        "cfg['idw']['backend'] requests FAISS, but faiss import failed "
+                        "and allow_fallback_to_exact=false."
+                    )
+
+        self.map_knn_backend = map_knn_backend
+        self.map_knn_backend_kwargs = map_knn_backend_kwargs
+        self.map_knn_k = max(1, int(idw_cfg.get("k", 8)))
+        self.map_knn_chunk = max(1, int(idw_cfg.get("chunk", speed.get("interp_chunk", 8192))))
+
+        # Keep mapping on CPU for stability/memory in collate-time mapping.
+        self.map_dev = torch.device("cpu")
+        if not self.use_dataset_native_mesh:
+            self.pred_c_map = self.pred_c_cpu.to(self.map_dev)
+            self.pred_l_map = self.pred_l_cpu.to(self.map_dev)
+            self.pred_p_map = self.pred_p_cpu.to(self.map_dev)
+            self.mask_p_map_2d = self.mask_p_cpu.view(self.H, self.W).to(self.map_dev)
+
+    def _bbox_from_cfg(self) -> tuple[float, float, float, float]:
+        bbox_raw = (self.cfg.get("data", {}) or {}).get("bbox", [0.0, 1.0, 0.0, 1.0])
+        if isinstance(bbox_raw, (list, tuple)) and len(bbox_raw) == 4:
+            return tuple(float(v) for v in bbox_raw)
+        return (0.0, 1.0, 0.0, 1.0)
+
+    def _as_cpu_tensor(self, x: Any, *, dtype: torch.dtype) -> torch.Tensor:
+        if torch.is_tensor(x):
+            t = x
+        else:
+            t = torch.as_tensor(x)
+        return t.detach().to(device="cpu", dtype=dtype).contiguous()
+
+    def _normalize_edge_index(self, ei: Any) -> torch.Tensor:
+        ei_t = self._as_cpu_tensor(ei, dtype=torch.int64)
+        if ei_t.ndim != 2:
+            raise RuntimeError(f"edge_index must be rank-2, got shape={tuple(ei_t.shape)}")
+        if ei_t.size(0) == 2:
+            return ei_t
+        if ei_t.size(1) == 2:
+            return ei_t.t().contiguous()
+        raise RuntimeError(f"edge_index must have shape (2,E) or (E,2), got {tuple(ei_t.shape)}")
+
+    def _build_chain_fallback_edges(self, n_nodes: int) -> torch.Tensor:
+        n = int(n_nodes)
+        if n <= 1:
+            return torch.empty((2, 0), dtype=torch.int64)
+        u = torch.arange(n - 1, dtype=torch.int64)
+        v = u + 1
+        return torch.stack([torch.cat([u, v], dim=0), torch.cat([v, u], dim=0)], dim=0)
+
+    def _build_fallback_edges(
+        self,
+        *,
+        centers: torch.Tensor,
+        parents: torch.Tensor,
+    ) -> torch.Tensor:
+        ei = build_amr_local_knn_edges(
+            centers,
+            parents,
+            self.H,
+            self.W,
+            k_local=int(self.cfg.get("edges", {}).get("k_local", 4)),
+            max_local=int(self.cfg.get("edges", {}).get("max_local", 2048)),
+        ).to(torch.int64)
+        if ei.ndim == 2 and ei.size(0) == 2 and ei.numel() > 0:
+            if not self._printed_ei_fallback_once:
+                print(
+                    "[UNIFORM-NOPRECOMP] built fallback edge_index for missing/empty dataset ei "
+                    f"(N={int(centers.size(0))}, E={int(ei.size(1))}).",
+                    flush=True,
+                )
+                self._printed_ei_fallback_once = True
+            return ei
+        # Last-resort connectivity to keep training/eval from hard-failing.
+        if not self._printed_ei_chain_fallback_once:
+            print(
+                "[UNIFORM-NOPRECOMP][WARN] local-KNN fallback edge build returned empty; "
+                "using chain connectivity fallback.",
+                flush=True,
+            )
+            self._printed_ei_chain_fallback_once = True
+        return self._build_chain_fallback_edges(int(centers.size(0)))
+
+    def _ensure_window_lists(
+        self,
+        ex: Dict[str, Any],
+        K: int,
+        idxs: List[int] | None = None,
+    ) -> tuple[
+        List[torch.Tensor], List[torch.Tensor], List[torch.Tensor],
+        List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]
+    ]:
+        centers_list_raw = ex.get("centers_list", None)
+        feat_list_raw = ex.get("feat_list", None)
+        level_list_raw = ex.get("level_list", None)
+        parents_list_raw = ex.get("parents_list", None)
+        ei_list_raw = ex.get("ei_list", None)
+        mask_list_raw = ex.get("mask_list", None)
+        ij_list_raw = ex.get("ij_list", None)
+
+        if centers_list_raw is None or feat_list_raw is None:
+            pair_required = ("centers_t", "centers_tp1", "center_feat_t", "center_feat_tp1")
+            if any(k not in ex for k in pair_required):
+                raise RuntimeError(
+                    "Uniform no-precompute collate expected centers/feature lists or pair keys in dataset sample."
+                )
+            centers_list_raw = [ex["centers_t"], ex["centers_tp1"]]
+            feat_list_raw = [ex["center_feat_t"], ex["center_feat_tp1"]]
+            level_list_raw = [ex.get("level_t", None), ex.get("level_tp1", None)]
+            ei_list_raw = [ex.get("ei_t", None), ex.get("ei_tp1", None)]
+            mask_list_raw = [ex.get("mask_t", None), ex.get("mask_tp1", None)]
+            parents_list_raw = [ex.get("dyn_parents", None), None]
+            ij_list_raw = [ex.get("ij_t", None), ex.get("ij_tp1", None)]
+            K = 2
+
+        if len(centers_list_raw) != K or len(feat_list_raw) != K:
+            raise RuntimeError(
+                f"Window list length mismatch: len(centers_list)={len(centers_list_raw)} "
+                f"len(feat_list)={len(feat_list_raw)} expected K={K}"
+            )
+
+        if level_list_raw is None:
+            level_list_raw = [None] * K
+        if parents_list_raw is None:
+            parents_list_raw = [None] * K
+        if ei_list_raw is None:
+            ei_list_raw = [None] * K
+        if mask_list_raw is None:
+            mask_list_raw = [None] * K
+        if ij_list_raw is None:
+            ij_list_raw = [None] * K
+
+        if len(level_list_raw) != K:
+            level_list_raw = list(level_list_raw)[:K] + [None] * max(0, K - len(level_list_raw))
+        if len(parents_list_raw) != K:
+            parents_list_raw = list(parents_list_raw)[:K] + [None] * max(0, K - len(parents_list_raw))
+        if len(ei_list_raw) != K:
+            ei_list_raw = list(ei_list_raw)[:K] + [None] * max(0, K - len(ei_list_raw))
+        if len(mask_list_raw) != K:
+            mask_list_raw = list(mask_list_raw)[:K] + [None] * max(0, K - len(mask_list_raw))
+        if len(ij_list_raw) != K:
+            ij_list_raw = list(ij_list_raw)[:K] + [None] * max(0, K - len(ij_list_raw))
+
+        bbox = self._bbox_from_cfg()
+        xmin, xmax, ymin, ymax = bbox
+
+        centers_list: List[torch.Tensor] = []
+        feat_list: List[torch.Tensor] = []
+        level_list: List[torch.Tensor] = []
+        parents_list: List[torch.Tensor] = []
+        ei_list: List[torch.Tensor] = []
+        mask_list: List[torch.Tensor] = []
+
+        for j in range(K):
+            centers = self._as_cpu_tensor(centers_list_raw[j], dtype=torch.float32)
+            if centers.ndim != 2 or centers.size(1) < 2:
+                raise RuntimeError(f"centers_list[{j}] must have shape (N,2+), got {tuple(centers.shape)}")
+            centers = centers[:, :2].contiguous()
+
+            feats = self._as_cpu_tensor(feat_list_raw[j], dtype=torch.float32)
+            if feats.ndim != 2 or feats.size(0) != centers.size(0):
+                raise RuntimeError(
+                    f"feat_list[{j}] shape mismatch with centers: "
+                    f"feat={tuple(feats.shape)} centers={tuple(centers.shape)}"
+                )
+
+            level_raw = level_list_raw[j]
+            if level_raw is None:
+                levels = torch.zeros((centers.size(0),), dtype=torch.int64)
+            else:
+                levels = self._as_cpu_tensor(level_raw, dtype=torch.int64).view(-1)
+                if levels.numel() != centers.size(0):
+                    raise RuntimeError(
+                        f"level_list[{j}] length mismatch with centers: "
+                        f"{levels.numel()} vs {centers.size(0)}"
+                    )
+
+            parents_raw = parents_list_raw[j]
+            if parents_raw is not None:
+                parents = self._as_cpu_tensor(parents_raw, dtype=torch.int64).view(-1)
+            else:
+                ij_raw = ij_list_raw[j]
+                if ij_raw is not None:
+                    ij = self._as_cpu_tensor(ij_raw, dtype=torch.int64)
+                    if ij.ndim != 2 or ij.size(1) < 2 or ij.size(0) != centers.size(0):
+                        raise RuntimeError(
+                            f"ij_list[{j}] must have shape (N,2+) aligned with centers, got {tuple(ij.shape)}"
+                        )
+                    row = ij[:, 0].clamp(0, self.H - 1)
+                    col = ij[:, 1].clamp(0, self.W - 1)
+                    parents = (row * self.W + col).to(torch.int64)
+                else:
+                    parents = parents_from_pos(
+                        centers,
+                        self.H,
+                        self.W,
+                        xmin=float(xmin),
+                        xmax=float(xmax),
+                        ymin=float(ymin),
+                        ymax=float(ymax),
+                    ).to(torch.int64)
+            if parents.numel() != centers.size(0):
+                raise RuntimeError(
+                    f"parents_list[{j}] length mismatch with centers: "
+                    f"{parents.numel()} vs {centers.size(0)}"
+                )
+
+            t_abs = None
+            if idxs is not None and j < len(idxs):
+                t_abs = int(idxs[j])
+
+            ei_raw = ei_list_raw[j]
+            if ei_raw is None:
+                cached = self._fallback_ei_cache_by_t.get(t_abs, None) if t_abs is not None else None
+                if cached is not None:
+                    ei = cached
+                else:
+                    ei = self._build_fallback_edges(centers=centers, parents=parents)
+                    if t_abs is not None:
+                        self._fallback_ei_cache_by_t[t_abs] = ei
+            else:
+                ei = self._normalize_edge_index(ei_raw)
+                if ei.numel() == 0:
+                    cached = self._fallback_ei_cache_by_t.get(t_abs, None) if t_abs is not None else None
+                    if cached is not None:
+                        ei = cached
+                    else:
+                        ei = self._build_fallback_edges(centers=centers, parents=parents)
+                        if t_abs is not None:
+                            self._fallback_ei_cache_by_t[t_abs] = ei
+            if ei.size(0) != 2:
+                raise RuntimeError(f"ei_list[{j}] produced empty/invalid edge_index: shape={tuple(ei.shape)}")
+
+            mask_raw = mask_list_raw[j]
+            if mask_raw is None:
+                mask = _mask_from_parents(parents, self.H, self.W).view(-1).to(torch.bool)
+            else:
+                mask = self._as_cpu_tensor(mask_raw, dtype=torch.bool).view(-1)
+
+            centers_list.append(centers)
+            feat_list.append(feats)
+            level_list.append(levels)
+            parents_list.append(parents)
+            ei_list.append(ei)
+            mask_list.append(mask)
+
+        return centers_list, feat_list, level_list, parents_list, ei_list, mask_list
+
+    def _build_pred2pred_maps_from_lists(self, centers_list: List[torch.Tensor]) -> tuple[List[torch.Tensor], List[torch.Tensor]]:
+        K = len(centers_list)
+        if K <= 1:
+            return [], []
+
+        pred2pred_idx_list: List[torch.Tensor] = []
+        pred2pred_w_list: List[torch.Tensor] = []
+        faiss_nlist = int(self.map_knn_backend_kwargs.get("faiss_nlist", 256))
+        faiss_nprobe = int(self.map_knn_backend_kwargs.get("faiss_nprobe", 16))
+        faiss_cache = bool(self.map_knn_backend_kwargs.get("faiss_cache", True))
+        faiss_cache_max_entries = int(self.map_knn_backend_kwargs.get("faiss_cache_max_entries", 4))
+
+        for src_j in range(1, K):
+            src_xy = centers_list[src_j].to(self.map_dev, dtype=torch.float32)
+            dst_xy = centers_list[src_j + 1] if (src_j + 1) < K else centers_list[src_j]
+            dst_xy = dst_xy.to(self.map_dev, dtype=torch.float32)
+
+            if src_xy.ndim != 2 or src_xy.size(1) < 2 or src_xy.size(0) == 0:
+                raise RuntimeError(f"Invalid src centers for pred2pred map at step {src_j}: {tuple(src_xy.shape)}")
+            if dst_xy.ndim != 2 or dst_xy.size(1) < 2 or dst_xy.size(0) == 0:
+                raise RuntimeError(f"Invalid dst centers for pred2pred map at step {src_j}: {tuple(dst_xy.shape)}")
+
+            k_eff = max(1, min(int(self.map_knn_k), int(src_xy.size(0))))
+            idx_map, w_map = build_idw_map(
+                dst_xy=dst_xy,
+                src_xy=src_xy,
+                k=k_eff,
+                chunk=int(self.map_knn_chunk),
+                backend=self.map_knn_backend,
+                faiss_nlist=faiss_nlist,
+                faiss_nprobe=faiss_nprobe,
+                faiss_cache=faiss_cache,
+                faiss_cache_max_entries=faiss_cache_max_entries,
+            )
+            pred2pred_idx_list.append(idx_map.detach().to("cpu", dtype=torch.int64))
+            pred2pred_w_list.append(w_map.detach().to("cpu", dtype=torch.float32))
+
+        return pred2pred_idx_list, pred2pred_w_list
+
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        ex0 = batch[0]
+        ex = dict(ex0)
+
+        idxs = ex["t_indices"].tolist()
+        K = len(idxs)
+
+        dt_list = []
+        for j in range(K - 1):
+            t_src = idxs[j]
+            v = self.dt_transitions[t_src]
+            dt_list.append(float(v.item()) if torch.is_tensor(v) else float(v))
+        ex["dt_list"] = dt_list
+        if self.dt_ref is not None:
+            ex["dt_ref"] = float(self.dt_ref) if not torch.is_tensor(self.dt_ref) else float(self.dt_ref.item())
+
+        centers_list, feat_list, level_list, parents_list, ei_list, mask_list = self._ensure_window_lists(
+            ex,
+            K,
+            idxs=idxs,
+        )
+        K = len(centers_list)
+
+        if self.use_dataset_native_mesh:
+            pred_edge_attr_list = [
+                dec_edge_attr_for_dyadic_quads(
+                    centers_list[j],
+                    level_list[j],
+                    ei_list[j],
+                    dx0=float(self.dx),
+                    dy0=float(self.dy),
+                    refine_ratio=2,
+                ).to(torch.float32)
+                for j in range(K)
+            ]
+
+            feat_t_on_pred_list: List[torch.Tensor] = [feat_list[0] for _ in range(K)]
+            feat_tp1_on_pred_list: List[torch.Tensor] = [feat_list[0] for _ in range(K)]
+            for j in range(1, K):
+                feat_t_on_pred_list[j] = feat_list[j - 1]
+                feat_tp1_on_pred_list[j] = feat_list[j]
+
+            pred2pred_idx_list, pred2pred_w_list = self._build_pred2pred_maps_from_lists(centers_list)
+
+            ex["pred_centers_list"] = centers_list
+            ex["pred_levels_list"] = level_list
+            ex["pred_parents_list"] = parents_list
+            ex["pred_ei_list"] = ei_list
+            ex["pred_edge_attr_list"] = pred_edge_attr_list
+            ex["mask_pred_list"] = mask_list
+            ex["feat_t_on_pred_list"] = feat_t_on_pred_list
+            ex["feat_tp1_on_pred_list"] = feat_tp1_on_pred_list
+            ex["pred2pred_idx_list"] = pred2pred_idx_list
+            ex["pred2pred_w_list"] = pred2pred_w_list
+            return ex
+
+        mapped_by_step: List[torch.Tensor] = []
+        for j in range(K):
+            mapped = _map_gt_on_pred_mesh_once(
+                src_centers=centers_list[j].to(self.map_dev, dtype=torch.float32),
+                src_feats=feat_list[j].to(self.map_dev, dtype=torch.float32),
+                mask_src_parent=None,
+                parents_src=None,
+                pred_centers=self.pred_c_map,
+                pred_levels=self.pred_l_map,
+                pred_parents=self.pred_p_map,
+                mask_pred_parent=self.mask_p_map_2d,
+                H=self.H,
+                W=self.W,
+                device=self.map_dev,
+                knn_k=self.map_knn_k,
+                knn_chunk=self.map_knn_chunk,
+                knn_backend=self.map_knn_backend,
+                knn_backend_kwargs=self.map_knn_backend_kwargs,
+            )
+            mapped_by_step.append(mapped.detach().to("cpu", dtype=torch.float32))
+
+        feat_t_on_pred_list: List[torch.Tensor] = [mapped_by_step[0] for _ in range(K)]
+        feat_tp1_on_pred_list: List[torch.Tensor] = [mapped_by_step[0] for _ in range(K)]
+        for j in range(1, K):
+            feat_t_on_pred_list[j] = mapped_by_step[j - 1]
+            feat_tp1_on_pred_list[j] = mapped_by_step[j]
+
+        ex["pred_centers_list"] = [self.pred_c_cpu for _ in range(K)]
+        ex["pred_levels_list"] = [self.pred_l_cpu for _ in range(K)]
+        ex["pred_parents_list"] = [self.pred_p_cpu for _ in range(K)]
+        ex["pred_ei_list"] = [self.pred_e_cpu for _ in range(K)]
+        ex["pred_edge_attr_list"] = [self.edge_attr_cpu for _ in range(K)]
+        ex["mask_pred_list"] = [self.mask_p_cpu for _ in range(K)]
+        ex["feat_t_on_pred_list"] = feat_t_on_pred_list
+        ex["feat_tp1_on_pred_list"] = feat_tp1_on_pred_list
+
+        if K > 1:
+            ex["pred2pred_idx_list"] = [self.idx_id_cpu for _ in range(K - 1)]
+            ex["pred2pred_w_list"] = [self.w_id_cpu for _ in range(K - 1)]
+        else:
+            ex["pred2pred_idx_list"] = []
+            ex["pred2pred_w_list"] = []
+
         return ex

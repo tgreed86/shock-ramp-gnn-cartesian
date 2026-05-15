@@ -573,8 +573,23 @@ def plot_loss_curves(out_path: str, epochs, train_losses, val_losses):
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig, ax = plt.subplots(figsize=(6,4))
-    ax.plot(epochs, train_losses, label="train")
-    #ax.plot(epochs, val_losses, label="val")
+    epochs_arr = np.asarray(epochs)
+    train_arr = np.asarray(train_losses, dtype=float)
+    val_arr = np.asarray(val_losses, dtype=float)
+
+    ax.plot(epochs_arr, train_arr, label="train")
+
+    # Validation can be sparse (NaN on skipped epochs); only draw computed points.
+    finite_val = np.isfinite(val_arr)
+    if finite_val.any():
+        ax.plot(
+            epochs_arr[finite_val],
+            val_arr[finite_val],
+            label="val",
+            marker="o",
+            markersize=3,
+            linewidth=1.5,
+        )
     ax.set_xlabel("epoch"); ax.set_ylabel("loss")
     ax.set_title("Loss vs epoch")
     ax.legend()
