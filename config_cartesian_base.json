@@ -22,9 +22,9 @@
     }
   },
   "split": {
-    "train": 0.85,
-    "val": 0.1,
-    "test": 0.05
+    "by_file": true,
+    "val_files": 6,
+    "test_files": 6
   },
   "policy": {
     "refine_ratio": 2,

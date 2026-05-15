@@ -1792,6 +1792,11 @@ def _resolve_pt_path_list(cfg: Dict[str, Any]) -> List[str]:
     data_cfg = cfg.get("data", {}) or {}
     raw_multi = data_cfg.get("pt_paths", None)
     raw_single = data_cfg.get("pt_path", None)
+    recursive = _cfg_bool_strict(
+        data_cfg.get("pt_path_recursive", False),
+        key="data.pt_path_recursive",
+    )
+    supported_exts = (".pt", ".pth", ".zip", ".h5", ".hdf5")
 
     paths_raw: List[Any]
     if isinstance(raw_multi, (list, tuple)) and len(raw_multi) > 0:
@@ -1808,10 +1813,40 @@ def _resolve_pt_path_list(cfg: Dict[str, Any]) -> List[str]:
         if pr is None:
             continue
         p = os.path.abspath(os.path.expanduser(str(pr)))
-        out.append(p)
-    if len(out) == 0:
+        if os.path.isdir(p):
+            found: List[str] = []
+            if recursive:
+                for root, _, files in os.walk(p):
+                    for fn in files:
+                        if fn.lower().endswith(supported_exts):
+                            found.append(os.path.join(root, fn))
+            else:
+                for fn in os.listdir(p):
+                    fp = os.path.join(p, fn)
+                    if os.path.isfile(fp) and fn.lower().endswith(supported_exts):
+                        found.append(fp)
+
+            found = sorted(os.path.abspath(x) for x in found)
+            if len(found) == 0:
+                raise RuntimeError(
+                    f"Directory data source contains no supported files {supported_exts}: {p}"
+                )
+            out.extend(found)
+        else:
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"Input data path not found: {p}")
+            out.append(p)
+
+    # Preserve first-seen order while dropping duplicates.
+    dedup: List[str] = []
+    seen: set[str] = set()
+    for p in out:
+        if p not in seen:
+            seen.add(p)
+            dedup.append(p)
+    if len(dedup) == 0:
         raise RuntimeError("No valid entries found in data.pt_path / data.pt_paths.")
-    return out
+    return dedup
 
 
 def _resolve_mesh_spec_path_for_input(
@@ -11731,23 +11766,91 @@ def main(
             "Check data.window_size/stride and input sequence lengths."
         )
     T = int(valid_window_idx.size)
-    idxs = valid_window_idx.copy()
-
-    # ---- RANDOMLY SHUFFLE IDXs BEFORE SPLIT ----
+    split_cfg = cfg.get("split", {}) or {}
     seed = int(cfg.get("seed", 1337))
     rng = np.random.default_rng(seed)
-    perm = rng.permutation(T)
-    idxs = idxs[perm]
 
-    # now compute split sizes
-    train_frac = cfg["split"].get("train", 0.8)
-    val_frac   = cfg["split"].get("val", 0.1)
-    n_train = int(round(train_frac * T))
-    n_val   = int(round(val_frac   * T))
-    # keep the rest for test
-    train_idx = idxs[:n_train]
-    val_idx   = idxs[n_train:n_train + n_val]
-    test_idx  = idxs[n_train + n_val:]
+    by_file_raw = split_cfg.get("by_file", None)
+    by_file = (
+        ("val_files" in split_cfg) or ("test_files" in split_cfg)
+        if by_file_raw is None
+        else _cfg_bool_strict(by_file_raw, key="split.by_file")
+    )
+
+    if by_file:
+        n_sources = int(len(source_records))
+        val_files = int(split_cfg.get("val_files", 0))
+        test_files = int(split_cfg.get("test_files", 0))
+        if val_files < 0 or test_files < 0:
+            raise ValueError(
+                f"split.val_files and split.test_files must be >= 0, got "
+                f"val_files={val_files}, test_files={test_files}"
+            )
+        if (val_files + test_files) >= n_sources:
+            raise ValueError(
+                f"split.val_files + split.test_files must be < number of files ({n_sources}) "
+                "so at least one file remains for training."
+            )
+
+        source_ids = np.arange(n_sources, dtype=np.int64)
+        source_ids = source_ids[rng.permutation(n_sources)]
+        val_source_ids = source_ids[:val_files]
+        test_source_ids = source_ids[val_files : (val_files + test_files)]
+        train_source_ids = source_ids[(val_files + test_files) :]
+
+        valid_t0 = (valid_window_idx * int(stride)).astype(np.int64)
+        valid_win_src = src_ids_np[valid_t0]
+
+        train_mask = np.isin(valid_win_src, train_source_ids)
+        val_mask = np.isin(valid_win_src, val_source_ids)
+        test_mask = np.isin(valid_win_src, test_source_ids)
+
+        train_idx = valid_window_idx[train_mask]
+        val_idx = valid_window_idx[val_mask]
+        test_idx = valid_window_idx[test_mask]
+
+        if train_idx.size == 0:
+            raise RuntimeError(
+                "File-level split produced zero training windows. "
+                "Reduce split.val_files/split.test_files or use longer files."
+            )
+
+        if train_idx.size > 1:
+            train_idx = train_idx[rng.permutation(train_idx.size)]
+        if val_idx.size > 1:
+            val_idx = val_idx[rng.permutation(val_idx.size)]
+        if test_idx.size > 1:
+            test_idx = test_idx[rng.permutation(test_idx.size)]
+
+        print(
+            f"[SPLIT] by_file=true seed={seed} "
+            f"files(total/train/val/test)={n_sources}/{len(train_source_ids)}/{len(val_source_ids)}/{len(test_source_ids)} "
+            f"windows(train/val/test)={int(train_idx.size)}/{int(val_idx.size)}/{int(test_idx.size)}"
+        )
+        print(
+            f"[SPLIT] source_ids train={train_source_ids.tolist()} "
+            f"val={val_source_ids.tolist()} test={test_source_ids.tolist()}"
+        )
+    else:
+        idxs = valid_window_idx.copy()
+        idxs = idxs[rng.permutation(T)]
+
+        train_frac = float(split_cfg.get("train", 0.8))
+        val_frac = float(split_cfg.get("val", 0.1))
+        if train_frac < 0.0 or val_frac < 0.0 or (train_frac + val_frac) > 1.0:
+            raise ValueError(
+                f"split.train and split.val must be non-negative with train+val<=1. "
+                f"Got train={train_frac}, val={val_frac}."
+            )
+
+        n_train = int(round(train_frac * T))
+        n_val = int(round(val_frac * T))
+        n_train = max(0, min(n_train, T))
+        n_val = max(0, min(n_val, T - n_train))
+
+        train_idx = idxs[:n_train]
+        val_idx = idxs[n_train : n_train + n_val]
+        test_idx = idxs[n_train + n_val :]
 
     train_ds = Subset(full_ds, train_idx.tolist())
     val_ds   = Subset(full_ds, val_idx.tolist())
