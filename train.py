@@ -206,7 +206,25 @@ def _compute_norm_stats_from_loader(
     momentum_sigma_mode: str = "independent",
     momentum_x_idx: int = 1,
     momentum_y_idx: int = 2,
+    print_progress: bool = True,
+    progress_every: int = 25,
 ):
+    dev = torch.device(device)
+    start_t = time.time()
+    total_batches = None
+    try:
+        total_batches = int(len(loader))
+    except Exception:
+        total_batches = None
+
+    if print_progress:
+        total_txt = str(total_batches) if total_batches is not None else "unknown"
+        print(
+            f"[NORM] Computing normalization stats on device={dev} "
+            f"(batches={total_txt}, progress_every={max(1, int(progress_every))}).",
+            flush=True,
+        )
+
     n_total = 0
     mean = None
     M2 = None
@@ -259,6 +277,42 @@ def _compute_norm_stats_from_loader(
             M2 = M2 + batch_M2 + (delta * delta) * (n_total * batch_n / new_n)
             n_total = new_n
 
+        if print_progress:
+            b_done = int(batch_idx) + 1
+            pe = max(1, int(progress_every))
+            should_print = (
+                (b_done == 1)
+                or (b_done % pe == 0)
+                or (total_batches is not None and b_done >= total_batches)
+            )
+            if should_print:
+                elapsed = max(time.time() - start_t, 1e-9)
+                rate = float(b_done) / elapsed
+                if total_batches is not None:
+                    remaining = max(0, int(total_batches) - b_done)
+                    eta_s = float(remaining) / max(rate, 1e-9)
+                    eta_txt = f"{eta_s:.1f}s"
+                    prog_txt = f"{b_done}/{int(total_batches)}"
+                else:
+                    eta_txt = "unknown"
+                    prog_txt = f"{b_done}/?"
+
+                cuda_txt = ""
+                if dev.type == "cuda" and torch.cuda.is_available():
+                    didx = dev.index if dev.index is not None else torch.cuda.current_device()
+                    mem_alloc_mb = float(torch.cuda.memory_allocated(didx)) / (1024.0 * 1024.0)
+                    mem_res_mb = float(torch.cuda.memory_reserved(didx)) / (1024.0 * 1024.0)
+                    cuda_txt = (
+                        f" | cuda_mem_alloc_mb={mem_alloc_mb:.1f} "
+                        f"cuda_mem_reserved_mb={mem_res_mb:.1f}"
+                    )
+
+                print(
+                    f"[NORM] progress {prog_txt} | elapsed={elapsed:.1f}s "
+                    f"| rate={rate:.2f} batches/s | eta={eta_txt}{cuda_txt}",
+                    flush=True,
+                )
+
     if mean is None or n_total < 2:
         raise RuntimeError("Could not compute normalization stats: no feature tensors found in loader.")
 
@@ -270,6 +324,12 @@ def _compute_norm_stats_from_loader(
         momentum_x_idx=momentum_x_idx,
         momentum_y_idx=momentum_y_idx,
     )
+    if print_progress:
+        elapsed = max(time.time() - start_t, 1e-9)
+        print(
+            f"[NORM] Done in {elapsed:.1f}s (samples={int(n_total)} features={int(mean.numel())}).",
+            flush=True,
+        )
     return mean, std
 
 def save_config(run_dir: str, cfg: dict, argv=None):
@@ -12145,6 +12205,14 @@ def main(
                 mu = sigma = None
 
     if do_norm and (mu is None or sigma is None):
+        norm_progress_enabled = _cfg_bool_strict(
+            cfg.get("train", {}).get("norm_stats_progress", True),
+            key="train.norm_stats_progress",
+        )
+        norm_progress_every = max(
+            1,
+            int(cfg.get("train", {}).get("norm_stats_progress_every", 25)),
+        )
         # compute from training loader on CPU/GPU (device already set)
         mu, sigma = _compute_norm_stats_from_loader(
             train_loader,
@@ -12152,6 +12220,8 @@ def main(
             momentum_sigma_mode=momentum_sigma_mode,
             momentum_x_idx=int(idx["mx"]),
             momentum_y_idx=int(idx["my"]),
+            print_progress=norm_progress_enabled,
+            progress_every=norm_progress_every,
         )
         # persist into cfg so eval uses the same stats
         cfg.setdefault("features", {}).setdefault("norm_stats", {})

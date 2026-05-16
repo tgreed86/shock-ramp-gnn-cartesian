@@ -62,7 +62,9 @@
     "precomp_force_recompute": false,
     "save_dir": "./runs_cartesian/100ep",
     "validation_every_epochs": 5,
-    "checkpoint_every_epochs": 5
+    "checkpoint_every_epochs": 5,
+    "norm_stats_progress": false,
+    "norm_stats_progress_every": 10
   },
   "speed": {
     "amp": false,
