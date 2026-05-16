@@ -1063,6 +1063,50 @@ def pick_device(pref: str = "auto") -> torch.device:
     return torch.device(pref)
 
 
+def _print_training_device_report(cfg: Dict[str, Any], device: torch.device) -> None:
+    """
+    Print a concise startup report indicating whether training will run on GPU.
+    """
+    dev = torch.device(device)
+    requested = str(cfg.get("device", "cpu"))
+    cuda_available = bool(torch.cuda.is_available())
+    mps_available = bool(
+        getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+    )
+    gpu_active = dev.type in ("cuda", "mps")
+
+    print(
+        f"[DEVICE] requested={requested!r} selected={str(dev)!r} "
+        f"gpu_active={'yes' if gpu_active else 'no'} backend={dev.type}",
+        flush=True,
+    )
+    print(
+        f"[DEVICE] availability: cuda={cuda_available} mps={mps_available}",
+        flush=True,
+    )
+
+    if dev.type == "cuda":
+        if not cuda_available:
+            print(
+                "[DEVICE][WARN] selected CUDA device but torch.cuda.is_available() is False.",
+                flush=True,
+            )
+            return
+        idx = dev.index if dev.index is not None else torch.cuda.current_device()
+        name = torch.cuda.get_device_name(idx)
+        props = torch.cuda.get_device_properties(idx)
+        total_gb = float(props.total_memory) / (1024.0 ** 3)
+        print(
+            f"[DEVICE] CUDA index={int(idx)} name={name} "
+            f"cc={int(props.major)}.{int(props.minor)} vram_gb={total_gb:.2f}",
+            flush=True,
+        )
+    elif dev.type == "mps":
+        print("[DEVICE] Apple Metal Performance Shaders (MPS) backend active.", flush=True)
+    else:
+        print("[DEVICE] CPU backend active (no GPU acceleration).", flush=True)
+
+
 def set_seed(seed: int = 42):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -11314,7 +11358,7 @@ def main(
     #device = pick_device(cfg.get("train", {}).get("device", "auto"))
     raw_dev = cfg.get("device", "cpu")
     device = torch.device(raw_dev)
-    #print(f"[INFO] Using device: {device}")
+    _print_training_device_report(cfg, device)
     set_seed(int(cfg.get("train", {}).get("seed", 42)))
 
     H = int(cfg["data"].get("H", 64)); W = int(cfg["data"].get("W", 64))
