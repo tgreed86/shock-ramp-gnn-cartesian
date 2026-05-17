@@ -12127,17 +12127,49 @@ def main(
             device="cpu",
         )
 
+    data_cfg = cfg.get("data", {}) or {}
+    loader_num_workers = int(data_cfg.get("num_workers", 0))
+    if loader_num_workers < 0:
+        raise ValueError(f"data.num_workers must be >= 0, got {loader_num_workers}.")
+    loader_pin_memory = _cfg_bool_strict(
+        data_cfg.get("pin_memory", (device.type == "cuda")),
+        key="data.pin_memory",
+    )
+    loader_persistent_workers = _cfg_bool_strict(
+        data_cfg.get("persistent_workers", (loader_num_workers > 0)),
+        key="data.persistent_workers",
+    ) if loader_num_workers > 0 else False
+    print(
+        "[DATA] DataLoader settings: "
+        f"num_workers={loader_num_workers} "
+        f"pin_memory={loader_pin_memory} "
+        f"persistent_workers={loader_persistent_workers}",
+        flush=True,
+    )
+
+    loader_common_kwargs: Dict[str, Any] = {
+        "batch_size": 1,
+        "num_workers": loader_num_workers,
+        "pin_memory": loader_pin_memory,
+        "collate_fn": collate,
+    }
+    if loader_num_workers > 0:
+        loader_common_kwargs["persistent_workers"] = loader_persistent_workers
+
     train_loader = DataLoader(
-        train_ds, batch_size=1, sampler=RandomSampler(train_ds),
-        num_workers=0, pin_memory=False, collate_fn=collate
+        train_ds,
+        sampler=RandomSampler(train_ds),
+        **loader_common_kwargs,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=1, sampler=RandomSampler(val_ds),
-        num_workers=0, pin_memory=False, collate_fn=collate
+        val_ds,
+        sampler=RandomSampler(val_ds),
+        **loader_common_kwargs,
     )
     test_loader = DataLoader(
-        test_ds, batch_size=1, sampler=RandomSampler(test_ds),
-        num_workers=0, pin_memory=False, collate_fn=collate
+        test_ds,
+        sampler=RandomSampler(test_ds),
+        **loader_common_kwargs,
     )
 
     chunk_sidecar_reader = None
@@ -12203,6 +12235,31 @@ def main(
                     f"{e!r}"
                 )
                 mu = sigma = None
+
+    if do_norm and (mu is None or sigma is None):
+        cfg_norm = (feats_cfg.get("norm_stats", None) if isinstance(feats_cfg, dict) else None)
+        if isinstance(cfg_norm, dict):
+            mu_raw = cfg_norm.get("mu", None)
+            sigma_raw = cfg_norm.get("sigma", None)
+            if (mu_raw is not None) and (sigma_raw is not None):
+                try:
+                    mu_cfg = torch.as_tensor(mu_raw, dtype=torch.float32, device=device).view(-1)
+                    sigma_cfg = torch.as_tensor(sigma_raw, dtype=torch.float32, device=device).view(-1)
+                    if mu_cfg.numel() != sigma_cfg.numel():
+                        raise ValueError(
+                            f"mu/sigma length mismatch ({mu_cfg.numel()} vs {sigma_cfg.numel()})"
+                        )
+                    if (not torch.isfinite(mu_cfg).all().item()) or (not torch.isfinite(sigma_cfg).all().item()):
+                        raise ValueError("mu/sigma contain non-finite values.")
+                    sigma_cfg = sigma_cfg.clamp_min(1e-12)
+                    mu, sigma = mu_cfg, sigma_cfg
+                    print(f"[NORM] Reusing normalization stats from config (F={mu.numel()}).")
+                except Exception as e:
+                    print(
+                        "[NORM][WARN] Could not use features.norm_stats from config; "
+                        f"will recompute from train loader: {e!r}"
+                    )
+                    mu = sigma = None
 
     if do_norm and (mu is None or sigma is None):
         norm_progress_enabled = _cfg_bool_strict(
