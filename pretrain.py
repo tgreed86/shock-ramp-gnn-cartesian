@@ -4374,10 +4374,117 @@ class CollateWithUniformStaticNoPrecomp:
         self._fallback_ei_cache_by_t: Dict[int, torch.Tensor] = {}
         self._printed_ei_fallback_once = False
         self._printed_ei_chain_fallback_once = False
+        train_cfg = self.cfg.get("train", {}) or {}
+        self.enable_uniform_static_fastpath = bool(
+            train_cfg.get("uniform_static_fastpath", True)
+        )
+        self._static_geom_ref: Dict[str, torch.Tensor] | None = None
+        self._static_pred_edge_attr_cpu: torch.Tensor | None = None
+        self._static_pred2pred_idx_cpu: torch.Tensor | None = None
+        self._static_pred2pred_w_cpu: torch.Tensor | None = None
+        self._fallback_ei_template: torch.Tensor | None = None
+        self._fallback_ei_template_nodes: int | None = None
+        self._printed_static_fastpath_once = False
 
         if not self.use_dataset_native_mesh:
             self._build_static_mesh()
         self._configure_mapping_backend()
+
+    def _geometry_equal(
+        self,
+        c_a: torch.Tensor,
+        l_a: torch.Tensor,
+        p_a: torch.Tensor,
+        c_b: torch.Tensor,
+        l_b: torch.Tensor,
+        p_b: torch.Tensor,
+    ) -> bool:
+        if c_a.shape != c_b.shape or l_a.shape != l_b.shape or p_a.shape != p_b.shape:
+            return False
+        if c_a.dtype != c_b.dtype or l_a.dtype != l_b.dtype or p_a.dtype != p_b.dtype:
+            return False
+        return bool(
+            torch.equal(c_a, c_b)
+            and torch.equal(l_a, l_b)
+            and torch.equal(p_a, p_b)
+        )
+
+    def _window_geometry_is_static(
+        self,
+        centers_list: List[torch.Tensor],
+        level_list: List[torch.Tensor],
+        parents_list: List[torch.Tensor],
+    ) -> bool:
+        if len(centers_list) <= 1:
+            return True
+        c0 = centers_list[0]
+        l0 = level_list[0]
+        p0 = parents_list[0]
+        for j in range(1, len(centers_list)):
+            if not self._geometry_equal(c0, l0, p0, centers_list[j], level_list[j], parents_list[j]):
+                return False
+        return True
+
+    def _ensure_uniform_static_fastpath_cache(
+        self,
+        *,
+        centers_list: List[torch.Tensor],
+        level_list: List[torch.Tensor],
+        parents_list: List[torch.Tensor],
+        ei_list: List[torch.Tensor],
+    ) -> bool:
+        if (not self.use_dataset_native_mesh) or (not self.enable_uniform_static_fastpath):
+            return False
+        if len(centers_list) == 0:
+            return False
+        if not self._window_geometry_is_static(centers_list, level_list, parents_list):
+            return False
+
+        c0 = centers_list[0]
+        l0 = level_list[0]
+        p0 = parents_list[0]
+        e0 = ei_list[0]
+        if e0.ndim != 2 or e0.size(0) != 2:
+            return False
+
+        if self._static_geom_ref is not None:
+            ref = self._static_geom_ref
+            if ref is None:
+                return False
+            if not self._geometry_equal(
+                ref["centers"], ref["levels"], ref["parents"], c0, l0, p0
+            ):
+                return False
+            if self._static_pred_edge_attr_cpu is None:
+                return False
+            if self._static_pred2pred_idx_cpu is None or self._static_pred2pred_w_cpu is None:
+                return False
+            return True
+
+        self._static_geom_ref = {
+            "centers": c0.detach().clone(),
+            "levels": l0.detach().clone(),
+            "parents": p0.detach().clone(),
+        }
+        self._static_pred_edge_attr_cpu = dec_edge_attr_for_dyadic_quads(
+            c0,
+            l0,
+            e0,
+            dx0=float(self.dx),
+            dy0=float(self.dy),
+            refine_ratio=2,
+        ).to(torch.float32)
+        n_nodes = int(c0.size(0))
+        self._static_pred2pred_idx_cpu = torch.arange(n_nodes, dtype=torch.int64).view(-1, 1)
+        self._static_pred2pred_w_cpu = torch.ones((n_nodes, 1), dtype=torch.float32)
+        if not self._printed_static_fastpath_once:
+            print(
+                "[UNIFORM-NOPRECOMP] enabled uniform_static_fastpath: "
+                f"reusing static edge_attr + identity pred2pred maps (N={n_nodes}).",
+                flush=True,
+            )
+            self._printed_static_fastpath_once = True
+        return True
 
     def _build_static_mesh(self) -> None:
         mesh_cfg = self.cfg.get("mesh", {}) or {}
@@ -4662,21 +4769,34 @@ class CollateWithUniformStaticNoPrecomp:
             max_local=int(self.cfg.get("edges", {}).get("max_local", 2048)),
         ).to(torch.int64)
         if ei.ndim == 2 and ei.size(0) == 2 and ei.numel() > 0:
+            if (
+                self.use_dataset_native_mesh
+                and self.enable_uniform_static_fastpath
+                and self._fallback_ei_template is None
+            ):
+                self._fallback_ei_template = ei
+                self._fallback_ei_template_nodes = int(centers.size(0))
             if not self._printed_ei_fallback_once:
-                print(
-                    "[UNIFORM-NOPRECOMP] built fallback edge_index for missing/empty dataset ei "
-                    f"(N={int(centers.size(0))}, E={int(ei.size(1))}).",
-                    flush=True,
-                )
+                wi = torch.utils.data.get_worker_info()
+                worker_ok = (wi is None) or (int(wi.id) == 0)
+                if worker_ok:
+                    print(
+                        "[UNIFORM-NOPRECOMP] built fallback edge_index for missing/empty dataset ei "
+                        f"(N={int(centers.size(0))}, E={int(ei.size(1))}).",
+                        flush=True,
+                    )
                 self._printed_ei_fallback_once = True
             return ei
         # Last-resort connectivity to keep training/eval from hard-failing.
         if not self._printed_ei_chain_fallback_once:
-            print(
-                "[UNIFORM-NOPRECOMP][WARN] local-KNN fallback edge build returned empty; "
-                "using chain connectivity fallback.",
-                flush=True,
-            )
+            wi = torch.utils.data.get_worker_info()
+            worker_ok = (wi is None) or (int(wi.id) == 0)
+            if worker_ok:
+                print(
+                    "[UNIFORM-NOPRECOMP][WARN] local-KNN fallback edge build returned empty; "
+                    "using chain connectivity fallback.",
+                    flush=True,
+                )
             self._printed_ei_chain_fallback_once = True
         return self._build_chain_fallback_edges(int(centers.size(0)))
 
@@ -4810,16 +4930,14 @@ class CollateWithUniformStaticNoPrecomp:
 
             ei_raw = ei_list_raw[j]
             if ei_raw is None:
-                cached = self._fallback_ei_cache_by_t.get(t_abs, None) if t_abs is not None else None
-                if cached is not None:
-                    ei = cached
+                if (
+                    self.use_dataset_native_mesh
+                    and self.enable_uniform_static_fastpath
+                    and self._fallback_ei_template is not None
+                    and self._fallback_ei_template_nodes == int(centers.size(0))
+                ):
+                    ei = self._fallback_ei_template
                 else:
-                    ei = self._build_fallback_edges(centers=centers, parents=parents)
-                    if t_abs is not None:
-                        self._fallback_ei_cache_by_t[t_abs] = ei
-            else:
-                ei = self._normalize_edge_index(ei_raw)
-                if ei.numel() == 0:
                     cached = self._fallback_ei_cache_by_t.get(t_abs, None) if t_abs is not None else None
                     if cached is not None:
                         ei = cached
@@ -4827,6 +4945,24 @@ class CollateWithUniformStaticNoPrecomp:
                         ei = self._build_fallback_edges(centers=centers, parents=parents)
                         if t_abs is not None:
                             self._fallback_ei_cache_by_t[t_abs] = ei
+            else:
+                ei = self._normalize_edge_index(ei_raw)
+                if ei.numel() == 0:
+                    if (
+                        self.use_dataset_native_mesh
+                        and self.enable_uniform_static_fastpath
+                        and self._fallback_ei_template is not None
+                        and self._fallback_ei_template_nodes == int(centers.size(0))
+                    ):
+                        ei = self._fallback_ei_template
+                    else:
+                        cached = self._fallback_ei_cache_by_t.get(t_abs, None) if t_abs is not None else None
+                        if cached is not None:
+                            ei = cached
+                        else:
+                            ei = self._build_fallback_edges(centers=centers, parents=parents)
+                            if t_abs is not None:
+                                self._fallback_ei_cache_by_t[t_abs] = ei
             if ei.size(0) != 2:
                 raise RuntimeError(f"ei_list[{j}] produced empty/invalid edge_index: shape={tuple(ei.shape)}")
 
@@ -4908,17 +5044,30 @@ class CollateWithUniformStaticNoPrecomp:
         K = len(centers_list)
 
         if self.use_dataset_native_mesh:
-            pred_edge_attr_list = [
-                dec_edge_attr_for_dyadic_quads(
-                    centers_list[j],
-                    level_list[j],
-                    ei_list[j],
-                    dx0=float(self.dx),
-                    dy0=float(self.dy),
-                    refine_ratio=2,
-                ).to(torch.float32)
-                for j in range(K)
-            ]
+            use_static_fastpath = self._ensure_uniform_static_fastpath_cache(
+                centers_list=centers_list,
+                level_list=level_list,
+                parents_list=parents_list,
+                ei_list=ei_list,
+            )
+
+            if use_static_fastpath:
+                assert self._static_pred_edge_attr_cpu is not None
+                assert self._static_pred2pred_idx_cpu is not None
+                assert self._static_pred2pred_w_cpu is not None
+                pred_edge_attr_list = [self._static_pred_edge_attr_cpu for _ in range(K)]
+            else:
+                pred_edge_attr_list = [
+                    dec_edge_attr_for_dyadic_quads(
+                        centers_list[j],
+                        level_list[j],
+                        ei_list[j],
+                        dx0=float(self.dx),
+                        dy0=float(self.dy),
+                        refine_ratio=2,
+                    ).to(torch.float32)
+                    for j in range(K)
+                ]
 
             feat_t_on_pred_list: List[torch.Tensor] = [feat_list[0] for _ in range(K)]
             feat_tp1_on_pred_list: List[torch.Tensor] = [feat_list[0] for _ in range(K)]
@@ -4926,7 +5075,11 @@ class CollateWithUniformStaticNoPrecomp:
                 feat_t_on_pred_list[j] = feat_list[j - 1]
                 feat_tp1_on_pred_list[j] = feat_list[j]
 
-            pred2pred_idx_list, pred2pred_w_list = self._build_pred2pred_maps_from_lists(centers_list)
+            if use_static_fastpath:
+                pred2pred_idx_list = [self._static_pred2pred_idx_cpu for _ in range(max(0, K - 1))]
+                pred2pred_w_list = [self._static_pred2pred_w_cpu for _ in range(max(0, K - 1))]
+            else:
+                pred2pred_idx_list, pred2pred_w_list = self._build_pred2pred_maps_from_lists(centers_list)
 
             ex["pred_centers_list"] = centers_list
             ex["pred_levels_list"] = level_list
