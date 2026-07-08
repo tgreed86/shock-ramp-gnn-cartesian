@@ -13,6 +13,12 @@ import inspect
 from typing import Any, Dict
 
 
+PREDICT_TYPE_STATE = "state"
+PREDICT_TYPE_DELTA = "delta"
+PREDICT_TYPE_RATE = "rate"
+PREDICT_TYPES = {PREDICT_TYPE_STATE, PREDICT_TYPE_DELTA, PREDICT_TYPE_RATE}
+
+
 def _make_activation(
     name: str,
     *,
@@ -35,6 +41,28 @@ def _make_activation(
     raise ValueError(
         f"Unsupported activation '{name}'. "
         "Use one of: relu, leaky_relu, silu, gelu, elu, identity."
+    )
+
+
+def _make_mlp(
+    *,
+    in_dim: int,
+    hidden_dim: int,
+    out_dim: int,
+    activation: str,
+    activation_negative_slope: float,
+    activation_elu_alpha: float,
+    dropout: float,
+) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Linear(int(in_dim), int(hidden_dim)),
+        _make_activation(
+            activation,
+            negative_slope=float(activation_negative_slope),
+            elu_alpha=float(activation_elu_alpha),
+        ),
+        nn.Dropout(p=float(dropout)),
+        nn.Linear(int(hidden_dim), int(out_dim)),
     )
 
 
@@ -123,6 +151,416 @@ class LocalEdgeAttention(nn.Module):
         return self.out_proj(out)
 
 
+class SAGEConvModel(nn.Module):
+    """GraphSAGE model matching the 1D advection/Burgers SAGEConv architecture."""
+
+    def __init__(
+        self,
+        *,
+        in_channels: int,
+        out_channels: int = 1,
+        state_channel: int = 0,
+        hidden: int = 64,
+        layers: int = 2,
+        dropout: float = 0.0,
+        activation: str = "relu",
+        activation_negative_slope: float = 0.01,
+        activation_elu_alpha: float = 1.0,
+        use_skip: bool = True,
+        use_layernorm: bool = False,
+        layernorm_eps: float = 1e-6,
+        predict_type: str = PREDICT_TYPE_STATE,
+    ) -> None:
+        super().__init__()
+        if in_channels <= 0:
+            raise ValueError(f"in_channels must be > 0, got {in_channels}.")
+        if out_channels <= 0:
+            raise ValueError(f"out_channels must be > 0, got {out_channels}.")
+        if state_channel < 0 or (state_channel + out_channels) > in_channels:
+            raise ValueError(
+                "state_channel/out_channels must select a valid state slice from the "
+                f"input, got state_channel={state_channel}, out_channels={out_channels}, "
+                f"in_channels={in_channels}."
+            )
+        if hidden <= 0:
+            raise ValueError(f"hidden must be > 0, got {hidden}.")
+        if layers < 1:
+            raise ValueError(f"layers must be >= 1, got {layers}.")
+        if not (0.0 <= float(dropout) < 1.0):
+            raise ValueError(f"dropout must satisfy 0 <= dropout < 1, got {dropout}.")
+        predict_key = str(predict_type).strip().lower()
+        if predict_key == "absolute":
+            predict_key = PREDICT_TYPE_STATE
+        if predict_key not in PREDICT_TYPES:
+            raise ValueError(
+                f"predict_type must be one of {sorted(PREDICT_TYPES)}, got '{predict_type}'."
+            )
+
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.state_channel = int(state_channel)
+        self.hidden = int(hidden)
+        self.layers = int(layers)
+        self.dropout = float(dropout)
+        self.predict_type = predict_key
+        self.use_skip = bool(use_skip)
+        self.use_layernorm = bool(use_layernorm)
+        self.block_activation = _make_activation(
+            activation,
+            negative_slope=float(activation_negative_slope),
+            elu_alpha=float(activation_elu_alpha),
+        )
+
+        dims = [self.in_channels] + [self.hidden] * self.layers
+        self.convs = nn.ModuleList()
+        self.skip_proj = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        for i in range(len(dims) - 1):
+            in_ch = int(dims[i])
+            out_ch = int(dims[i + 1])
+            self.convs.append(SAGEConv(in_ch, out_ch))
+            if self.use_skip:
+                if in_ch == out_ch:
+                    self.skip_proj.append(nn.Identity())
+                else:
+                    self.skip_proj.append(nn.Linear(in_ch, out_ch, bias=False))
+            else:
+                self.skip_proj.append(nn.Identity())
+            if self.use_layernorm:
+                self.norms.append(nn.LayerNorm(out_ch, eps=float(layernorm_eps)))
+            else:
+                self.norms.append(nn.Identity())
+
+        self.head = nn.Sequential(
+            nn.Linear(self.hidden, self.hidden),
+            _make_activation(
+                activation,
+                negative_slope=float(activation_negative_slope),
+                elu_alpha=float(activation_elu_alpha),
+            ),
+            nn.Dropout(p=self.dropout),
+            nn.Linear(self.hidden, self.out_channels),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        *,
+        edge_attr: torch.Tensor | None = None,
+        dt: float | None = None,
+    ) -> torch.Tensor:
+        """Run the SAGEConv stack; edge_attr and dt are accepted for API parity."""
+        del edge_attr
+        del dt
+
+        state = x[:, self.state_channel : self.state_channel + self.out_channels]
+        h = x
+        for li, conv in enumerate(self.convs):
+            h_res = h
+            h = conv(h, edge_index)
+            if self.use_skip:
+                h = h + self.skip_proj[li](h_res)
+            h = self.norms[li](h)
+            h = self.block_activation(h)
+            h = F.dropout(h, p=self.dropout, training=self.training)
+
+        out = self.head(h)
+        if self.predict_type == PREDICT_TYPE_STATE:
+            return state + out
+        if self.predict_type == PREDICT_TYPE_DELTA:
+            return out
+        if self.predict_type == PREDICT_TYPE_RATE:
+            return out
+        raise RuntimeError(f"Unexpected predict_type='{self.predict_type}'.")
+
+    def predict_state(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        *,
+        edge_attr: torch.Tensor | None = None,
+        dt: float,
+        state_override: torch.Tensor | None = None,
+        state_residual: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return next-state predictions regardless of model predict_type."""
+        if state_override is not None and state_residual is not None:
+            raise ValueError("Pass only one of state_override or state_residual.")
+
+        state_in = x[:, self.state_channel : self.state_channel + self.out_channels]
+        state_ref = state_override if state_override is not None else state_residual
+        if state_ref is None:
+            state_base = state_in
+        else:
+            if state_ref.ndim != 2 or state_ref.shape != state_in.shape:
+                raise ValueError(
+                    "state_override/state_residual must have shape matching the state "
+                    f"slice {tuple(state_in.shape)}, got {tuple(state_ref.shape)}."
+                )
+            state_base = state_ref.to(device=x.device, dtype=x.dtype)
+
+        y = self.forward(x, edge_index, edge_attr=edge_attr, dt=dt)
+        if self.predict_type == PREDICT_TYPE_STATE:
+            if state_ref is None:
+                return y
+            return y + (state_base - state_in)
+        if self.predict_type == PREDICT_TYPE_DELTA:
+            return state_base + y
+        if self.predict_type == PREDICT_TYPE_RATE:
+            return state_base + float(dt) * y
+        raise RuntimeError(f"Unexpected predict_type='{self.predict_type}'.")
+
+
+class MeshGraphNetProcessorBlock(nn.Module):
+    """One edge-update + node-update MeshGraphNet processor block."""
+
+    def __init__(
+        self,
+        *,
+        hidden: int,
+        dropout: float,
+        activation: str,
+        activation_negative_slope: float,
+        activation_elu_alpha: float,
+        use_layernorm: bool,
+        layernorm_eps: float,
+    ) -> None:
+        super().__init__()
+        self.edge_mlp = _make_mlp(
+            in_dim=3 * int(hidden),
+            hidden_dim=int(hidden),
+            out_dim=int(hidden),
+            activation=activation,
+            activation_negative_slope=float(activation_negative_slope),
+            activation_elu_alpha=float(activation_elu_alpha),
+            dropout=float(dropout),
+        )
+        self.node_mlp = _make_mlp(
+            in_dim=2 * int(hidden),
+            hidden_dim=int(hidden),
+            out_dim=int(hidden),
+            activation=activation,
+            activation_negative_slope=float(activation_negative_slope),
+            activation_elu_alpha=float(activation_elu_alpha),
+            dropout=float(dropout),
+        )
+        if use_layernorm:
+            self.edge_norm = nn.LayerNorm(int(hidden), eps=float(layernorm_eps))
+            self.node_norm = nn.LayerNorm(int(hidden), eps=float(layernorm_eps))
+        else:
+            self.edge_norm = nn.Identity()
+            self.node_norm = nn.Identity()
+
+    def forward(
+        self,
+        node_latent: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_latent: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        src = edge_index[0].long()
+        dst = edge_index[1].long()
+
+        edge_inputs = torch.cat(
+            [node_latent[src], node_latent[dst], edge_latent],
+            dim=-1,
+        )
+        edge_latent = edge_latent + self.edge_mlp(edge_inputs)
+        edge_latent = self.edge_norm(edge_latent)
+
+        agg = torch.zeros_like(node_latent)
+        agg.index_add_(0, dst, edge_latent)
+        node_inputs = torch.cat([node_latent, agg], dim=-1)
+        node_latent = node_latent + self.node_mlp(node_inputs)
+        node_latent = self.node_norm(node_latent)
+        return node_latent, edge_latent
+
+
+class MeshGraphNetModel(nn.Module):
+    """MeshGraphNet-style model matching the 1D advection/Burgers processor stack."""
+
+    def __init__(
+        self,
+        *,
+        in_channels: int,
+        out_channels: int = 1,
+        state_channel: int = 0,
+        edge_attr_channels: int = 5,
+        hidden: int = 64,
+        layers: int = 2,
+        dropout: float = 0.0,
+        activation: str = "relu",
+        activation_negative_slope: float = 0.01,
+        activation_elu_alpha: float = 1.0,
+        use_layernorm: bool = False,
+        layernorm_eps: float = 1e-6,
+        predict_type: str = PREDICT_TYPE_STATE,
+    ) -> None:
+        super().__init__()
+        if in_channels <= 0:
+            raise ValueError(f"in_channels must be > 0, got {in_channels}.")
+        if out_channels <= 0:
+            raise ValueError(f"out_channels must be > 0, got {out_channels}.")
+        if state_channel < 0 or (state_channel + out_channels) > in_channels:
+            raise ValueError(
+                "state_channel/out_channels must select a valid state slice from the "
+                f"input, got state_channel={state_channel}, out_channels={out_channels}, "
+                f"in_channels={in_channels}."
+            )
+        if edge_attr_channels <= 0:
+            raise ValueError(f"edge_attr_channels must be > 0, got {edge_attr_channels}.")
+        if hidden <= 0:
+            raise ValueError(f"hidden must be > 0, got {hidden}.")
+        if layers < 1:
+            raise ValueError(f"layers must be >= 1, got {layers}.")
+        if not (0.0 <= float(dropout) < 1.0):
+            raise ValueError(f"dropout must satisfy 0 <= dropout < 1, got {dropout}.")
+        predict_key = str(predict_type).strip().lower()
+        if predict_key == "absolute":
+            predict_key = PREDICT_TYPE_STATE
+        if predict_key not in PREDICT_TYPES:
+            raise ValueError(
+                f"predict_type must be one of {sorted(PREDICT_TYPES)}, got '{predict_type}'."
+            )
+
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.state_channel = int(state_channel)
+        self.edge_attr_channels = int(edge_attr_channels)
+        self.hidden = int(hidden)
+        self.layers = int(layers)
+        self.dropout = float(dropout)
+        self.predict_type = predict_key
+        self.block_activation = _make_activation(
+            activation,
+            negative_slope=float(activation_negative_slope),
+            elu_alpha=float(activation_elu_alpha),
+        )
+
+        self.node_encoder = _make_mlp(
+            in_dim=self.in_channels,
+            hidden_dim=self.hidden,
+            out_dim=self.hidden,
+            activation=activation,
+            activation_negative_slope=float(activation_negative_slope),
+            activation_elu_alpha=float(activation_elu_alpha),
+            dropout=self.dropout,
+        )
+        self.edge_encoder = _make_mlp(
+            in_dim=self.edge_attr_channels,
+            hidden_dim=self.hidden,
+            out_dim=self.hidden,
+            activation=activation,
+            activation_negative_slope=float(activation_negative_slope),
+            activation_elu_alpha=float(activation_elu_alpha),
+            dropout=self.dropout,
+        )
+        self.processor = nn.ModuleList(
+            [
+                MeshGraphNetProcessorBlock(
+                    hidden=self.hidden,
+                    dropout=self.dropout,
+                    activation=activation,
+                    activation_negative_slope=float(activation_negative_slope),
+                    activation_elu_alpha=float(activation_elu_alpha),
+                    use_layernorm=bool(use_layernorm),
+                    layernorm_eps=float(layernorm_eps),
+                )
+                for _ in range(self.layers)
+            ]
+        )
+        self.head = nn.Sequential(
+            nn.Linear(self.hidden, self.hidden),
+            _make_activation(
+                activation,
+                negative_slope=float(activation_negative_slope),
+                elu_alpha=float(activation_elu_alpha),
+            ),
+            nn.Dropout(p=self.dropout),
+            nn.Linear(self.hidden, self.out_channels),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        *,
+        edge_attr: torch.Tensor | None = None,
+        dt: float | None = None,
+    ) -> torch.Tensor:
+        del dt
+
+        state = x[:, self.state_channel : self.state_channel + self.out_channels]
+        if edge_attr is None:
+            raise ValueError("MeshGraphNetModel requires edge_attr in forward/predict_state.")
+        if edge_attr.ndim != 2:
+            raise ValueError(f"edge_attr must be rank-2 [E,D], got shape={tuple(edge_attr.shape)}.")
+        if edge_attr.shape[1] != self.edge_attr_channels:
+            raise ValueError(
+                "edge_attr channel mismatch: "
+                f"expected {self.edge_attr_channels}, got {edge_attr.shape[1]}."
+            )
+        if edge_attr.shape[0] != edge_index.shape[1]:
+            raise ValueError(
+                "edge_attr edge count mismatch: "
+                f"edge_attr has {edge_attr.shape[0]} rows, edge_index has {edge_index.shape[1]} edges."
+            )
+
+        edge_attr = edge_attr.to(device=x.device, dtype=x.dtype)
+        node_latent = self.node_encoder(x)
+        edge_latent = self.edge_encoder(edge_attr)
+        for block in self.processor:
+            node_latent, edge_latent = block(node_latent, edge_index, edge_latent)
+            node_latent = self.block_activation(node_latent)
+            node_latent = F.dropout(node_latent, p=self.dropout, training=self.training)
+
+        out = self.head(node_latent)
+        if self.predict_type == PREDICT_TYPE_STATE:
+            return state + out
+        if self.predict_type == PREDICT_TYPE_DELTA:
+            return out
+        if self.predict_type == PREDICT_TYPE_RATE:
+            return out
+        raise RuntimeError(f"Unexpected predict_type='{self.predict_type}'.")
+
+    def predict_state(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        *,
+        edge_attr: torch.Tensor | None = None,
+        dt: float,
+        state_override: torch.Tensor | None = None,
+        state_residual: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return next-state predictions regardless of model predict_type."""
+        if state_override is not None and state_residual is not None:
+            raise ValueError("Pass only one of state_override or state_residual.")
+
+        state_in = x[:, self.state_channel : self.state_channel + self.out_channels]
+        state_ref = state_override if state_override is not None else state_residual
+        if state_ref is None:
+            state_base = state_in
+        else:
+            if state_ref.ndim != 2 or state_ref.shape != state_in.shape:
+                raise ValueError(
+                    "state_override/state_residual must have shape matching the state "
+                    f"slice {tuple(state_in.shape)}, got {tuple(state_ref.shape)}."
+                )
+            state_base = state_ref.to(device=x.device, dtype=x.dtype)
+
+        y = self.forward(x, edge_index, edge_attr=edge_attr, dt=dt)
+        if self.predict_type == PREDICT_TYPE_STATE:
+            if state_ref is None:
+                return y
+            return y + (state_base - state_in)
+        if self.predict_type == PREDICT_TYPE_DELTA:
+            return state_base + y
+        if self.predict_type == PREDICT_TYPE_RATE:
+            return state_base + float(dt) * y
+        raise RuntimeError(f"Unexpected predict_type='{self.predict_type}'.")
+
+
 class FeatureNet(nn.Module):
     """
     GraphSAGE encoder with a regression head that predicts features at dynamic cell centers.
@@ -154,7 +592,13 @@ class FeatureNet(nn.Module):
         activation_elu_alpha: float = 1.0,
     ):
         super().__init__()
+        if hidden <= 0:
+            raise ValueError(f"hidden must be > 0, got {hidden}.")
+        if layers < 1:
+            raise ValueError(f"layers must be >= 1, got {layers}.")
         self.dropout = dropout
+        self.hidden = int(hidden)
+        self.layers = int(layers)
         self.conv_type = str(conv_type).strip().lower()
         if self.conv_type not in {"sage", "gine", "nnconv"}:
             raise ValueError(
@@ -188,7 +632,7 @@ class FeatureNet(nn.Module):
             elu_alpha=self.activation_elu_alpha,
         )
 
-        dims = [in_channels] + [hidden] * (layers - 1)
+        dims = [in_channels] + [hidden] * self.layers
         self.convs = nn.ModuleList()
         self.layer_types = []
         self.block_skip_proj = nn.ModuleList()

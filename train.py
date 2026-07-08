@@ -32,7 +32,7 @@ from contextlib import nullcontext
 import numpy as np
 
 from dataset import CellRefineWindowDataset
-from models import FeatureNet, ParcFeatureAdapter
+from models import FeatureNet, MeshGraphNetModel, ParcFeatureAdapter, SAGEConvModel
 from amr_policy import coarse_aggregate_from_dynamic, predict_masks_hierarchical_from_gt_gradients
             
 from plots import plot_loss_curves, amr_composite_to_finest_grid
@@ -455,6 +455,13 @@ def mls_advdiff_terms_abs_faceadj(
     Still supports 2-hop and neighbor damping via solver options.
     """
     loss_cfg = cfg.get("loss", {}) or {}
+    advection_type = str(loss_cfg.get("advection_type", "scalar")).strip().lower()
+    if compute_adv and advection_type != "scalar":
+        raise RuntimeError(
+            "MLS backend only supports loss.advection_type='scalar'. "
+            f"Got advection_type={advection_type!r}. "
+            "Use loss.physics_backend='dec' for Euler advection."
+        )
     rho_floor = float(loss_cfg.get("rho_floor", 1e-6))
     u_clip    = float(loss_cfg.get("u_clip", 1000.0))
     nu        = float(loss_cfg.get("nu", 0.0))
@@ -2225,6 +2232,107 @@ def _ramp_feature_source_id_for_t(
     return None
 
 
+def _position_feature_mode(cfg: Dict[str, Any]) -> str:
+    build_cfg = cfg.get("features", {}).get("build", {}) or {}
+    if not _cfg_bool_strict(build_cfg.get("use_pos", True), key="features.build.use_pos"):
+        return "none"
+
+    raw = str(build_cfg.get("position_mode", "xy")).strip().lower().replace("-", "_")
+    aliases = {
+        "none": "none",
+        "off": "none",
+        "false": "none",
+        "xy": "xy",
+        "x_y": "xy",
+        "pos": "xy",
+        "position": "xy",
+        "positions": "xy",
+        "coords": "xy",
+        "coordinates": "xy",
+        "absolute": "xy",
+        "absolute_xy": "xy",
+        "boundary": "boundary_distances",
+        "boundary_distance": "boundary_distances",
+        "boundary_distances": "boundary_distances",
+        "distance_to_boundary": "boundary_distances",
+        "distances_to_boundary": "boundary_distances",
+        "distance_to_boundaries": "boundary_distances",
+        "distances_to_boundaries": "boundary_distances",
+        "boundary_distance_clipped": "boundary_distances",
+        "boundary_distances_clipped": "boundary_distances",
+        "clipped_boundary_distances": "boundary_distances",
+    }
+    if raw not in aliases:
+        raise ValueError(
+            "features.build.position_mode must be one of {xy, boundary_distances, none}; "
+            f"got {build_cfg.get('position_mode')!r}."
+        )
+    return aliases[raw]
+
+
+def _position_feature_dim(cfg: Dict[str, Any]) -> int:
+    mode = _position_feature_mode(cfg)
+    if mode == "none":
+        return 0
+    if mode == "xy":
+        return 2
+    if mode == "boundary_distances":
+        return 4
+    raise RuntimeError(f"Unexpected position feature mode: {mode}")
+
+
+def _build_position_features(
+    centers: torch.Tensor,
+    cfg: Dict[str, Any],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    mode = _position_feature_mode(cfg)
+    if mode == "none":
+        return None
+    if centers is None or (not torch.is_tensor(centers)) or centers.ndim != 2 or centers.size(1) < 2:
+        raise RuntimeError(
+            f"features.build.position_mode='{mode}' requires centers tensor with shape (N,2)."
+        )
+
+    xy = centers[:, :2].to(device=device, dtype=dtype)
+    if mode == "xy":
+        return xy
+
+    xmin, xmax, ymin, ymax = _get_bbox(cfg)
+    xmin_t = torch.tensor(float(xmin), device=device, dtype=dtype)
+    xmax_t = torch.tensor(float(xmax), device=device, dtype=dtype)
+    ymin_t = torch.tensor(float(ymin), device=device, dtype=dtype)
+    ymax_t = torch.tensor(float(ymax), device=device, dtype=dtype)
+
+    x = xy[:, 0:1]
+    y = xy[:, 1:2]
+    d_left = x - xmin_t
+    d_right = xmax_t - x
+    d_bottom = y - ymin_t
+    d_top = ymax_t - y
+    out = torch.cat([d_left, d_right, d_bottom, d_top], dim=1)
+
+    build_cfg = cfg.get("features", {}).get("build", {}) or {}
+    if bool(build_cfg.get("boundary_distance_normalize", True)):
+        lx = max(float(xmax) - float(xmin), 1e-12)
+        ly = max(float(ymax) - float(ymin), 1e-12)
+        scale = torch.tensor([lx, lx, ly, ly], device=device, dtype=dtype).view(1, 4)
+        out = out / scale
+
+    clip_raw = build_cfg.get("boundary_distance_clip", None)
+    if clip_raw is not None:
+        clip = float(clip_raw)
+        if clip <= 0.0:
+            raise ValueError("features.build.boundary_distance_clip must be > 0 when provided.")
+        out = out.clamp(min=0.0, max=clip)
+        if bool(build_cfg.get("boundary_distance_clip_normalize", True)):
+            out = out / clip
+
+    return out
+
+
 def _build_X(
     feat,
     centers,
@@ -2236,7 +2344,7 @@ def _build_X(
 ):
     """
     Build node features for FeatureNet:
-      [ physics_feat ] (+ [x,y] if use_pos) (+ [level] if use_level)
+      [ physics_feat ] (+ position features if use_pos) (+ [level] if use_level)
       (+ [dt_hat_fixed] if features.build.use_dt_hat_fixed)
 
     feat:    (N, F) on whatever device we want to run the model on (cpu/cuda/mps)
@@ -2244,7 +2352,6 @@ def _build_X(
     levels:  (N,) or (N,1)
     """
     build_cfg = cfg.get("features", {}).get("build", {})
-    use_pos   = build_cfg.get("use_pos", True)
     use_level = build_cfg.get("use_level", True)
     use_dt_hat_fixed = bool(build_cfg.get("use_dt_hat_fixed", False))
     include_ramp_angle = bool(build_cfg.get("include_ramp_angle", False))
@@ -2253,8 +2360,9 @@ def _build_X(
     dev = feat.device
     Xs = [feat]  # already on dev
 
-    if use_pos:
-        Xs.append(centers.to(dev))
+    pos_feat = _build_position_features(centers, cfg, device=dev, dtype=feat.dtype)
+    if pos_feat is not None:
+        Xs.append(pos_feat)
 
     if use_level:
         lvl = levels
@@ -6399,6 +6507,121 @@ def _apply_rate_guardrails(y_rate: torch.Tensor, dt_hat: torch.Tensor | float, c
 
     return y
 
+
+def _normalize_predict_type_key(predict_type: Any) -> str:
+    key = str(predict_type).strip().lower()
+    if key == "absolute":
+        key = "state"
+    if key not in {"state", "delta", "rate"}:
+        raise ValueError(
+            f"model.predict_type must be one of {{state, delta, rate}}, got {predict_type!r}."
+        )
+    return key
+
+
+def _target_for_predict_type(
+    *,
+    norm_in: torch.Tensor,
+    norm_tgt: torch.Tensor,
+    dt_hat: torch.Tensor,
+    predict_type: str,
+) -> torch.Tensor:
+    predict_type = _normalize_predict_type_key(predict_type)
+    if predict_type == "state":
+        return norm_tgt
+    delta_target = norm_tgt - norm_in
+    if predict_type == "delta":
+        return delta_target
+    return delta_target / dt_hat.clamp_min(1e-12)
+
+
+def _state_from_model_output(
+    *,
+    norm_in: torch.Tensor,
+    y_pred: torch.Tensor,
+    dt_hat: torch.Tensor,
+    predict_type: str,
+) -> torch.Tensor:
+    predict_type = _normalize_predict_type_key(predict_type)
+    if predict_type == "state":
+        return y_pred
+    if predict_type == "delta":
+        return norm_in + y_pred
+    return norm_in + y_pred * dt_hat
+
+
+def _resolve_model_type_key(model_cfg: Dict[str, Any] | None) -> str:
+    model_cfg = model_cfg or {}
+    raw_model_type = model_cfg.get("type", None)
+    model_name = str(model_cfg.get("name", "FeatureNet")).strip().lower().replace("-", "_")
+    if raw_model_type is None:
+        if model_name in {"sageconvmodel", "sageconv", "advectionsagemodel", "burgerssagemodel"}:
+            model_type = "sageconv"
+        elif model_name in {
+            "meshgraphnet",
+            "mesh_graph_net",
+            "mgn",
+            "meshgraphnetmodel",
+            "advectionmeshgraphnetmodel",
+            "burgersmeshgraphnetmodel",
+        }:
+            model_type = "meshgraphnet"
+        else:
+            model_type = "featurenet"
+    else:
+        model_type = str(raw_model_type).strip().lower().replace("-", "_")
+
+    model_type_aliases = {
+        "feature_net": "featurenet",
+        "featurenet": "featurenet",
+        "graphsage": "sageconv",
+        "sage_conv": "sageconv",
+        "sageconv": "sageconv",
+        "sagemodel": "sageconv",
+        "sageconvmodel": "sageconv",
+        "advectionsagemodel": "sageconv",
+        "burgerssagemodel": "sageconv",
+        "mesh_graph_net": "meshgraphnet",
+        "meshgraphnet": "meshgraphnet",
+        "mgn": "meshgraphnet",
+        "meshgraphnetmodel": "meshgraphnet",
+        "advectionmeshgraphnetmodel": "meshgraphnet",
+        "burgersmeshgraphnetmodel": "meshgraphnet",
+    }
+    model_type = model_type_aliases.get(model_type, model_type)
+    valid_model_types = {"featurenet", "sageconv", "meshgraphnet"}
+    if model_type not in valid_model_types:
+        raise ValueError(
+            f"Unsupported model.type '{model_cfg.get('type')}'. "
+            "Use model.type='featurenet', 'sageconv', or 'meshgraphnet'. "
+            "For FeatureNet message passing, set model.conv_type to one of "
+            "{sage, gine, nnconv}."
+        )
+    return model_type
+
+
+def _model_requires_edge_attr_from_cfg(cfg: Dict[str, Any]) -> bool:
+    model_cfg = cfg.get("model", {}) or {}
+    model_type = _resolve_model_type_key(model_cfg)
+    if model_type == "meshgraphnet":
+        return True
+    if model_type != "featurenet":
+        return False
+
+    conv_type = str(model_cfg.get("conv_type", "sage")).strip().lower().replace("-", "_")
+    if conv_type == "sageconv":
+        conv_type = "sage"
+    if conv_type in {"gine", "nnconv"}:
+        return True
+
+    att_cfg = model_cfg.get("attention", {}) or {}
+    use_attention = bool(model_cfg.get("use_attention", att_cfg.get("enabled", False)))
+    attention_use_edge_attr = bool(
+        model_cfg.get("attention_use_edge_attr", att_cfg.get("use_edge_attr", True))
+    )
+    return bool(use_attention and attention_use_edge_attr)
+
+
 def sanitize_state_for_ops(x_abs: torch.Tensor, cfg: dict, rho_floor=1e-6, E_floor=1e-6):
     loss = cfg.get("loss", {}) or {}
     u_clip = float(loss.get("u_clip", 1e3))
@@ -6605,11 +6828,11 @@ def train_one_epoch_multi_step(
 ):
     """
     STRICT multi-step mesh-first training with:
-      - Variant-B physics baseline + learned correction (rate mode)
+      - Variant-B physics baseline + learned correction
       - Optional PARC operator inputs (advection/diffusion terms)
       - Optional physics residual loss (delta-form), as before
 
-    Assumes model predicts RATE (cfg["model"]["predict_type"] == "rate").
+    Supports model.predict_type in {state, delta, rate}; RK4 integration requires rate.
     """
 
     model.train()
@@ -6753,13 +6976,19 @@ def train_one_epoch_multi_step(
     use_huber = bool(cfg["loss"].get("use_huber", True))
     grad_clip = float(cfg.get("train", {}).get("grad_clip", 1.0))
 
-    predict_type = str(cfg.get("model", {}).get("predict_type", "rate")).lower()
-    if predict_type != "rate":
-        raise RuntimeError(f"PARC/Variant-B implementation below assumes predict_type='rate', got '{predict_type}'")
+    predict_type = _normalize_predict_type_key(
+        cfg.get("model", {}).get("predict_type", cfg.get("model", {}).get("target_mode", "rate"))
+    )
+    cfg.setdefault("model", {})["predict_type"] = predict_type
     time_integrator = _resolve_time_integrator(cfg)
     _time_integrator_eff, rk4_alpha = _resolve_time_integrator_for_epoch(
         cfg, epoch_idx=epoch_idx, base_integrator=time_integrator
     )
+    if predict_type != "rate" and rk4_alpha > 0.0:
+        raise RuntimeError(
+            "RK4/ramped RK4 integration requires model.predict_type='rate'. "
+            f"Got predict_type='{predict_type}'."
+        )
 
     # Physics-input controls
     loss_cfg = cfg.get("loss", {}) or {}
@@ -6773,6 +7002,7 @@ def train_one_epoch_multi_step(
     # Determine whether we must compute physics operators this step.
     # Physics is now controlled by loss.physics_inputs_enabled.
     need_phy = bool(parc_use)
+    model_needs_edge_attr = _model_requires_edge_attr_from_cfg(cfg)
 
     parc_sel_cache: Dict[int, Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]] = {}
     parc_mask_cache: Dict[Tuple[int, str, int], torch.Tensor] = {}
@@ -6829,7 +7059,7 @@ def train_one_epoch_multi_step(
     runtime_idw_backend_kwargs: Dict[str, Any] = {}
     runtime_bbox = _get_bbox(cfg)
     runtime_refine_ratio = _get_refine_ratio(cfg)
-    runtime_need_edge_attr = bool(need_phy and (not use_mls))
+    runtime_need_edge_attr = bool(model_needs_edge_attr or (need_phy and (not use_mls)))
     runtime_mesh_plot_settings = _runtime_mesh_plot_settings(cfg)
     runtime_mesh_plot_state = {"rebuilds": 0, "saved": 0}
     runtime_mesh_plot_wedge_path = None
@@ -7680,9 +7910,10 @@ def train_one_epoch_multi_step(
         feat_t_on_pred_list = _require_list(batch, "feat_t_on_pred_list")
         feat_tp1_on_pred_list = _require_list(batch, "feat_tp1_on_pred_list")
 
-        if need_phy and pred_ea_list is None:
+        if (model_needs_edge_attr or (need_phy and (not use_mls))) and pred_ea_list is None:
             raise RuntimeError(
-                "PARC/DEC enabled but batch is missing pred_ea_list / pred_edge_attr_list. "
+                "Model/DEC physics requires edge attributes, but batch is missing "
+                "pred_ea_list / pred_edge_attr_list. "
                 "Update H5 loader + CollateWithPrecompute to attach edge_attr per step."
             )
 
@@ -7696,10 +7927,11 @@ def train_one_epoch_multi_step(
         opt.zero_grad(set_to_none=True)
         batch_rt_other_zero_grad_s += _rt_dt(t_zero_grad_t0)
 
-        # Only DEC needs edge_attr. MLS does not.
-        if need_phy and (not use_mls) and (pred_ea_list is None):
+        # Only DEC physics and edge-aware model families need edge_attr. MLS does not.
+        if (model_needs_edge_attr or (need_phy and (not use_mls))) and (pred_ea_list is None):
             raise RuntimeError(
-                "DEC/PARC physics enabled but batch is missing pred_ea_list / pred_edge_attr_list. "
+                "Model/DEC physics requires edge attributes, but batch is missing "
+                "pred_ea_list / pred_edge_attr_list. "
                 "Update loader + CollateWithPrecompute to attach edge_attr per step."
             )
 
@@ -7834,6 +8066,11 @@ def train_one_epoch_multi_step(
             with amp_ctx():
                 pei = pred_ei.to(device) if torch.is_tensor(pred_ei) else pred_ei
                 pea = pred_ea.to(device) if (pred_ea is not None and torch.is_tensor(pred_ea)) else pred_ea
+                if model_needs_edge_attr and pea is None:
+                    raise RuntimeError(
+                        f"model.type='{cfg.get('model', {}).get('type', cfg.get('model', {}).get('name', ''))}' "
+                        f"requires edge_attr, but step_k={step_k} has pred_ea=None."
+                    )
                 chunk_specs_eff = chunk_specs_step
                 if chunk_enabled and (chunk_specs_eff is None):
                     t_chunk_t0 = _step_t0()
@@ -8610,22 +8847,30 @@ def train_one_epoch_multi_step(
                 t_loss_t0 = _step_t0()
                 delta_target = norm_tgt - norm_in
                 rate_target = delta_target / dt_hat.clamp_min(1e-12)
+                model_target = _target_for_predict_type(
+                    norm_in=norm_in,
+                    norm_tgt=norm_tgt,
+                    dt_hat=dt_hat,
+                    predict_type=predict_type,
+                )
 
                 if _should_print():
-                    print(f"[NAN-DBG] step={step_k} ---- rate_target checks ----")
+                    print(f"[NAN-DBG] step={step_k} ---- target checks ----")
                     _tstats("delta_target", delta_target)
                     _tstats("rate_target", rate_target)
+                    _tstats("model_target", model_target)
                     _mark_printed()
 
-                _assert_finite_if("rate_target", rate_target)
+                _assert_finite_if("model_target", model_target)
 
                 watch_steps = set(cfg.get("debug", {}).get("parc_scale_watch_steps", [0, 3, 6, 9]))
                 if cfg.get("debug", {}).get("parc_scale_watch", False) and (step_k in watch_steps):
                     with torch.no_grad():
-                        _tstats("rate_target", rate_target)
+                        _tstats("model_target", model_target)
                         _tstats("y_pred", y_pred)
 
-                y_pred = _apply_rate_guardrails(y_pred, dt_hat, cfg)
+                if predict_type == "rate":
+                    y_pred = _apply_rate_guardrails(y_pred, dt_hat, cfg)
 
 
                 # ==========================================================
@@ -8634,13 +8879,19 @@ def train_one_epoch_multi_step(
                 #   - phys-space call: best to detect normalization mismatch
                 # NOTE: do NOT pass the AMP GradScaler "scaler" here.
                 # ==========================================================
-                center_loss = (F.huber_loss(y_pred, rate_target, delta=huber_delta)
-                               if use_huber else F.mse_loss(y_pred, rate_target))
+                center_loss = (F.huber_loss(y_pred, model_target, delta=huber_delta)
+                               if use_huber else F.mse_loss(y_pred, model_target))
 
-                y_pred_abs = _maybe_denorm(norm_in + y_pred * dt_hat, mu, sigma)
+                y_pred_norm = _state_from_model_output(
+                    norm_in=norm_in,
+                    y_pred=y_pred,
+                    dt_hat=dt_hat,
+                    predict_type=predict_type,
+                )
+                y_pred_abs = _maybe_denorm(y_pred_norm, mu, sigma)
 
                 # ---------------- DEBUG: oracle check ----------------
-                if cfg.get("debug", {}).get("oracle_watch", False):
+                if cfg.get("debug", {}).get("oracle_watch", False) and predict_type == "rate":
                     Fdim = int(x_in_abs.size(1))
                     idx = dec.infer_feature_indices(cfg, Fdim)
                     rho_idx = int(idx.get("rho", 0))
@@ -9571,13 +9822,19 @@ def evaluate_one_epoch_multi_step(
     tmp_w  = float(cfg["loss"].get("temporal_weight", 0.0))
     use_huber = bool(cfg["loss"].get("use_huber", True))
 
-    predict_type = str(cfg.get("model", {}).get("predict_type", "rate")).lower()
-    if predict_type != "rate":
-        raise RuntimeError(f"PARC/Variant-B implementation below assumes predict_type='rate', got '{predict_type}'")
+    predict_type = _normalize_predict_type_key(
+        cfg.get("model", {}).get("predict_type", cfg.get("model", {}).get("target_mode", "rate"))
+    )
+    cfg.setdefault("model", {})["predict_type"] = predict_type
     time_integrator = _resolve_time_integrator(cfg)
     _time_integrator_eff, rk4_alpha = _resolve_time_integrator_for_epoch(
         cfg, epoch_idx=epoch_idx, base_integrator=time_integrator
     )
+    if predict_type != "rate" and rk4_alpha > 0.0:
+        raise RuntimeError(
+            "RK4/ramped RK4 integration requires model.predict_type='rate'. "
+            f"Got predict_type='{predict_type}'."
+        )
 
     loss_cfg = cfg.get("loss", {}) or {}
     parc_use = _physics_inputs_active_from_loss_cfg(loss_cfg)
@@ -9587,6 +9844,7 @@ def evaluate_one_epoch_multi_step(
     dec_resid_w = float(loss_cfg.get("residual_weight", 0.0))
 
     need_phy = bool(parc_use)
+    model_needs_edge_attr = _model_requires_edge_attr_from_cfg(cfg)
 
     backend = str(loss_cfg.get("physics_backend", "dec")).lower()
     use_mls = (backend in ("mls", "moving_least_squares", "moving-least-squares"))
@@ -9612,7 +9870,7 @@ def evaluate_one_epoch_multi_step(
     runtime_idw_backend_kwargs: Dict[str, Any] = {}
     runtime_bbox = _get_bbox(cfg)
     runtime_refine_ratio = _get_refine_ratio(cfg)
-    runtime_need_edge_attr = bool(need_phy and (not use_mls))
+    runtime_need_edge_attr = bool(model_needs_edge_attr or (need_phy and (not use_mls)))
     runtime_mesh_plot_settings = _runtime_mesh_plot_settings(cfg)
     runtime_mesh_plot_state = {"rebuilds": 0, "saved": 0}
     runtime_mesh_plot_wedge_path = None
@@ -9849,9 +10107,10 @@ def evaluate_one_epoch_multi_step(
             feat_t_on_pred_list = _require_list(batch, "feat_t_on_pred_list")
             feat_tp1_on_pred_list = _require_list(batch, "feat_tp1_on_pred_list")
 
-            if need_phy and pred_ea_list is None:
+            if (model_needs_edge_attr or (need_phy and (not use_mls))) and pred_ea_list is None:
                 raise RuntimeError(
-                    "PARC/DEC enabled but batch is missing pred_ea_list / pred_edge_attr_list."
+                    "Model/DEC physics requires edge attributes, but batch is missing "
+                    "pred_ea_list / pred_edge_attr_list."
                 )
 
             pred_lists = (pred_centers_list, pred_levels_list, pred_parents_list, pred_ei_list, mask_pred_list)
@@ -9887,6 +10146,11 @@ def evaluate_one_epoch_multi_step(
                 with amp_ctx():
                     pei = pred_ei.to(device) if torch.is_tensor(pred_ei) else pred_ei
                     pea = pred_ea.to(device) if (pred_ea is not None and torch.is_tensor(pred_ea)) else pred_ea
+                    if model_needs_edge_attr and pea is None:
+                        raise RuntimeError(
+                            f"model.type='{cfg.get('model', {}).get('type', cfg.get('model', {}).get('name', ''))}' "
+                            f"requires edge_attr, but eval step_k={step_k} has pred_ea=None."
+                        )
 
                     r_adv_abs = r_diff_abs = r_phy_abs = area = None
                     ch_mask = None
@@ -10243,14 +10507,21 @@ def evaluate_one_epoch_multi_step(
                             if (r_phy_abs is not None) and (r_phy_rk4 is not None):
                                 r_phy_for_loss = (1.0 - rk4_alpha) * r_phy_abs + rk4_alpha * r_phy_rk4
 
-                    y_pred = _apply_rate_guardrails(y_pred, dt_hat, cfg)
+                    if predict_type == "rate":
+                        y_pred = _apply_rate_guardrails(y_pred, dt_hat, cfg)
 
                     # Absolute prediction update in fp32 for stability.
                     with torch.autocast(device_type=device.type, enabled=False):
                         dt_hat_f32 = dt_hat.to(dtype=torch.float32)
                         y_pred_f32 = y_pred.to(dtype=torch.float32)
+                        y_pred_norm_f32 = _state_from_model_output(
+                            norm_in=norm_in.to(dtype=torch.float32),
+                            y_pred=y_pred_f32,
+                            dt_hat=dt_hat_f32,
+                            predict_type=predict_type,
+                        )
                         y_pred_abs = _maybe_denorm(
-                            norm_in.to(dtype=torch.float32) + y_pred_f32 * dt_hat_f32,
+                            y_pred_norm_f32,
                             mu, sigma
                         )
 
@@ -10258,12 +10529,16 @@ def evaluate_one_epoch_multi_step(
                     tmp_loss = y_pred.new_zeros(())
                     if norm_tgt is not None:
                         with torch.autocast(device_type=device.type, enabled=False):
-                            delta_target_f32 = (norm_tgt - norm_in).to(dtype=torch.float32)
                             dt_hat_f32 = dt_hat.to(dtype=torch.float32)
-                            rate_target_f32 = delta_target_f32 / dt_hat_f32.clamp_min(1e-12)
+                            model_target_f32 = _target_for_predict_type(
+                                norm_in=norm_in.to(dtype=torch.float32),
+                                norm_tgt=norm_tgt.to(dtype=torch.float32),
+                                dt_hat=dt_hat_f32,
+                                predict_type=predict_type,
+                            )
                             center_loss = (
-                                F.huber_loss(y_pred_f32, rate_target_f32, delta=huber_delta)
-                                if use_huber else F.mse_loss(y_pred_f32, rate_target_f32)
+                                F.huber_loss(y_pred_f32, model_target_f32, delta=huber_delta)
+                                if use_huber else F.mse_loss(y_pred_f32, model_target_f32)
                             ).to(dtype=y_pred.dtype)
                         if tmp_w > 0:
                             tmp_loss = temporal_consistency(x_in, norm_tgt)
@@ -11108,7 +11383,7 @@ def build_model_from_cfg(cfg, device):
     model_cfg = cfg.get("model", {}) or {}
 
     b = cfg.get("features", {}).get("build", {})
-    in_ch = Fdim + (2 if b.get("use_pos", True) else 0) + (1 if b.get("use_level", True) else 0)
+    in_ch = Fdim + _position_feature_dim(cfg) + (1 if b.get("use_level", True) else 0)
     if bool(b.get("use_dt_hat_fixed", False)):
         in_ch += 1
     if bool(b.get("include_ramp_angle", False)):
@@ -11122,8 +11397,33 @@ def build_model_from_cfg(cfg, device):
         in_ch += dec.parc_extra_in_channels(cfg, Fdim)
 
     out_ch = Fdim
-    conv_type = str(model_cfg.get("conv_type", "sage")).strip().lower()
+
+    predict_type = _normalize_predict_type_key(
+        model_cfg.get("predict_type", model_cfg.get("target_mode", "rate"))
+    )
+    model_cfg["predict_type"] = predict_type
+
+    raw_conv_type = model_cfg.get("conv_type", None)
+    model_type = _resolve_model_type_key(model_cfg)
+
+    conv_type = str(raw_conv_type if raw_conv_type is not None else "sage").strip().lower().replace("-", "_")
+    if conv_type == "sageconv":
+        conv_type = "sage"
+    if model_type == "sageconv":
+        conv_type = "sage"
+    elif model_type == "meshgraphnet":
+        conv_type = "sage"
+    elif conv_type not in {"sage", "gine", "nnconv"}:
+        raise ValueError(
+            f"Unsupported model.conv_type '{raw_conv_type}'. "
+            "Use one of: sage, gine, nnconv."
+        )
+
     edge_dim = int(model_cfg.get("edge_dim", 5)) if conv_type in ("gine", "nnconv") else None
+    edge_attr_channels_raw = model_cfg.get("edge_attr_channels", model_cfg.get("edge_dim", 5))
+    if edge_attr_channels_raw is None:
+        edge_attr_channels_raw = 5
+    edge_attr_channels = int(edge_attr_channels_raw)
     nnconv_hidden = int(model_cfg.get("nnconv_hidden", model_cfg.get("hidden", 128)))
     att_cfg = model_cfg.get("attention", {}) or {}
     use_attention = bool(model_cfg.get("use_attention", att_cfg.get("enabled", False)))
@@ -11151,30 +11451,63 @@ def build_model_from_cfg(cfg, device):
         model_cfg.get("activation_elu_alpha", model_cfg.get("elu_alpha", 1.0))
     )
 
-    model = FeatureNet(
-        in_channels=in_ch,
-        out_channels=out_ch,
-        hidden=int(model_cfg.get("hidden", 128)),
-        layers=int(model_cfg.get("layers", 3)),
-        dropout=float(model_cfg.get("dropout", 0.1)),
-        make_score_head=True,
-        conv_type=conv_type,
-        edge_dim=edge_dim,
-        nnconv_hidden=nnconv_hidden,
-        use_skip=bool(model_cfg.get("use_skip", False)),
-        skip_type=str(model_cfg.get("skip_type", "block")),
-        use_layernorm=bool(model_cfg.get("use_layernorm", False)),
-        layernorm_eps=float(model_cfg.get("layernorm_eps", 1e-6)),
-        use_attention=use_attention,
-        attention_heads=attention_heads,
-        attention_dropout=attention_dropout,
-        attention_edge_dim=attention_edge_dim,
-        attention_use_edge_attr=attention_use_edge_attr,
-        attention_replace_last=attention_replace_last,
-        activation=activation,
-        activation_negative_slope=activation_negative_slope,
-        activation_elu_alpha=activation_elu_alpha,
-    ).to(device)
+    if model_type == "sageconv":
+        model = SAGEConvModel(
+            in_channels=in_ch,
+            out_channels=out_ch,
+            state_channel=int(model_cfg.get("state_channel", 0)),
+            hidden=int(model_cfg.get("hidden", 128)),
+            layers=int(model_cfg.get("layers", 3)),
+            dropout=float(model_cfg.get("dropout", 0.0)),
+            activation=activation,
+            activation_negative_slope=activation_negative_slope,
+            activation_elu_alpha=activation_elu_alpha,
+            use_skip=bool(model_cfg.get("use_skip", True)),
+            use_layernorm=bool(model_cfg.get("use_layernorm", False)),
+            layernorm_eps=float(model_cfg.get("layernorm_eps", 1e-6)),
+            predict_type=predict_type,
+        ).to(device)
+    elif model_type == "meshgraphnet":
+        model = MeshGraphNetModel(
+            in_channels=in_ch,
+            out_channels=out_ch,
+            state_channel=int(model_cfg.get("state_channel", 0)),
+            edge_attr_channels=edge_attr_channels,
+            hidden=int(model_cfg.get("hidden", 128)),
+            layers=int(model_cfg.get("layers", 3)),
+            dropout=float(model_cfg.get("dropout", 0.0)),
+            activation=activation,
+            activation_negative_slope=activation_negative_slope,
+            activation_elu_alpha=activation_elu_alpha,
+            use_layernorm=bool(model_cfg.get("use_layernorm", False)),
+            layernorm_eps=float(model_cfg.get("layernorm_eps", 1e-6)),
+            predict_type=predict_type,
+        ).to(device)
+    else:
+        model = FeatureNet(
+            in_channels=in_ch,
+            out_channels=out_ch,
+            hidden=int(model_cfg.get("hidden", 128)),
+            layers=int(model_cfg.get("layers", 3)),
+            dropout=float(model_cfg.get("dropout", 0.1)),
+            make_score_head=True,
+            conv_type=conv_type,
+            edge_dim=edge_dim,
+            nnconv_hidden=nnconv_hidden,
+            use_skip=bool(model_cfg.get("use_skip", False)),
+            skip_type=str(model_cfg.get("skip_type", "block")),
+            use_layernorm=bool(model_cfg.get("use_layernorm", False)),
+            layernorm_eps=float(model_cfg.get("layernorm_eps", 1e-6)),
+            use_attention=use_attention,
+            attention_heads=attention_heads,
+            attention_dropout=attention_dropout,
+            attention_edge_dim=attention_edge_dim,
+            attention_use_edge_attr=attention_use_edge_attr,
+            attention_replace_last=attention_replace_last,
+            activation=activation,
+            activation_negative_slope=activation_negative_slope,
+            activation_elu_alpha=activation_elu_alpha,
+        ).to(device)
 
     # -------------------------
     # Optional PARC adapter
@@ -11249,6 +11582,10 @@ def main(
     if not isinstance(build_cfg, dict):
         raise ValueError("features.build must be a JSON object when provided.")
     build_cfg.setdefault("use_pos", True)
+    build_cfg.setdefault("position_mode", "xy")
+    build_cfg.setdefault("boundary_distance_normalize", True)
+    build_cfg.setdefault("boundary_distance_clip", None)
+    build_cfg.setdefault("boundary_distance_clip_normalize", True)
     # Cartesian project contract: no AMR-level feature channel.
     build_cfg["use_level"] = False
     build_cfg.setdefault("use_dt_hat_fixed", False)
@@ -11278,6 +11615,7 @@ def main(
 
     loss.setdefault("nu", 0.0)
     loss.setdefault("advection_scheme", "upwind")
+    loss.setdefault("advection_type", "scalar")
     loss.setdefault("rho_eps", 1e-8)
 
     # Physics-input controls (authoritative):
@@ -11312,6 +11650,14 @@ def main(
         )
     loss["physics_backend"] = backend_alias[backend_mode]
 
+    advection_type = str(loss.get("advection_type", "scalar")).strip().lower()
+    if advection_type not in ("scalar", "euler"):
+        raise ValueError(
+            "loss.advection_type must be one of {scalar, euler}. "
+            f"Got: {loss.get('advection_type')!r}"
+        )
+    loss["advection_type"] = advection_type
+
     if (not _physics_inputs_active_from_loss_cfg(loss)) and (
         float(loss.get("blend_weight", 0.0)) != 0.0 or float(loss.get("residual_weight", 0.0)) != 0.0
     ):
@@ -11342,6 +11688,7 @@ def main(
 
     print("[PHYSICS-CFG] backend=", loss.get("physics_backend"),
       "inputs_enabled=", int(_physics_inputs_active_from_loss_cfg(loss)),
+      "advection_type=", loss.get("advection_type"),
       "mode=", loss.get("mode"),
       "adv_w=", loss.get("adv_weight"),
       "diff_w=", loss.get("diff_weight"),

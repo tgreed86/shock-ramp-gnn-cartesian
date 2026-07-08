@@ -18,6 +18,12 @@
       "momentum_sigma_mode": "independent"
     },
     "build": {
+      "use_pos": true,
+      "position_mode": "boundary_distances",
+      "_comment_position_mode": "Options: 'xy' for raw node centers, 'boundary_distances' for [left,right,bottom,top] distances, or 'none'.",
+      "boundary_distance_normalize": true,
+      "boundary_distance_clip": null,
+      "boundary_distance_clip_normalize": true,
       "use_dt_hat_fixed": false
     }
   },
@@ -48,6 +54,10 @@
   },
   "model": {
     "name": "FeatureNet",
+    "type": "featurenet",
+    "_comment_type": "Options: 'featurenet', 'sageconv', or 'meshgraphnet'. MeshGraphNet matches the 1D_advection/Burgers processor stack and uses edge_attr_channels (default 5).",
+    "conv_type": "sage",
+    "_comment_conv_type": "FeatureNet only: one of 'sage', 'gine', or 'nnconv'.",
     "hidden": 128,
     "layers": 3,
     "predict_type": "rate"

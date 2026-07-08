@@ -500,6 +500,54 @@ def dec_divergence_euler_flux(
 
     return div
 
+def _euler_primitive_rates_from_conservative_rates(
+    *,
+    x_abs: torch.Tensor,
+    cfg: dict,
+    qdot_cons: torch.Tensor,   # [N,4] in [rho,mx,my,E_tot] ordering
+    eps: float = 1e-8,
+) -> dict[str, torch.Tensor]:
+    """
+    Convert conservative Euler rates to primitive rates for state
+    representation [u, v, rho, p, e_int].
+    """
+    if qdot_cons.ndim != 2 or qdot_cons.size(1) != 4:
+        raise RuntimeError(
+            f"qdot_cons must have shape [N,4], got {tuple(qdot_cons.shape)}"
+        )
+
+    state = _state_views(x_abs, cfg, eps=eps)
+    gamma = gas_gamma_from_cfg(cfg)
+
+    rho = state["rho"]
+    u = state["u"]
+    v = state["v"]
+    e_int = state["e_int"]
+    rho_safe = rho.abs().clamp_min(eps)
+
+    drho = qdot_cons[:, 0]
+    dmx = qdot_cons[:, 1]
+    dmy = qdot_cons[:, 2]
+    dEt = qdot_cons[:, 3]
+
+    du = (dmx - u * drho) / rho_safe
+    dv = (dmy - v * drho) / rho_safe
+
+    kinetic = 0.5 * (u * u + v * v)
+    de_int = (dEt - drho * (e_int + kinetic) - rho_safe * (u * du + v * dv)) / rho_safe
+    dp = (gamma - 1.0) * (drho * e_int + rho_safe * de_int)
+
+    return {
+        "rho": drho,
+        "mx": dmx,
+        "my": dmy,
+        "E_tot": dEt,
+        "u": du,
+        "v": dv,
+        "p": dp,
+        "e_int": de_int,
+    }
+
 def infer_feature_indices(cfg: dict, Fdim: int):
     """
     Returns indices for density, momx, momy, energy.
@@ -625,13 +673,15 @@ def dec_advdiff_terms_abs(
     idx = infer_feature_indices(cfg, Fdim)
 
     # --- helpers ---
-    def _names_to_indices(names, *, default):
+    def _names_to_indices(names, *, default, strict: bool = False, selection_name: str = "channels"):
         if not names:
             return list(default)
         out = []
         seen = set()
+        unknown = []
         for name in names:
             n = str(name).lower()
+            j = None
             if ("dens" in n) or (n == "rho"):
                 j = idx["rho"]
             elif n in ("u", "ux", "x_velocity", "velocity_x", "velx"):
@@ -641,6 +691,7 @@ def dec_advdiff_terms_abs(
             elif ("press" in n) or (n == "p") or (n == "pressure"):
                 p_idx = idx.get("p", None)
                 if p_idx is None:
+                    unknown.append(str(name))
                     continue
                 j = int(p_idx)
             elif ("ener" in n) or (n == "e"):
@@ -650,11 +701,26 @@ def dec_advdiff_terms_abs(
             elif ("y" in n and "mom" in n) or (n in ("my", "y_momentum", "mom_y")):
                 j = idx["my"]
             else:
+                unknown.append(str(name))
+                continue
+            if j is None:
+                unknown.append(str(name))
                 continue
             if j not in seen:
                 out.append(j)
                 seen.add(j)
-        return out if len(out) > 0 else list(default)
+        if strict and len(unknown) > 0:
+            raise RuntimeError(
+                f"Strict Euler advection rejected unknown {selection_name}: {unknown}. "
+                "Please fix loss.*_channels entries."
+            )
+        if len(out) == 0:
+            if strict:
+                raise RuntimeError(
+                    f"Strict Euler advection could not map any {selection_name} from {names!r}."
+                )
+            return list(default)
+        return out
 
     # --- geometry / weights ---
     if levels is None:
@@ -682,12 +748,12 @@ def dec_advdiff_terms_abs(
                   or loss.get("dec_diff_channels", None)
                   or legacy)
 
-    advection_type = str(loss.get("advection_type", "scalar")).lower()
+    advection_type = str(loss.get("advection_type", "scalar")).strip().lower()
+    if advection_type not in ("scalar", "euler"):
+        raise RuntimeError(
+            f"Unsupported loss.advection_type={advection_type!r}. Use 'scalar' or 'euler'."
+        )
     state_rep = state_representation_from_cfg(cfg, Fdim)
-    if advection_type == "euler" and state_rep == "primitive_uvrhope":
-        # Euler conservative divergence does not map directly to primitive channels.
-        # Fall back to scalar advection on selected primitive fields.
-        advection_type = "scalar"
     advection_reconstruction = str(loss.get("advection_reconstruction", "first_order"))
     muscl_limiter = str(loss.get("muscl_limiter", "minmod"))
 
@@ -712,7 +778,12 @@ def dec_advdiff_terms_abs(
     else:
         default_diff = [idx["rho"], idx["E"]]
 
-    sel_adv  = _names_to_indices(adv_names,  default=(default_adv_euler if advection_type == "euler" else default_adv_scalar))
+    sel_adv  = _names_to_indices(
+        adv_names,
+        default=(default_adv_euler if advection_type == "euler" else default_adv_scalar),
+        strict=(advection_type == "euler"),
+        selection_name="adv_channels",
+    )
     sel_diff = _names_to_indices(diff_names, default=default_diff)
 
     # allocate full-sized outputs (fill selected columns only)
@@ -739,13 +810,41 @@ def dec_advdiff_terms_abs(
                 eps=rho_eps,
             )  # [N,4] ordered [rho,mx,my,E]
 
-            euler_idx = [idx["rho"], idx["mx"], idx["my"], idx["E"]]
-            col_map = {j: k for k, j in enumerate(euler_idx)}
-            sel_adv_euler = [j for j in sel_adv if j in col_map]
-            if len(sel_adv_euler) > 0:
-                cols = [col_map[j] for j in sel_adv_euler]
-                r_adv[:, sel_adv_euler] = -div_euler_full[:, cols]
-            # (channels outside the Euler set remain zero)
+            qdot_cons = -div_euler_full
+            if state_rep == "primitive_uvrhope":
+                prim_rates = _euler_primitive_rates_from_conservative_rates(
+                    x_abs=x_abs,
+                    cfg=cfg,
+                    qdot_cons=qdot_cons,
+                    eps=rho_eps,
+                )
+                p_idx = idx.get("p", None)
+                rate_by_index: dict[int, torch.Tensor] = {
+                    int(idx["rho"]): prim_rates["rho"],
+                    int(idx.get("u", idx["mx"])): prim_rates["u"],
+                    int(idx.get("v", idx["my"])): prim_rates["v"],
+                    int(idx["E"]): prim_rates["e_int"],
+                }
+                if p_idx is not None:
+                    rate_by_index[int(p_idx)] = prim_rates["p"]
+            else:
+                rate_by_index = {
+                    int(idx["rho"]): qdot_cons[:, 0],
+                    int(idx["mx"]): qdot_cons[:, 1],
+                    int(idx["my"]): qdot_cons[:, 2],
+                    int(idx["E"]): qdot_cons[:, 3],
+                    int(idx.get("u", idx["mx"])): qdot_cons[:, 1],
+                    int(idx.get("v", idx["my"])): qdot_cons[:, 2],
+                }
+
+            unsupported = [int(j) for j in sel_adv if int(j) not in rate_by_index]
+            if len(unsupported) > 0:
+                raise RuntimeError(
+                    "Strict Euler advection cannot provide rates for selected channel indices "
+                    f"{unsupported}. state_rep={state_rep}, sel_adv={sel_adv}, idx={idx}"
+                )
+            for j in sel_adv:
+                r_adv[:, int(j)] = rate_by_index[int(j)]
 
         else:
             # scalar advection: -div(u * phi)
