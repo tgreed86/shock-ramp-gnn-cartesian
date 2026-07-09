@@ -2447,6 +2447,33 @@ def _build_X(
                 "features.build.include_ramp_angle=true but angle_feature_value is missing. "
                 "Set features.build.ramp_angle_deg or provide angle metadata in data/path."
             )
+        if not getattr(_build_X, "_printed_ramp_angle_input", False):
+            angle_units = str(ramp_feature_ctx.get("angle_units", "radians")).lower()
+            angle_deg_by_source = ramp_feature_ctx.get("angle_deg_by_source", None)
+            deg_val = None
+            if (sid is not None) and isinstance(angle_deg_by_source, dict):
+                deg_val = angle_deg_by_source.get(int(sid), None)
+                if deg_val is None:
+                    deg_val = angle_deg_by_source.get(str(int(sid)), None)
+            if deg_val is None:
+                angle_deg = ramp_feature_ctx.get("angle_deg", None)
+                if angle_deg is not None:
+                    deg_val = float(angle_deg)
+            feature_val = float(aval)
+            if deg_val is None:
+                deg_val = float(np.rad2deg(feature_val)) if angle_units == "radians" else feature_val
+            col_idx = sum(
+                int(x.size(1))
+                for x in Xs
+                if torch.is_tensor(x) and x.ndim == 2
+            )
+            print(
+                "[INPUT-FEAT] ramp_angle appended "
+                f"column={col_idx}, feature={feature_val:.6g}, units={angle_units}, "
+                f"deg={float(deg_val):.6g}, source_id={sid}, step_t_abs={step_t_abs}",
+                flush=True,
+            )
+            setattr(_build_X, "_printed_ramp_angle_input", True)
         a = torch.tensor(float(aval), device=dev, dtype=feat.dtype).view(1, 1)
         Xs.append(a.expand(int(feat.size(0)), 1))
 
@@ -11956,6 +11983,9 @@ def main(
                         f"Could not build per-source ramp angle feature for source_id={sid} ({rec['pt_path']})."
                     )
                 angle_by_source[sid] = float(aval)
+                if "angle_deg" in ctx_i:
+                    angle_deg_by_source = ramp_feature_ctx.setdefault("angle_deg_by_source", {})
+                    angle_deg_by_source[sid] = float(ctx_i["angle_deg"])
             if include_signed_dist:
                 p0 = ctx_i.get("distance_point", None)
                 n = ctx_i.get("distance_normal", None)
@@ -11974,10 +12004,40 @@ def main(
             ramp_feature_ctx["distance_by_source"] = dist_by_source
 
     if bool(ramp_feature_ctx.get("include_ramp_angle", False)):
+        angle_units = str(ramp_feature_ctx.get("angle_units", "radians"))
+        angle_feature_by_source = ramp_feature_ctx.get("angle_feature_by_source", None)
+        angle_deg_by_source = ramp_feature_ctx.get("angle_deg_by_source", None)
+        if isinstance(angle_feature_by_source, dict) and len(angle_feature_by_source) > 0:
+            source_parts = []
+            for sid in sorted(int(k) for k in angle_feature_by_source.keys())[:12]:
+                feat_val = float(angle_feature_by_source.get(sid, angle_feature_by_source.get(str(sid))))
+                deg_val = None
+                if isinstance(angle_deg_by_source, dict):
+                    deg_val = angle_deg_by_source.get(sid, angle_deg_by_source.get(str(sid), None))
+                if deg_val is None:
+                    deg_val = float(np.rad2deg(feat_val)) if angle_units == "radians" else feat_val
+                source_parts.append(f"{sid}:deg={float(deg_val):.6g},feature={feat_val:.6g}")
+            suffix = ""
+            if len(angle_feature_by_source) > 12:
+                suffix = f", ... ({len(angle_feature_by_source)} sources total)"
+            print(
+                "[GEOM-FEAT] include_ramp_angle=1 "
+                f"units={angle_units} per-source [{'; '.join(source_parts)}{suffix}]",
+                flush=True,
+            )
+        else:
+            feature_val = float(ramp_feature_ctx.get("angle_feature_value"))
+            deg_val = float(ramp_feature_ctx.get("angle_deg"))
+            print(
+                "[GEOM-FEAT] include_ramp_angle=1 "
+                f"deg={deg_val:.6g}, feature={feature_val:.6g}, units={angle_units}",
+                flush=True,
+            )
+    else:
         print(
-            "[GEOM-FEAT] include_ramp_angle=1 "
-            f"(deg={float(ramp_feature_ctx.get('angle_deg')):.6g}, "
-            f"units={ramp_feature_ctx.get('angle_units', 'radians')})"
+            "[GEOM-FEAT] include_ramp_angle=0 "
+            "(ramp angle will not be appended to node inputs)",
+            flush=True,
         )
     if bool(ramp_feature_ctx.get("include_signed_distance_to_ramp", False)):
         print(
