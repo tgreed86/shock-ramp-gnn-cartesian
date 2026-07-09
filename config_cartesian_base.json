@@ -24,7 +24,11 @@
       "boundary_distance_normalize": true,
       "boundary_distance_clip": null,
       "boundary_distance_clip_normalize": true,
-      "use_dt_hat_fixed": false
+      "include_dt_hat": false,
+      "include_ramp_angle": false,
+      "_comment_include_ramp_angle": "If true, append ramp angle as one extra node feature. Inferred from ramp_angle_deg, metadata, or DMR_* filename fallback.",
+      "ramp_angle_units": "radians",
+      "ramp_angle_deg": null
     }
   },
   "split": {

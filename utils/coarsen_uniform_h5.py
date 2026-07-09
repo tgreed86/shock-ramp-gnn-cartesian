@@ -9,6 +9,7 @@ Expected input schema:
   - channel_names: [C]
 Optional pass-through:
   - channel_units: [C]
+  - ramp-angle metadata is preserved/inferred into output attrs
 
 The script performs:
   1) symmetric center-crop to dimensions divisible by target size
@@ -28,12 +29,116 @@ import argparse
 import os
 import re
 from pathlib import Path
-from typing import Tuple
+from typing import Any, Tuple
 
 import h5py
 import numpy as np
 
 _RES_SUFFIX_RE = re.compile(r"_(\d+)x(\d+)$")
+
+
+def _to_scalar_float(v: Any) -> float | None:
+    if v is None:
+        return None
+    if isinstance(v, (bytes, np.bytes_)):
+        try:
+            v = v.decode("utf-8")
+        except Exception:
+            return None
+    arr = np.asarray(v)
+    if arr.size != 1:
+        return None
+    try:
+        return float(arr.reshape(-1)[0])
+    except Exception:
+        return None
+
+
+def _parse_compact_decimal_token(tok: str | None) -> float | None:
+    if tok is None:
+        return None
+    s = str(tok).strip()
+    if s == "":
+        return None
+    if ("p" in s.lower()) and ("." not in s):
+        if s[0] in "+-":
+            s = s[0] + s[1:].replace("p", ".").replace("P", ".")
+        else:
+            s = s.replace("p", ".").replace("P", ".")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _extract_angle_from_path(path_like: str | Path | None) -> float | None:
+    if not path_like:
+        return None
+    s = os.path.basename(str(path_like))
+
+    patterns = (
+        r"(?:^|[_\-])ramp[-_]?angle[-_]?(-?\d+(?:\.\d+)?)",
+        r"(?:^|[_\-])angle[-_]?(-?\d+(?:\.\d+)?)",
+    )
+    for pat in patterns:
+        m = re.search(pat, s, flags=re.IGNORECASE)
+        if m is not None:
+            val = _parse_compact_decimal_token(m.group(1))
+            if val is not None:
+                return float(val)
+
+    # Fallback for shock-ramp DMR files named like:
+    #   DMR_8_0_60__125x250.h5  -> pressure/token 8_0, ramp angle 60 deg
+    #   DMR_5_5_70__125x250.h5  -> pressure/token 5_5, ramp angle 70 deg
+    m = re.search(
+        r"^DMR[_\-]"
+        r"(-?\d+(?:[pP]\d+|\.\d+)?)"
+        r"[_\-]"
+        r"(-?\d+(?:[pP]\d+|\.\d+)?)"
+        r"[_\-]"
+        r"(-?\d+(?:[pP]\d+|\.\d+)?)"
+        r"(?=(?:[_\-]{1,2}|\.|$))",
+        s,
+        flags=re.IGNORECASE,
+    )
+    if m is not None:
+        angle = _parse_compact_decimal_token(m.group(3))
+        if angle is not None:
+            return float(angle)
+    return None
+
+
+def _resolve_ramp_angle_deg(fin: h5py.File, in_h5: str) -> tuple[float | None, str | None]:
+    degree_keys = (
+        "ramp_angle_deg",
+        "ramp_angle_degrees",
+        "angle_deg",
+        "angle_degrees",
+        "theta_deg",
+        "theta_degrees",
+        "ramp_angle",
+        "angle",
+        "theta",
+    )
+    radian_keys = ("ramp_angle_rad", "angle_rad", "theta_rad", "ramp_angle_radians")
+
+    for key in degree_keys:
+        if key in fin.attrs:
+            val = _to_scalar_float(fin.attrs[key])
+            if val is not None:
+                return float(val), f"input_attr:{key}"
+
+    for key in radian_keys:
+        if key in fin.attrs:
+            val = _to_scalar_float(fin.attrs[key])
+            if val is not None:
+                return float(np.rad2deg(val)), f"input_attr:{key}"
+
+    angle = _extract_angle_from_path(in_h5)
+    if angle is not None:
+        return float(angle), "filename"
+
+    return None, None
 
 
 def _is_h5_file(path: Path) -> bool:
@@ -161,6 +266,7 @@ def coarsen_uniform_h5(
         r0, r1, c0, c1, fh, fw = _crop_plan(in_h, in_w, int(target_h), int(target_w))
         crop_h = r1 - r0
         crop_w = c1 - c0
+        ramp_angle_deg, ramp_angle_source = _resolve_ramp_angle_deg(fin, in_h5)
 
         print(
             "[COARSEN] input:",
@@ -177,6 +283,14 @@ def coarsen_uniform_h5(
             f"fh={fh}, fw={fw} -> output H={target_h}, W={target_w}",
             flush=True,
         )
+        if ramp_angle_deg is not None:
+            print(
+                "[COARSEN] ramp angle:",
+                f"{ramp_angle_deg:g} deg (source={ramp_angle_source})",
+                flush=True,
+            )
+        else:
+            print("[COARSEN] ramp angle: not found", flush=True)
 
         kwargs = {}
         if compression and str(compression).lower() != "none":
@@ -190,6 +304,10 @@ def coarsen_uniform_h5(
                     fout.attrs[k] = v
                 except Exception:
                     pass
+            if ramp_angle_deg is not None:
+                fout.attrs["ramp_angle_deg"] = np.float64(float(ramp_angle_deg))
+                fout.attrs["ramp_angle_rad"] = np.float64(float(np.deg2rad(ramp_angle_deg)))
+                fout.attrs["ramp_angle_source"] = np.bytes_(str(ramp_angle_source or "unknown"))
 
             d_out = fout.create_dataset(
                 "snapshots",
@@ -234,6 +352,10 @@ def coarsen_uniform_h5(
             meta.attrs["factor_h"] = np.int32(fh)
             meta.attrs["factor_w"] = np.int32(fw)
             meta.attrs["method"] = np.bytes_("crop_then_block_mean")
+            if ramp_angle_deg is not None:
+                meta.attrs["ramp_angle_deg"] = np.float64(float(ramp_angle_deg))
+                meta.attrs["ramp_angle_rad"] = np.float64(float(np.deg2rad(ramp_angle_deg)))
+                meta.attrs["ramp_angle_source"] = np.bytes_(str(ramp_angle_source or "unknown"))
 
     print(f"[COARSEN] wrote: {out_h5}", flush=True)
 

@@ -1653,6 +1653,22 @@ def _dt_hat_feature_column(
         f"Expected scalar or (N,) / (N,1), got shape={tuple(dt.shape)} with N={n_nodes}."
     )
 
+
+def _include_dt_hat_from_build_cfg(build_cfg: Dict[str, Any] | None) -> bool:
+    build_cfg = build_cfg or {}
+    if "include_dt_hat" in build_cfg:
+        return _cfg_bool_strict(
+            build_cfg.get("include_dt_hat"),
+            key="features.build.include_dt_hat",
+        )
+    if "use_dt_hat_fixed" in build_cfg:
+        return _cfg_bool_strict(
+            build_cfg.get("use_dt_hat_fixed"),
+            key="features.build.use_dt_hat_fixed",
+        )
+    return False
+
+
 def _to_scalar_float(v: Any) -> float | None:
     if v is None:
         return None
@@ -1741,6 +1757,25 @@ def _extract_angle_from_path(path_like: str | None) -> float | None:
                 return float(m.group(1))
             except Exception:
                 continue
+
+    # Fallback for shock-ramp DMR files named like:
+    #   DMR_8_0_60__125x250.h5  -> pressure/token 8_0, ramp angle 60 deg
+    #   DMR_5_5_70__125x250.h5  -> pressure/token 5_5, ramp angle 70 deg
+    m = re.search(
+        r"^DMR[_\-]"
+        r"(-?\d+(?:[pP]\d+|\.\d+)?)"
+        r"[_\-]"
+        r"(-?\d+(?:[pP]\d+|\.\d+)?)"
+        r"[_\-]"
+        r"(-?\d+(?:[pP]\d+|\.\d+)?)"
+        r"(?=(?:[_\-]{1,2}|\.|$))",
+        s,
+        flags=re.IGNORECASE,
+    )
+    if m is not None:
+        angle = _parse_compact_decimal_token(m.group(3))
+        if angle is not None:
+            return float(angle)
     return None
 
 
@@ -2345,7 +2380,7 @@ def _build_X(
     """
     Build node features for FeatureNet:
       [ physics_feat ] (+ position features if use_pos) (+ [level] if use_level)
-      (+ [dt_hat_fixed] if features.build.use_dt_hat_fixed)
+      (+ [dt_hat] if features.build.include_dt_hat)
 
     feat:    (N, F) on whatever device we want to run the model on (cpu/cuda/mps)
     centers: (N, 2) (typically from precompute; may be on cpu)
@@ -2353,7 +2388,7 @@ def _build_X(
     """
     build_cfg = cfg.get("features", {}).get("build", {})
     use_level = build_cfg.get("use_level", True)
-    use_dt_hat_fixed = bool(build_cfg.get("use_dt_hat_fixed", False))
+    include_dt_hat = _include_dt_hat_from_build_cfg(build_cfg)
     include_ramp_angle = bool(build_cfg.get("include_ramp_angle", False))
     include_signed_dist = bool(build_cfg.get("include_signed_distance_to_ramp", False))
 
@@ -2370,10 +2405,10 @@ def _build_X(
             lvl = lvl.unsqueeze(-1)
         Xs.append(lvl.to(dev).to(feat.dtype))
 
-    if use_dt_hat_fixed:
+    if include_dt_hat:
         if dt_hat is None:
             raise RuntimeError(
-                "features.build.use_dt_hat_fixed=true but dt_hat was not provided to _build_X."
+                "features.build.include_dt_hat=true but dt_hat was not provided to _build_X."
             )
         Xs.append(
             _dt_hat_feature_column(
@@ -11384,7 +11419,7 @@ def build_model_from_cfg(cfg, device):
 
     b = cfg.get("features", {}).get("build", {})
     in_ch = Fdim + _position_feature_dim(cfg) + (1 if b.get("use_level", True) else 0)
-    if bool(b.get("use_dt_hat_fixed", False)):
+    if _include_dt_hat_from_build_cfg(b):
         in_ch += 1
     if bool(b.get("include_ramp_angle", False)):
         in_ch += 1
@@ -11588,7 +11623,9 @@ def main(
     build_cfg.setdefault("boundary_distance_clip_normalize", True)
     # Cartesian project contract: no AMR-level feature channel.
     build_cfg["use_level"] = False
-    build_cfg.setdefault("use_dt_hat_fixed", False)
+    if "include_dt_hat" not in build_cfg:
+        build_cfg["include_dt_hat"] = _include_dt_hat_from_build_cfg(build_cfg)
+    build_cfg.pop("use_dt_hat_fixed", None)
     # Optional geometry channels (default-off to preserve current behavior)
     build_cfg.setdefault("include_ramp_angle", False)
     build_cfg.setdefault("ramp_angle_deg", None)
