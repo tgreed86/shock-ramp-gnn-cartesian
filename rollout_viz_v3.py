@@ -125,6 +125,7 @@ from train import (
     _get_bbox,
     _physics_inputs_active_from_loss_cfg,
     _load_series_from_pt_path,
+    _build_ramp_feature_context,
 )
 from models import ParcFeatureAdapter
 from utils_geom import build_idw_map, apply_idw_map
@@ -184,6 +185,10 @@ def _load_pt_series(pt_path: str):
     """Load raw time series from .pt/.pth/.zip or uniform-grid .h5/.hdf5."""
     _resolved_path, data_list = _load_series_from_pt_path(pt_path)
     return data_list
+
+def _load_pt_series_with_path(pt_path: str):
+    """Load raw time series and return the resolved file path used for metadata inference."""
+    return _load_series_from_pt_path(pt_path)
 
 def _get_refine_ratio(cfg: dict) -> int:
     pol = cfg.get("policy", {}) or {}
@@ -4156,6 +4161,16 @@ def main():
         cfg.setdefault("data", {})["pt_path"] = args.pt_path
     if "data" not in cfg or "pt_path" not in cfg["data"]:
         raise RuntimeError("cfg['data']['pt_path'] must be set (or use --pt-path).")
+    pt_path_cfg = cfg["data"]["pt_path"]
+    if isinstance(pt_path_cfg, (list, tuple)):
+        if len(pt_path_cfg) != 1:
+            raise RuntimeError(
+                "rollout_viz_v3.py runs one rollout file at a time. "
+                "The loaded config contains multiple data.pt_path entries; pass the held-out file "
+                "explicitly with --pt-path."
+            )
+        pt_path_cfg = pt_path_cfg[0]
+    cfg["data"]["pt_path"] = str(pt_path_cfg)
 
     runtime_cli_flags = []
     if args.runtime_mesh_cnn_ckpt is not None:
@@ -4210,7 +4225,8 @@ def main():
 
     # ----- Load series -----
     with Timer("Load time series"):
-        data_list = _load_pt_series(cfg["data"]["pt_path"])
+        resolved_pt_path, data_list = _load_pt_series_with_path(cfg["data"]["pt_path"])
+    cfg["data"]["pt_path"] = resolved_pt_path
 
     # If snapshots carry explicit base resolution (uniform HDF5 path), prefer it.
     if len(data_list) > 0:
@@ -4227,6 +4243,28 @@ def main():
             cfg["data"]["W"] = W
             dx = (xmax - xmin) / W
             dy = (ymax - ymin) / H
+        cxy, _pxy = _extract_xy_from_snapshot(data_list[0])
+        if torch.is_tensor(cxy) and cxy.ndim == 2 and cxy.size(1) >= 2 and cxy.numel() > 0:
+            cxy_cpu = cxy.detach().to(device="cpu", dtype=torch.float64)
+            xb0 = float(cxy_cpu[:, 0].min().item())
+            xb1 = float(cxy_cpu[:, 0].max().item())
+            yb0 = float(cxy_cpu[:, 1].min().item())
+            yb1 = float(cxy_cpu[:, 1].max().item())
+            old_bbox_raw = cfg.get("data", {}).get("bbox", None)
+            if isinstance(old_bbox_raw, (list, tuple)) and len(old_bbox_raw) == 4:
+                old_bbox = tuple(float(v) for v in old_bbox_raw)
+            else:
+                old_bbox = (float(xmin), float(xmax), float(ymin), float(ymax))
+            new_bbox = (xb0, xb1, yb0, yb1)
+            if any(abs(a - b) > 1e-10 for a, b in zip(old_bbox, new_bbox)):
+                log(
+                    "[INFO] Overriding cfg data.bbox from file coordinates: "
+                    f"{old_bbox} -> {new_bbox}"
+                )
+            cfg.setdefault("data", {})["bbox"] = [xb0, xb1, yb0, yb1]
+            xmin, xmax, ymin, ymax = xb0, xb1, yb0, yb1
+            dx = (xmax - xmin) / W
+            dy = (ymax - ymin) / H
     T = len(data_list)
     log(f"[INFO] Series length T={T}")
 
@@ -4238,6 +4276,34 @@ def main():
 
     # dt info (if present in snapshots)
     dt_transitions, dt_ref = _compute_dt_transitions(data_list)
+
+    mesh_spec_cfg = (cfg.get("mesh", {}) or {}).get("starting_mesh_path", None)
+    mesh_spec_path = (
+        os.path.abspath(os.path.expanduser(str(mesh_spec_cfg)))
+        if mesh_spec_cfg is not None
+        else None
+    )
+    ramp_feature_ctx = _build_ramp_feature_context(
+        cfg,
+        data_obj=data_list,
+        pt_path=resolved_pt_path,
+        mesh_spec_path=mesh_spec_path,
+    )
+    if bool(ramp_feature_ctx.get("include_ramp_angle", False)):
+        angle_units = str(ramp_feature_ctx.get("angle_units", "radians"))
+        feature_val = float(ramp_feature_ctx.get("angle_feature_value"))
+        deg_val = float(ramp_feature_ctx.get("angle_deg"))
+        log(
+            "[GEOM-FEAT] include_ramp_angle=1 "
+            f"deg={deg_val:.6g}, feature={feature_val:.6g}, units={angle_units}"
+        )
+    else:
+        log("[GEOM-FEAT] include_ramp_angle=0 (ramp angle will not be appended to node inputs)")
+    if bool(ramp_feature_ctx.get("include_signed_distance_to_ramp", False)):
+        log(
+            "[GEOM-FEAT] include_signed_distance_to_ramp=1 "
+            f"distance_scale={float(ramp_feature_ctx.get('distance_scale', 1.0)):.6g}"
+        )
 
     runtime_mesh_cfg = cfg.get("train", {}).get("runtime_mesh", {}) or {}
     runtime_mesh_enabled = _cfg_bool_strict(
@@ -4341,7 +4407,7 @@ def main():
 
     # ----- Build model & load weights -----
     with Timer("Build model"):
-        model = build_model_from_cfg(cfg, device)
+        model = build_model_from_cfg(cfg, device, ramp_feature_ctx=ramp_feature_ctx)
 
     # ---- attach ParcFeatureAdapter when physics-input channels are enabled ----
     loss_cfg = cfg.get("loss", {}) or {}
@@ -4442,6 +4508,7 @@ def main():
             write_budgets=True,
             runtime_mesh_policy=runtime_mesh_policy,
             infer_only=bool(args.infer_only),
+            ramp_feature_ctx=ramp_feature_ctx,
         )
     log(f"[TEST] loss={test_loss:.4e}")
 

@@ -32,7 +32,7 @@ from contextlib import nullcontext
 import numpy as np
 
 from dataset import CellRefineWindowDataset
-from models import FeatureNet, MeshGraphNetModel, ParcFeatureAdapter, SAGEConvModel
+from models import FeatureNet, FluxGraphNetModel, MeshGraphNetModel, ParcFeatureAdapter, SAGEConvModel
 from amr_policy import coarse_aggregate_from_dynamic, predict_masks_hierarchical_from_gt_gradients
             
 from plots import plot_loss_curves, amr_composite_to_finest_grid
@@ -1597,6 +1597,10 @@ def _loss_comp_print(
     dec_resid_w,
     phy_loss,
     total_loss,
+    pressure_aux_w=0.0,
+    pressure_aux_loss=None,
+    pressure_consistency_w=0.0,
+    pressure_consistency_loss=None,
     y_nn=None,
     y_pred=None,
 ):
@@ -1605,11 +1609,19 @@ def _loss_comp_print(
     ll  = _t2f(lap_loss)
     tl  = _t2f(tmp_loss)
     pl  = _t2f(phy_loss)
+    pal = _t2f(pressure_aux_loss)
+    pcl = _t2f(pressure_consistency_loss)
     tot = _t2f(total_loss)
 
     lap_term = (float(lap_w) * (ll if ll is not None else 0.0)) if lap_w else 0.0
     tmp_term = (float(tmp_w) * (tl if tl is not None else 0.0)) if tmp_w else 0.0
     phy_term = (float(dec_resid_w) * (pl if pl is not None else 0.0)) if dec_resid_w else 0.0
+    paux_term = (
+        float(pressure_aux_w) * (pal if pal is not None else 0.0)
+    ) if pressure_aux_w else 0.0
+    pcons_term = (
+        float(pressure_consistency_w) * (pcl if pcl is not None else 0.0)
+    ) if pressure_consistency_w else 0.0
 
     yn = None if y_nn is None else _t2f(y_nn.abs().mean())
     yp = None if y_pred is None else _t2f(y_pred.abs().mean())
@@ -1620,6 +1632,8 @@ def _loss_comp_print(
         f"lap={_fmt(lap_term)} (w={lap_w:.2e}, raw={_fmt(ll)}) | "
         f"tmp={_fmt(tmp_term)} (w={tmp_w:.2e}, raw={_fmt(tl)}) | "
         f"dec_resid={_fmt(phy_term)} (w={dec_resid_w:.2e}, raw={_fmt(pl)}) | "
+        f"p_aux={_fmt(paux_term)} (w={pressure_aux_w:.2e}, raw={_fmt(pal)}) | "
+        f"p_cons={_fmt(pcons_term)} (w={pressure_consistency_w:.2e}, raw={_fmt(pcl)}) | "
         f"TOTAL={_fmt(tot)} | "
         f"dec_use={int(bool(dec_use))} dec_blend_w={dec_blend_w:.2e} | "
         f"|y_nn|={_fmt(yn)} | |y_pred|={_fmt(yp)}"
@@ -1831,6 +1845,21 @@ def _load_series_from_h5_path(h5_path: str):
 
     p = os.path.abspath(os.path.expanduser(str(h5_path)))
     with h5py.File(p, "r") as f:
+        h5_attrs: Dict[str, Any] = {}
+        for k, v in f.attrs.items():
+            if isinstance(v, np.ndarray) and v.shape == ():
+                v = v.item()
+            if isinstance(v, (bytes, np.bytes_)):
+                v = v.decode("utf-8")
+            h5_attrs[str(k)] = v
+        if "coarsen_meta" in f:
+            for k, v in f["coarsen_meta"].attrs.items():
+                if isinstance(v, np.ndarray) and v.shape == ():
+                    v = v.item()
+                if isinstance(v, (bytes, np.bytes_)):
+                    v = v.decode("utf-8")
+                h5_attrs.setdefault(str(k), v)
+
         required = ("snapshots", "time", "xy", "channel_names")
         missing = [k for k in required if k not in f]
         if missing:
@@ -1897,6 +1926,8 @@ def _load_series_from_h5_path(h5_path: str):
                 "H": int(Hf),
                 "W": int(Wf),
             }
+            if h5_attrs:
+                snap["attrs"] = h5_attrs
             seq.append(snap)
 
     return p, seq
@@ -6612,6 +6643,148 @@ def _state_from_model_output(
     return norm_in + y_pred * dt_hat
 
 
+def _parse_lr_schedule_entries(train_cfg: Dict[str, Any]) -> list[tuple[int, float]]:
+    sched_cfg = train_cfg.get("lr_schedule", {}) or {}
+    if not isinstance(sched_cfg, dict):
+        raise ValueError("train.lr_schedule must be a JSON object when provided.")
+    if not bool(sched_cfg.get("enabled", False)):
+        return []
+
+    entries_raw = sched_cfg.get("entries", [])
+    if entries_raw is None:
+        entries_raw = []
+    if not isinstance(entries_raw, (list, tuple)):
+        raise ValueError("train.lr_schedule.entries must be a list of {epoch, lr} objects.")
+
+    entries: list[tuple[int, float]] = []
+    seen: set[int] = set()
+    for i, entry in enumerate(entries_raw):
+        if not isinstance(entry, dict):
+            raise ValueError(f"train.lr_schedule.entries[{i}] must be an object, got {type(entry)}.")
+        if "epoch" not in entry or "lr" not in entry:
+            raise ValueError(f"train.lr_schedule.entries[{i}] must include both 'epoch' and 'lr'.")
+        epoch = int(entry["epoch"])
+        lr = float(entry["lr"])
+        if epoch < 1:
+            raise ValueError(f"train.lr_schedule.entries[{i}].epoch must be >= 1, got {epoch}.")
+        if lr <= 0.0:
+            raise ValueError(f"train.lr_schedule.entries[{i}].lr must be > 0, got {lr}.")
+        if epoch in seen:
+            raise ValueError(f"Duplicate train.lr_schedule entry for epoch {epoch}.")
+        seen.add(epoch)
+        entries.append((epoch, lr))
+
+    entries.sort(key=lambda item: item[0])
+    return entries
+
+
+def _lr_from_schedule_for_epoch(
+    entries: list[tuple[int, float]],
+    epoch: int,
+) -> float | None:
+    lr_eff = None
+    ep = int(epoch)
+    for milestone, lr in entries:
+        if int(milestone) <= ep:
+            lr_eff = float(lr)
+        else:
+            break
+    return lr_eff
+
+
+def _set_optimizer_lr(optimizer, lr: float) -> bool:
+    lr = float(lr)
+    changed = False
+    for group in optimizer.param_groups:
+        old = float(group.get("lr", lr))
+        if abs(old - lr) > max(1e-16, 1e-12 * max(abs(old), abs(lr), 1.0)):
+            group["lr"] = lr
+            changed = True
+    return changed
+
+
+def _pressure_auxiliary_losses(
+    *,
+    y_pred_abs: torch.Tensor,
+    x_tgt_abs: torch.Tensor | None,
+    cfg: Dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Derived ideal-gas pressure supervision.
+
+    Returns:
+      pressure_target_loss: compare p(rho,e/E_tot) from prediction to target pressure
+      pressure_consistency_loss: compare predicted primitive P channel to p(rho,e)
+    """
+    zero = y_pred_abs.new_zeros(())
+    loss_cfg = cfg.get("loss", {}) or {}
+    aux_w = float(loss_cfg.get("pressure_aux_weight", loss_cfg.get("pressure_loss_weight", 0.0)))
+    cons_w = float(loss_cfg.get("pressure_consistency_weight", 0.0))
+    if aux_w <= 0.0 and cons_w <= 0.0:
+        return zero, zero
+
+    Fdim = int(y_pred_abs.size(1))
+    idx = dec.infer_feature_indices(cfg, Fdim)
+    rep = dec.state_representation_from_cfg(cfg, Fdim)
+    gamma = float(dec.gas_gamma_from_cfg(cfg))
+    eps = float(loss_cfg.get("pressure_aux_eps", loss_cfg.get("p_floor", 1e-8)))
+    eps = max(eps, 1e-12)
+
+    if rep == "primitive_uvrhope":
+        rho_pred = y_pred_abs[:, int(idx["rho"])].clamp_min(eps)
+        e_pred = y_pred_abs[:, int(idx["E"])].clamp_min(eps)
+        p_derived_pred = ((gamma - 1.0) * rho_pred * e_pred).clamp_min(eps)
+        p_idx = idx.get("p", None)
+        p_channel_pred = None
+        if p_idx is not None:
+            p_channel_pred = y_pred_abs[:, int(p_idx)].clamp_min(eps)
+        if x_tgt_abs is not None:
+            if p_idx is not None:
+                p_target = x_tgt_abs[:, int(p_idx)].clamp_min(eps)
+            else:
+                rho_tgt = x_tgt_abs[:, int(idx["rho"])].clamp_min(eps)
+                e_tgt = x_tgt_abs[:, int(idx["E"])].clamp_min(eps)
+                p_target = ((gamma - 1.0) * rho_tgt * e_tgt).clamp_min(eps)
+        else:
+            p_target = None
+    else:
+        p_derived_pred = dec.pressure_from_conservative_state(
+            y_pred_abs,
+            cfg,
+            eps=eps,
+            clamp_min=eps,
+        )
+        p_channel_pred = None
+        p_target = (
+            None
+            if x_tgt_abs is None
+            else dec.pressure_from_conservative_state(x_tgt_abs, cfg, eps=eps, clamp_min=eps)
+        )
+
+    def _compare_pressure(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        use_log = bool(loss_cfg.get("pressure_aux_log", True))
+        use_huber = bool(loss_cfg.get("pressure_aux_huber", True))
+        delta = float(loss_cfg.get("pressure_aux_huber_delta", 0.1 if use_log else 1.0))
+        if use_log:
+            aa = torch.log(a.clamp_min(eps))
+            bb = torch.log(b.clamp_min(eps))
+        else:
+            scale = b.detach().abs().mean().clamp_min(float(loss_cfg.get("pressure_aux_scale_floor", 1.0)))
+            aa = a / scale
+            bb = b / scale
+        return F.huber_loss(aa, bb, delta=delta) if use_huber else F.mse_loss(aa, bb)
+
+    target_loss = zero
+    if aux_w > 0.0 and p_target is not None:
+        target_loss = _compare_pressure(p_derived_pred, p_target)
+
+    consistency_loss = zero
+    if cons_w > 0.0 and p_channel_pred is not None:
+        consistency_loss = _compare_pressure(p_channel_pred, p_derived_pred.detach())
+
+    return target_loss, consistency_loss
+
+
 def _resolve_model_type_key(model_cfg: Dict[str, Any] | None) -> str:
     model_cfg = model_cfg or {}
     raw_model_type = model_cfg.get("type", None)
@@ -6628,6 +6801,14 @@ def _resolve_model_type_key(model_cfg: Dict[str, Any] | None) -> str:
             "burgersmeshgraphnetmodel",
         }:
             model_type = "meshgraphnet"
+        elif model_name in {
+            "fluxgraphnet",
+            "flux_graph_net",
+            "fluxgnn",
+            "flux",
+            "fluxgraphnetmodel",
+        }:
+            model_type = "fluxgraphnet"
         else:
             model_type = "featurenet"
     else:
@@ -6649,13 +6830,20 @@ def _resolve_model_type_key(model_cfg: Dict[str, Any] | None) -> str:
         "meshgraphnetmodel": "meshgraphnet",
         "advectionmeshgraphnetmodel": "meshgraphnet",
         "burgersmeshgraphnetmodel": "meshgraphnet",
+        "flux_graph_net": "fluxgraphnet",
+        "fluxgraphnet": "fluxgraphnet",
+        "fluxgnn": "fluxgraphnet",
+        "flux": "fluxgraphnet",
+        "fluxgraphnetmodel": "fluxgraphnet",
+        "advectionfluxgraphnetmodel": "fluxgraphnet",
+        "burgersfluxgraphnetmodel": "fluxgraphnet",
     }
     model_type = model_type_aliases.get(model_type, model_type)
-    valid_model_types = {"featurenet", "sageconv", "meshgraphnet"}
+    valid_model_types = {"featurenet", "sageconv", "meshgraphnet", "fluxgraphnet"}
     if model_type not in valid_model_types:
         raise ValueError(
             f"Unsupported model.type '{model_cfg.get('type')}'. "
-            "Use model.type='featurenet', 'sageconv', or 'meshgraphnet'. "
+            "Use model.type='featurenet', 'sageconv', 'meshgraphnet', or 'fluxgraphnet'. "
             "For FeatureNet message passing, set model.conv_type to one of "
             "{sage, gine, nnconv}."
         )
@@ -6665,7 +6853,7 @@ def _resolve_model_type_key(model_cfg: Dict[str, Any] | None) -> str:
 def _model_requires_edge_attr_from_cfg(cfg: Dict[str, Any]) -> bool:
     model_cfg = cfg.get("model", {}) or {}
     model_type = _resolve_model_type_key(model_cfg)
-    if model_type == "meshgraphnet":
+    if model_type in {"meshgraphnet", "fluxgraphnet"}:
         return True
     if model_type != "featurenet":
         return False
@@ -9004,7 +9192,28 @@ def train_one_epoch_multi_step(
                             channel_mask=ch_mask,
                         ).to(dtype=y_pred.dtype)
 
-                loss_step = center_loss + lap_w * lap_loss + tmp_w * tmp_loss + dec_resid_w * phy_loss
+                pressure_aux_w = float(loss_cfg.get("pressure_aux_weight", loss_cfg.get("pressure_loss_weight", 0.0)))
+                pressure_consistency_w = float(loss_cfg.get("pressure_consistency_weight", 0.0))
+                pressure_aux_loss = y_pred.new_zeros(())
+                pressure_consistency_loss = y_pred.new_zeros(())
+                if pressure_aux_w > 0.0 or pressure_consistency_w > 0.0:
+                    with torch.autocast(device_type=device.type, enabled=False):
+                        p_aux, p_cons = _pressure_auxiliary_losses(
+                            y_pred_abs=y_pred_abs.float(),
+                            x_tgt_abs=x_tgt_abs.float(),
+                            cfg=cfg,
+                        )
+                    pressure_aux_loss = p_aux.to(dtype=y_pred.dtype)
+                    pressure_consistency_loss = p_cons.to(dtype=y_pred.dtype)
+
+                loss_step = (
+                    center_loss
+                    + lap_w * lap_loss
+                    + tmp_w * tmp_loss
+                    + dec_resid_w * phy_loss
+                    + pressure_aux_w * pressure_aux_loss
+                    + pressure_consistency_w * pressure_consistency_loss
+                )
 
                 if cfg.get("debug", {}).get("print_loss_components", False) and (not train_one_epoch_multi_step._printed_loss_components):
                     _loss_comp_print(
@@ -9020,6 +9229,10 @@ def train_one_epoch_multi_step(
                         dec_blend_w=dec_blend_w,
                         dec_resid_w=dec_resid_w,
                         phy_loss=phy_loss,
+                        pressure_aux_w=pressure_aux_w,
+                        pressure_aux_loss=pressure_aux_loss,
+                        pressure_consistency_w=pressure_consistency_w,
+                        pressure_consistency_loss=pressure_consistency_loss,
                         total_loss=loss_step,
                         y_nn=y_corr,
                         y_pred=y_pred,
@@ -10628,7 +10841,31 @@ def evaluate_one_epoch_multi_step(
                                 channel_mask=ch_mask,
                             ).to(dtype=y_pred.dtype)
 
-                    loss_step = center_loss + lap_w * lap_loss + tmp_w * tmp_loss + dec_resid_w * phy_loss
+                    pressure_aux_w = float(loss_cfg.get("pressure_aux_weight", loss_cfg.get("pressure_loss_weight", 0.0)))
+                    pressure_consistency_w = float(loss_cfg.get("pressure_consistency_weight", 0.0))
+                    pressure_aux_loss = y_pred.new_zeros(())
+                    pressure_consistency_loss = y_pred.new_zeros(())
+                    if (
+                        norm_tgt is not None
+                        and (pressure_aux_w > 0.0 or pressure_consistency_w > 0.0)
+                    ):
+                        with torch.autocast(device_type=device.type, enabled=False):
+                            p_aux, p_cons = _pressure_auxiliary_losses(
+                                y_pred_abs=y_pred_abs.float(),
+                                x_tgt_abs=x_tgt_abs.float() if x_tgt_abs is not None else None,
+                                cfg=cfg,
+                            )
+                        pressure_aux_loss = p_aux.to(dtype=y_pred.dtype)
+                        pressure_consistency_loss = p_cons.to(dtype=y_pred.dtype)
+
+                    loss_step = (
+                        center_loss
+                        + lap_w * lap_loss
+                        + tmp_w * tmp_loss
+                        + dec_resid_w * phy_loss
+                        + pressure_aux_w * pressure_aux_loss
+                        + pressure_consistency_w * pressure_consistency_loss
+                    )
                     if norm_tgt is None:
                         loss_step = y_pred.new_zeros(())
 
@@ -11430,7 +11667,7 @@ def evaluate_one_epoch_multi_step(
         runtime_multires_lookup = None
     return avg_loss, stats
 
-def build_model_from_cfg(cfg, device):
+def build_model_from_cfg(cfg, device, ramp_feature_ctx: Dict[str, Any] | None = None):
     feats_cfg = cfg.get("features", {}) or {}
     use_cols = feats_cfg.get("use_columns", None)
     if isinstance(use_cols, (list, tuple)) and len(use_cols) > 0:
@@ -11445,13 +11682,24 @@ def build_model_from_cfg(cfg, device):
     model_cfg = cfg.get("model", {}) or {}
 
     b = cfg.get("features", {}).get("build", {})
-    in_ch = Fdim + _position_feature_dim(cfg) + (1 if b.get("use_level", True) else 0)
+    pos_dim = _position_feature_dim(cfg)
+    pos_mode = _position_feature_mode(cfg)
+    boundary_distance_start_col = Fdim if pos_mode == "boundary_distances" else None
+    in_ch = Fdim + pos_dim + (1 if b.get("use_level", True) else 0)
+    layout_cursor = Fdim + pos_dim
+    if b.get("use_level", True):
+        layout_cursor += 1
     if _include_dt_hat_from_build_cfg(b):
         in_ch += 1
+        layout_cursor += 1
     if bool(b.get("include_ramp_angle", False)):
         in_ch += 1
+        layout_cursor += 1
+    ramp_signed_distance_col = None
     if bool(b.get("include_signed_distance_to_ramp", False)):
+        ramp_signed_distance_col = layout_cursor
         in_ch += 1
+        layout_cursor += 1
 
     loss = cfg.get("loss", {}) or {}
     parc_on = _physics_inputs_active_from_loss_cfg(loss)
@@ -11473,7 +11721,7 @@ def build_model_from_cfg(cfg, device):
         conv_type = "sage"
     if model_type == "sageconv":
         conv_type = "sage"
-    elif model_type == "meshgraphnet":
+    elif model_type in {"meshgraphnet", "fluxgraphnet"}:
         conv_type = "sage"
     elif conv_type not in {"sage", "gine", "nnconv"}:
         raise ValueError(
@@ -11544,6 +11792,70 @@ def build_model_from_cfg(cfg, device):
             use_layernorm=bool(model_cfg.get("use_layernorm", False)),
             layernorm_eps=float(model_cfg.get("layernorm_eps", 1e-6)),
             predict_type=predict_type,
+        ).to(device)
+    elif model_type == "fluxgraphnet":
+        idx = dec.infer_feature_indices(cfg, Fdim)
+        state_rep = dec.state_representation_from_cfg(cfg, Fdim)
+
+        ramp_normal = model_cfg.get("ramp_normal", None)
+        if ramp_normal is None and isinstance(ramp_feature_ctx, dict):
+            ramp_normal = ramp_feature_ctx.get("distance_normal", None)
+        if ramp_normal is None:
+            angle_deg = _to_scalar_float(
+                b.get("ramp_angle_deg", b.get("ramp_angle_degrees", None))
+            )
+            if angle_deg is not None:
+                theta = math.radians(float(angle_deg))
+                ramp_normal = [-math.sin(theta), math.cos(theta)]
+
+        model = FluxGraphNetModel(
+            in_channels=in_ch,
+            out_channels=out_ch,
+            state_channel=int(model_cfg.get("state_channel", 0)),
+            edge_attr_channels=edge_attr_channels,
+            hidden=int(model_cfg.get("hidden", 128)),
+            layers=int(model_cfg.get("layers", 3)),
+            dropout=float(model_cfg.get("dropout", 0.0)),
+            activation=activation,
+            activation_negative_slope=activation_negative_slope,
+            activation_elu_alpha=activation_elu_alpha,
+            use_layernorm=bool(model_cfg.get("use_layernorm", False)),
+            layernorm_eps=float(model_cfg.get("layernorm_eps", 1e-6)),
+            predict_type=predict_type,
+            state_representation=str(model_cfg.get("state_representation", state_rep)),
+            u_index=int(idx.get("u", idx.get("mx", 0))),
+            v_index=int(idx.get("v", idx.get("my", 1))),
+            rho_index=int(idx.get("rho", 2 if Fdim >= 5 else 0)),
+            p_index=idx.get("p", None),
+            energy_index=int(idx.get("E", min(Fdim - 1, 4))),
+            gamma=float(model_cfg.get("gamma", dec.gas_gamma_from_cfg(cfg))),
+            rho_floor=float(model_cfg.get("rho_floor", loss.get("rho_eps", 1e-8))),
+            e_floor=float(model_cfg.get("e_floor", loss.get("E_floor", 1e-8))),
+            p_floor=float(model_cfg.get("p_floor", loss.get("p_floor", 1e-8))),
+            velocity_clip=float(model_cfg.get("velocity_clip", loss.get("u_clip", 0.0))),
+            signed_edge_channels=model_cfg.get("signed_edge_channels", [0, 1]),
+            fallback_directed_flux=bool(model_cfg.get("fallback_directed_flux", False)),
+            use_open_boundary_source=bool(model_cfg.get("use_open_boundary_source", True)),
+            use_ramp_boundary_source=bool(model_cfg.get("use_ramp_boundary_source", True)),
+            open_boundary_source_channels=model_cfg.get(
+                "open_boundary_source_channels",
+                [0, 1, 2, 3],
+            ),
+            ramp_boundary_source_channels=model_cfg.get(
+                "ramp_boundary_source_channels",
+                [1, 2],
+            ),
+            boundary_distance_start_col=boundary_distance_start_col,
+            boundary_distance_dim=4,
+            boundary_width=float(model_cfg.get("boundary_width", 0.02)),
+            ramp_signed_distance_col=ramp_signed_distance_col,
+            ramp_boundary_width=(
+                None
+                if model_cfg.get("ramp_boundary_width", None) is None
+                else float(model_cfg.get("ramp_boundary_width"))
+            ),
+            ramp_normal=ramp_normal,
+            ramp_pressure_source_weight=float(model_cfg.get("ramp_pressure_source_weight", 0.0)),
         ).to(device)
     else:
         model = FeatureNet(
@@ -11643,8 +11955,11 @@ def main(
     build_cfg = features_cfg.setdefault("build", {})
     if not isinstance(build_cfg, dict):
         raise ValueError("features.build must be a JSON object when provided.")
+    model_type_for_defaults = _resolve_model_type_key(cfg.get("model", {}) or {})
+    fluxgraphnet_defaults = model_type_for_defaults == "fluxgraphnet"
     build_cfg.setdefault("use_pos", True)
-    build_cfg.setdefault("position_mode", "xy")
+    if "position_mode" not in build_cfg:
+        build_cfg["position_mode"] = "boundary_distances" if fluxgraphnet_defaults else "xy"
     build_cfg.setdefault("boundary_distance_normalize", True)
     build_cfg.setdefault("boundary_distance_clip", None)
     build_cfg.setdefault("boundary_distance_clip_normalize", True)
@@ -11657,10 +11972,20 @@ def main(
     build_cfg.setdefault("include_ramp_angle", False)
     build_cfg.setdefault("ramp_angle_deg", None)
     build_cfg.setdefault("ramp_angle_units", "radians")
-    build_cfg.setdefault("include_signed_distance_to_ramp", False)
+    if "include_signed_distance_to_ramp" not in build_cfg:
+        build_cfg["include_signed_distance_to_ramp"] = bool(fluxgraphnet_defaults)
     build_cfg.setdefault("signed_distance_low_y_quantile", 0.12)
     build_cfg.setdefault("signed_distance_min_points", 32)
     build_cfg.setdefault("signed_distance_normalize", True)
+
+    if fluxgraphnet_defaults:
+        model_defaults = cfg.setdefault("model", {})
+        model_defaults.setdefault("predict_type", "rate")
+        model_defaults.setdefault("use_open_boundary_source", True)
+        model_defaults.setdefault("use_ramp_boundary_source", True)
+        model_defaults.setdefault("open_boundary_source_channels", [0, 1, 2, 3])
+        model_defaults.setdefault("ramp_boundary_source_channels", [1, 2])
+        model_defaults.setdefault("boundary_width", 0.02)
 
     use_cols_cfg = features_cfg.get("use_columns", None)
     if isinstance(use_cols_cfg, (list, tuple)) and len(use_cols_cfg) > 0:
@@ -11672,6 +11997,13 @@ def main(
     print(f"[IDX] rep={rep} map={idx}")
 
     loss = cfg.setdefault("loss", {})
+    if fluxgraphnet_defaults:
+        loss.setdefault("advection_type", "euler")
+        loss.setdefault("pressure_aux_weight", 0.05)
+        loss.setdefault("pressure_aux_log", True)
+        loss.setdefault("pressure_aux_huber", True)
+        loss.setdefault("pressure_aux_huber_delta", 0.1)
+        loss.setdefault("pressure_consistency_weight", 0.01)
 
     loss.setdefault("mode", "diffusion")           # "diffusion" | "advection" | "advdiff"
     loss.setdefault("blend_weight", 0.0)
@@ -11779,6 +12111,11 @@ def main(
     train_cfg = cfg.setdefault("train", {})
     train_cfg.setdefault("validation_every_epochs", 1)
     train_cfg.setdefault("checkpoint_every_epochs", 1)
+    lr_schedule_cfg = train_cfg.setdefault("lr_schedule", {})
+    if not isinstance(lr_schedule_cfg, dict):
+        raise ValueError("train.lr_schedule must be a JSON object when provided.")
+    lr_schedule_cfg.setdefault("enabled", False)
+    lr_schedule_cfg.setdefault("entries", [])
     train_cfg.setdefault("mesh_mode", "uniform")
     train_cfg.setdefault("use_precompute", False)
     mesh_mode = str(train_cfg.get("mesh_mode", "uniform")).strip().lower()
@@ -12045,7 +12382,7 @@ def main(
             f"(distance_scale={float(ramp_feature_ctx.get('distance_scale', 1.0)):.6g})"
         )
 
-    model = build_model_from_cfg(cfg, device)
+    model = build_model_from_cfg(cfg, device, ramp_feature_ctx=ramp_feature_ctx)
 
     # After model is created, before optimizer is created:
     loss_cfg = cfg.get("loss", {}) or {}
@@ -12084,10 +12421,21 @@ def main(
 
     # 2) Create optimizer with *all* groups already present
     opt = optim.AdamW(opt_groups, weight_decay=float(cfg["train"].get("weight_decay", 0.0)))
+    lr_schedule_entries = _parse_lr_schedule_entries(cfg.get("train", {}) or {})
+    if lr_schedule_entries:
+        parts = ", ".join(f"epoch {ep}->lr {lr:.3e}" for ep, lr in lr_schedule_entries)
+        print(f"[LR-SCHEDULE] enabled: {parts}", flush=True)
 
     # 3) Now create the scheduler (safe: param_groups size is final)
     sch_cfg   = cfg.get("scheduler", {})
     use_sched = bool(sch_cfg.get("use", True))
+    if lr_schedule_entries and use_sched:
+        print(
+            "[LR-SCHEDULE] train.lr_schedule is enabled; disabling ReduceLROnPlateau "
+            "from the top-level scheduler block for this run.",
+            flush=True,
+        )
+        use_sched = False
     scheduler = None
     if use_sched:
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -12748,6 +13096,15 @@ def main(
         cfg.setdefault("features", {}).setdefault("norm_stats", {})
         cfg["features"]["norm_stats"]["sigma"] = sigma.detach().cpu().tolist()
 
+    norm_setter = getattr(model, "set_normalization_stats", None)
+    if callable(norm_setter):
+        norm_setter(mu, sigma)
+        print(
+            f"[MODEL] synced normalization stats into {model.__class__.__name__} "
+            f"(enabled={int(mu is not None and sigma is not None)})",
+            flush=True,
+        )
+
     # --- ABS really means ABS check (one batch) ---
     if cfg.get("debug", {}).get("abs_means_abs_check", True):
         batch0 = next(iter(train_loader))
@@ -12901,6 +13258,12 @@ def main(
     TR, VL = [], []
     last_completed_epoch = int(resume_epoch) if resume_active else 0
     for epoch in range(start_epoch, total_epochs + 1):
+        lr_scheduled = _lr_from_schedule_for_epoch(lr_schedule_entries, epoch)
+        if lr_scheduled is not None:
+            changed_lr = _set_optimizer_lr(opt, lr_scheduled)
+            if changed_lr or any(int(ep) == int(epoch) for ep, _ in lr_schedule_entries):
+                print(f"[LR-SCHEDULE] epoch {epoch:03d}: lr={lr_scheduled:.3e}", flush=True)
+
         t0 = time.time()
         #batch = next(iter(train_loader))
 

@@ -561,6 +561,675 @@ class MeshGraphNetModel(nn.Module):
         raise RuntimeError(f"Unexpected predict_type='{self.predict_type}'.")
 
 
+class FluxGraphNetModel(nn.Module):
+    """
+    FluxGraphNet-style conservative transport model for shock-ramp primitive fields.
+
+    Public I/O follows the project convention: normalized state/delta/rate in the
+    configured feature order. Internally, primitive [U,V,RHO,P,Eint] states are
+    mapped to conservative [rho,rho*u,rho*v,E_tot], updated by anti-symmetric
+    learned edge fluxes, then mapped back to primitive output channels.
+    """
+
+    def __init__(
+        self,
+        *,
+        in_channels: int,
+        out_channels: int = 5,
+        state_channel: int = 0,
+        edge_attr_channels: int = 5,
+        hidden: int = 64,
+        layers: int = 2,
+        dropout: float = 0.0,
+        activation: str = "relu",
+        activation_negative_slope: float = 0.01,
+        activation_elu_alpha: float = 1.0,
+        use_layernorm: bool = False,
+        layernorm_eps: float = 1e-6,
+        predict_type: str = PREDICT_TYPE_RATE,
+        state_representation: str = "primitive_uvrhope",
+        u_index: int = 0,
+        v_index: int = 1,
+        rho_index: int = 2,
+        p_index: int | None = 3,
+        energy_index: int = 4,
+        gamma: float = 1.4,
+        rho_floor: float = 1e-6,
+        e_floor: float = 1e-8,
+        p_floor: float = 1e-8,
+        velocity_clip: float = 0.0,
+        signed_edge_channels: tuple[int, ...] | list[int] | None = (0, 1),
+        fallback_directed_flux: bool = False,
+        use_open_boundary_source: bool = True,
+        use_ramp_boundary_source: bool = True,
+        open_boundary_source_channels: tuple[int, ...] | list[int] | None = (0, 1, 2, 3),
+        ramp_boundary_source_channels: tuple[int, ...] | list[int] | None = (1, 2),
+        boundary_distance_start_col: int | None = None,
+        boundary_distance_dim: int = 4,
+        boundary_width: float = 0.02,
+        ramp_signed_distance_col: int | None = None,
+        ramp_boundary_width: float | None = None,
+        ramp_normal: tuple[float, float] | list[float] | torch.Tensor | None = None,
+        ramp_pressure_source_weight: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if in_channels <= 0:
+            raise ValueError(f"in_channels must be > 0, got {in_channels}.")
+        if out_channels <= 0:
+            raise ValueError(f"out_channels must be > 0, got {out_channels}.")
+        if state_channel < 0 or (state_channel + out_channels) > in_channels:
+            raise ValueError(
+                "state_channel/out_channels must select a valid state slice from the "
+                f"input, got state_channel={state_channel}, out_channels={out_channels}, "
+                f"in_channels={in_channels}."
+            )
+        if edge_attr_channels <= 0:
+            raise ValueError(f"edge_attr_channels must be > 0, got {edge_attr_channels}.")
+        if hidden <= 0:
+            raise ValueError(f"hidden must be > 0, got {hidden}.")
+        if layers < 1:
+            raise ValueError(f"layers must be >= 1, got {layers}.")
+        if not (0.0 <= float(dropout) < 1.0):
+            raise ValueError(f"dropout must satisfy 0 <= dropout < 1, got {dropout}.")
+        predict_key = str(predict_type).strip().lower()
+        if predict_key == "absolute":
+            predict_key = PREDICT_TYPE_STATE
+        if predict_key not in PREDICT_TYPES:
+            raise ValueError(
+                f"predict_type must be one of {sorted(PREDICT_TYPES)}, got '{predict_type}'."
+            )
+
+        rep = str(state_representation).strip().lower()
+        if rep in {"primitive", "primitive_uvrhope", "primitive_uv_rho_p_e", "uvrhope"}:
+            rep = "primitive_uvrhope"
+        elif rep in {"conservative", "conserved"}:
+            rep = "conservative"
+        else:
+            raise ValueError(
+                "state_representation must be one of {primitive_uvrhope, conservative}, "
+                f"got {state_representation!r}."
+            )
+        if rep == "primitive_uvrhope" and out_channels < 5:
+            raise ValueError("FluxGraphNetModel primitive mode requires at least 5 output channels.")
+        if rep == "conservative" and out_channels < 4:
+            raise ValueError("FluxGraphNetModel conservative mode requires at least 4 output channels.")
+
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.state_channel = int(state_channel)
+        self.edge_attr_channels = int(edge_attr_channels)
+        self.hidden = int(hidden)
+        self.layers = int(layers)
+        self.dropout = float(dropout)
+        self.predict_type = predict_key
+        self.state_representation = rep
+
+        self.u_index = int(u_index)
+        self.v_index = int(v_index)
+        self.rho_index = int(rho_index)
+        self.p_index = None if p_index is None else int(p_index)
+        self.energy_index = int(energy_index)
+        self.gamma = float(gamma)
+        self.rho_floor = float(rho_floor)
+        self.e_floor = float(e_floor)
+        self.p_floor = float(p_floor)
+        self.velocity_clip = float(velocity_clip)
+        self.fallback_directed_flux = bool(fallback_directed_flux)
+        self.use_open_boundary_source = bool(use_open_boundary_source)
+        self.use_ramp_boundary_source = bool(use_ramp_boundary_source)
+        self.boundary_distance_start_col = (
+            None if boundary_distance_start_col is None else int(boundary_distance_start_col)
+        )
+        self.boundary_distance_dim = int(boundary_distance_dim)
+        self.boundary_width = float(boundary_width)
+        self.ramp_signed_distance_col = (
+            None if ramp_signed_distance_col is None else int(ramp_signed_distance_col)
+        )
+        self.ramp_boundary_width = (
+            float(ramp_boundary_width)
+            if ramp_boundary_width is not None
+            else float(boundary_width)
+        )
+        self.ramp_pressure_source_weight = float(ramp_pressure_source_weight)
+
+        signed_channels = [] if signed_edge_channels is None else [int(c) for c in signed_edge_channels]
+        for ch in signed_channels:
+            if ch < 0 or ch >= self.edge_attr_channels:
+                raise ValueError(
+                    "signed_edge_channels entries must index edge_attr columns; "
+                    f"got {ch} for edge_attr_channels={self.edge_attr_channels}."
+                )
+        self.signed_edge_channels = tuple(signed_channels)
+
+        self.register_buffer("norm_mu", torch.zeros(self.out_channels, dtype=torch.float32), persistent=True)
+        self.register_buffer("norm_sigma", torch.ones(self.out_channels, dtype=torch.float32), persistent=True)
+        self.register_buffer("_has_norm_stats", torch.tensor(False), persistent=True)
+        self.register_buffer(
+            "open_boundary_source_mask",
+            self._make_conserved_mask(open_boundary_source_channels),
+            persistent=False,
+        )
+        self.register_buffer(
+            "ramp_boundary_source_mask",
+            self._make_conserved_mask(ramp_boundary_source_channels),
+            persistent=False,
+        )
+        if ramp_normal is None:
+            normal = torch.tensor([0.0, 1.0], dtype=torch.float32)
+            has_normal = False
+        else:
+            normal = torch.as_tensor(ramp_normal, dtype=torch.float32).view(-1)
+            if normal.numel() != 2:
+                raise ValueError(f"ramp_normal must have two entries, got shape={tuple(normal.shape)}.")
+            nrm = torch.linalg.norm(normal).clamp_min(1e-12)
+            normal = normal / nrm
+            has_normal = True
+        self.register_buffer("ramp_normal", normal.to(torch.float32), persistent=False)
+        self.register_buffer("_has_ramp_normal", torch.tensor(bool(has_normal)), persistent=False)
+
+        self._flux_pair_cache: dict[
+            tuple[int, int, int, str],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
+
+        self.block_activation = _make_activation(
+            activation,
+            negative_slope=float(activation_negative_slope),
+            elu_alpha=float(activation_elu_alpha),
+        )
+
+        self.node_encoder = _make_mlp(
+            in_dim=self.in_channels,
+            hidden_dim=self.hidden,
+            out_dim=self.hidden,
+            activation=activation,
+            activation_negative_slope=float(activation_negative_slope),
+            activation_elu_alpha=float(activation_elu_alpha),
+            dropout=self.dropout,
+        )
+        self.edge_encoder = _make_mlp(
+            in_dim=self.edge_attr_channels,
+            hidden_dim=self.hidden,
+            out_dim=self.hidden,
+            activation=activation,
+            activation_negative_slope=float(activation_negative_slope),
+            activation_elu_alpha=float(activation_elu_alpha),
+            dropout=self.dropout,
+        )
+        self.processor = nn.ModuleList(
+            [
+                MeshGraphNetProcessorBlock(
+                    hidden=self.hidden,
+                    dropout=self.dropout,
+                    activation=activation,
+                    activation_negative_slope=float(activation_negative_slope),
+                    activation_elu_alpha=float(activation_elu_alpha),
+                    use_layernorm=bool(use_layernorm),
+                    layernorm_eps=float(layernorm_eps),
+                )
+                for _ in range(self.layers)
+            ]
+        )
+
+        self.flux_head = _make_mlp(
+            in_dim=(2 * self.hidden) + self.edge_attr_channels,
+            hidden_dim=self.hidden,
+            out_dim=4,
+            activation=activation,
+            activation_negative_slope=float(activation_negative_slope),
+            activation_elu_alpha=float(activation_elu_alpha),
+            dropout=self.dropout,
+        )
+        self.open_boundary_head = (
+            _make_mlp(
+                in_dim=self.hidden,
+                hidden_dim=self.hidden,
+                out_dim=4,
+                activation=activation,
+                activation_negative_slope=float(activation_negative_slope),
+                activation_elu_alpha=float(activation_elu_alpha),
+                dropout=self.dropout,
+            )
+            if self.use_open_boundary_source
+            else None
+        )
+        self.ramp_boundary_head = (
+            _make_mlp(
+                in_dim=self.hidden,
+                hidden_dim=self.hidden,
+                out_dim=4,
+                activation=activation,
+                activation_negative_slope=float(activation_negative_slope),
+                activation_elu_alpha=float(activation_elu_alpha),
+                dropout=self.dropout,
+            )
+            if self.use_ramp_boundary_source
+            else None
+        )
+
+    @staticmethod
+    def _make_conserved_mask(channels: tuple[int, ...] | list[int] | None) -> torch.Tensor:
+        mask = torch.zeros(4, dtype=torch.float32)
+        if channels is None:
+            return mask
+        for ch in channels:
+            ci = int(ch)
+            if ci < 0 or ci >= 4:
+                raise ValueError(f"Conserved source channel indices must be in [0,3], got {ci}.")
+            mask[ci] = 1.0
+        return mask
+
+    def set_normalization_stats(self, mu, sigma) -> None:
+        """Install state-channel normalization stats after the trainer computes them."""
+        if mu is None or sigma is None:
+            self.norm_mu.zero_()
+            self.norm_sigma.fill_(1.0)
+            self._has_norm_stats.fill_(False)
+            return
+
+        mu_t = torch.as_tensor(mu, dtype=self.norm_mu.dtype, device=self.norm_mu.device).view(-1)
+        sig_t = torch.as_tensor(sigma, dtype=self.norm_sigma.dtype, device=self.norm_sigma.device).view(-1)
+        if mu_t.numel() < self.out_channels or sig_t.numel() < self.out_channels:
+            raise ValueError(
+                "Normalization stats are shorter than the model state dimension: "
+                f"mu={mu_t.numel()}, sigma={sig_t.numel()}, out_channels={self.out_channels}."
+            )
+        self.norm_mu.copy_(mu_t[: self.out_channels])
+        self.norm_sigma.copy_(sig_t[: self.out_channels].clamp_min(1e-12))
+        self._has_norm_stats.fill_(True)
+
+    def _state_slice(self, x: torch.Tensor) -> torch.Tensor:
+        return x[:, self.state_channel : self.state_channel + self.out_channels]
+
+    def _denorm_state(self, state: torch.Tensor) -> torch.Tensor:
+        if not bool(self._has_norm_stats.item()):
+            return state
+        mu = self.norm_mu.to(device=state.device, dtype=state.dtype).view(1, -1)
+        sigma = self.norm_sigma.to(device=state.device, dtype=state.dtype).view(1, -1).clamp_min(1e-12)
+        return state * sigma + mu
+
+    def _norm_state(self, state_abs: torch.Tensor) -> torch.Tensor:
+        if not bool(self._has_norm_stats.item()):
+            return state_abs
+        mu = self.norm_mu.to(device=state_abs.device, dtype=state_abs.dtype).view(1, -1)
+        sigma = self.norm_sigma.to(device=state_abs.device, dtype=state_abs.dtype).view(1, -1).clamp_min(1e-12)
+        return (state_abs - mu) / sigma
+
+    def _norm_rate(self, rate_abs: torch.Tensor) -> torch.Tensor:
+        if not bool(self._has_norm_stats.item()):
+            return rate_abs
+        sigma = self.norm_sigma.to(device=rate_abs.device, dtype=rate_abs.dtype).view(1, -1).clamp_min(1e-12)
+        return rate_abs / sigma
+
+    def _primitive_abs_to_conservative(self, state_abs: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if self.state_representation == "conservative":
+            rho = state_abs[:, 0].clamp_min(self.rho_floor)
+            mx = state_abs[:, 1]
+            my = state_abs[:, 2]
+            Et = state_abs[:, 3]
+            rho_safe = rho.clamp_min(self.rho_floor)
+            u = mx / rho_safe
+            v = my / rho_safe
+            if self.velocity_clip > 0.0:
+                u = u.clamp(min=-self.velocity_clip, max=self.velocity_clip)
+                v = v.clamp(min=-self.velocity_clip, max=self.velocity_clip)
+            kinetic = 0.5 * (mx * mx + my * my) / rho_safe
+            p = (self.gamma - 1.0) * (Et - kinetic)
+            e_int = (Et / rho_safe) - 0.5 * (u * u + v * v)
+            q = torch.stack([rho, mx, my, Et], dim=1)
+            return q, {"rho": rho, "u": u, "v": v, "p": p, "e_int": e_int}
+
+        rho = state_abs[:, self.rho_index].clamp_min(self.rho_floor)
+        u = state_abs[:, self.u_index]
+        v = state_abs[:, self.v_index]
+        if self.velocity_clip > 0.0:
+            u = u.clamp(min=-self.velocity_clip, max=self.velocity_clip)
+            v = v.clamp(min=-self.velocity_clip, max=self.velocity_clip)
+        e_int = state_abs[:, self.energy_index].clamp_min(self.e_floor)
+        mx = rho * u
+        my = rho * v
+        Et = rho * (e_int + 0.5 * (u * u + v * v))
+        if self.p_index is not None and 0 <= self.p_index < state_abs.size(1):
+            p = state_abs[:, self.p_index].clamp_min(self.p_floor)
+        else:
+            p = ((self.gamma - 1.0) * rho * e_int).clamp_min(self.p_floor)
+        q = torch.stack([rho, mx, my, Et], dim=1)
+        return q, {"rho": rho, "u": u, "v": v, "p": p, "e_int": e_int}
+
+    def _conservative_abs_to_primitive(self, q_abs: torch.Tensor, template_abs: torch.Tensor) -> torch.Tensor:
+        if self.state_representation == "conservative":
+            out = template_abs.clone()
+            out[:, :4] = q_abs
+            return out
+
+        rho = q_abs[:, 0].clamp_min(self.rho_floor)
+        mx = q_abs[:, 1]
+        my = q_abs[:, 2]
+        Et = q_abs[:, 3]
+        u = mx / rho
+        v = my / rho
+        if self.velocity_clip > 0.0:
+            u = u.clamp(min=-self.velocity_clip, max=self.velocity_clip)
+            v = v.clamp(min=-self.velocity_clip, max=self.velocity_clip)
+        e_int = ((Et / rho) - 0.5 * (u * u + v * v)).clamp_min(self.e_floor)
+        p = ((self.gamma - 1.0) * rho * e_int).clamp_min(self.p_floor)
+
+        out = template_abs.clone()
+        out[:, self.u_index] = u
+        out[:, self.v_index] = v
+        out[:, self.rho_index] = rho
+        out[:, self.energy_index] = e_int
+        if self.p_index is not None and 0 <= self.p_index < out.size(1):
+            out[:, self.p_index] = p
+        return out
+
+    def _conservative_rate_to_primitive_rate(
+        self,
+        qdot: torch.Tensor,
+        state: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        if self.state_representation == "conservative":
+            out = qdot.new_zeros((qdot.size(0), self.out_channels))
+            out[:, :4] = qdot
+            return out
+
+        rho = state["rho"].clamp_min(self.rho_floor)
+        u = state["u"]
+        v = state["v"]
+        e_int = state["e_int"].clamp_min(self.e_floor)
+        rho_dot = qdot[:, 0]
+        mx_dot = qdot[:, 1]
+        my_dot = qdot[:, 2]
+        Et_dot = qdot[:, 3]
+
+        u_dot = (mx_dot - u * rho_dot) / rho
+        v_dot = (my_dot - v * rho_dot) / rho
+        kinetic = 0.5 * (u * u + v * v)
+        e_dot = (Et_dot - rho_dot * (e_int + kinetic) - rho * (u * u_dot + v * v_dot)) / rho
+        p_dot = (self.gamma - 1.0) * (rho_dot * e_int + rho * e_dot)
+
+        out = qdot.new_zeros((qdot.size(0), self.out_channels))
+        out[:, self.u_index] = u_dot
+        out[:, self.v_index] = v_dot
+        out[:, self.rho_index] = rho_dot
+        out[:, self.energy_index] = e_dot
+        if self.p_index is not None and 0 <= self.p_index < out.size(1):
+            out[:, self.p_index] = p_dot
+        return out
+
+    def _get_flux_pairing(
+        self,
+        edge_index: torch.Tensor,
+        num_nodes: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        cache_key = (
+            int(num_nodes),
+            int(edge_index.shape[1]),
+            int(edge_index.data_ptr()),
+            str(edge_index.device),
+        )
+        cached = self._flux_pair_cache.get(cache_key, None)
+        if cached is not None:
+            return cached
+
+        src = edge_index[0].long()
+        dst = edge_index[1].long()
+        if src.numel() == 0:
+            empty = src.new_empty((0,))
+            signs = torch.empty((0,), device=edge_index.device, dtype=torch.float32)
+            cached = (empty, empty, empty, signs, empty)
+            self._flux_pair_cache[cache_key] = cached
+            return cached
+
+        lo = torch.minimum(src, dst)
+        hi = torch.maximum(src, dst)
+        pair_key = lo * int(num_nodes) + hi
+        _unique_keys, inverse, counts = torch.unique(
+            pair_key,
+            sorted=True,
+            return_inverse=True,
+            return_counts=True,
+        )
+        sort_perm = torch.argsort(pair_key)
+        group_start = torch.cumsum(counts, dim=0) - counts
+        rep_idx = sort_perm[group_start]
+
+        orient = torch.where(
+            src == lo,
+            torch.ones_like(src, dtype=torch.float32),
+            -torch.ones_like(src, dtype=torch.float32),
+        )
+        orient_sum = torch.zeros((int(counts.numel()),), device=edge_index.device, dtype=torch.float32)
+        orient_sum.index_add_(0, inverse, orient)
+        paired_groups = (counts == 2) & (lo[rep_idx] != hi[rep_idx]) & (orient_sum.abs() <= 1e-6)
+        paired_edge_mask = paired_groups[inverse]
+
+        rep_idx_paired = rep_idx[paired_groups]
+        lo_paired = lo[rep_idx_paired]
+        hi_paired = hi[rep_idx_paired]
+        canonical_sign = torch.where(
+            src[rep_idx_paired] == lo_paired,
+            torch.ones_like(rep_idx_paired, dtype=torch.float32),
+            -torch.ones_like(rep_idx_paired, dtype=torch.float32),
+        )
+        fallback_idx = (~paired_edge_mask).nonzero(as_tuple=False).view(-1)
+        cached = (rep_idx_paired, lo_paired, hi_paired, canonical_sign, fallback_idx)
+        self._flux_pair_cache[cache_key] = cached
+        return cached
+
+    def _canonical_edge_features(
+        self,
+        edge_attr: torch.Tensor,
+        rep_idx: torch.Tensor,
+        canonical_sign: torch.Tensor,
+    ) -> torch.Tensor:
+        edge_feat = edge_attr[rep_idx].abs()
+        if len(self.signed_edge_channels) == 0 or rep_idx.numel() == 0:
+            return edge_feat
+        signed = edge_attr[rep_idx]
+        s = canonical_sign.to(device=edge_attr.device, dtype=edge_attr.dtype).view(-1)
+        edge_feat = edge_feat.clone()
+        for ch in self.signed_edge_channels:
+            edge_feat[:, int(ch)] = signed[:, int(ch)] * s
+        return edge_feat
+
+    def _compute_conservative_flux_update(
+        self,
+        *,
+        node_latent: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+    ) -> torch.Tensor:
+        num_nodes = int(node_latent.size(0))
+        src = edge_index[0].long()
+        dst = edge_index[1].long()
+        rep_idx, lo, hi, canonical_sign, fallback_idx = self._get_flux_pairing(edge_index, num_nodes)
+
+        delta = torch.zeros((num_nodes, 4), device=node_latent.device, dtype=node_latent.dtype)
+
+        if rep_idx.numel() > 0:
+            h_lo = node_latent[lo]
+            h_hi = node_latent[hi]
+            pair_mean = 0.5 * (h_lo + h_hi)
+            pair_absdiff = torch.abs(h_lo - h_hi)
+            edge_feat = self._canonical_edge_features(edge_attr, rep_idx, canonical_sign)
+            flux_inputs = torch.cat([pair_mean, pair_absdiff, edge_feat], dim=-1)
+            paired_flux = self.flux_head(flux_inputs)
+            delta.index_add_(0, lo, -paired_flux)
+            delta.index_add_(0, hi, paired_flux)
+
+        if self.fallback_directed_flux and fallback_idx.numel() > 0:
+            h_src = node_latent[src[fallback_idx]]
+            h_dst = node_latent[dst[fallback_idx]]
+            pair_mean = 0.5 * (h_src + h_dst)
+            pair_absdiff = torch.abs(h_src - h_dst)
+            edge_feat = edge_attr[fallback_idx]
+            flux_inputs = torch.cat([pair_mean, pair_absdiff, edge_feat], dim=-1)
+            fallback_flux = self.flux_head(flux_inputs)
+            delta.index_add_(0, src[fallback_idx], -fallback_flux)
+
+        return delta
+
+    def _linear_gate_from_distance(self, dist: torch.Tensor, width: float) -> torch.Tensor:
+        width_t = max(float(width), 1e-12)
+        return (1.0 - (dist.abs() / width_t)).clamp(min=0.0, max=1.0)
+
+    def _boundary_gates(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        n = int(x.size(0))
+        boundary_gate = x.new_zeros((n, 1))
+        ramp_gate = x.new_zeros((n, 1))
+
+        if self.boundary_distance_start_col is not None:
+            start = int(self.boundary_distance_start_col)
+            end = start + max(1, int(self.boundary_distance_dim))
+            if 0 <= start < x.size(1) and end <= x.size(1):
+                d = x[:, start:end]
+                min_dist = d.abs().min(dim=1, keepdim=True).values
+                boundary_gate = self._linear_gate_from_distance(min_dist, self.boundary_width)
+                if d.size(1) >= 3:
+                    bottom_dist = d[:, 2:3]
+                    ramp_gate = self._linear_gate_from_distance(bottom_dist, self.ramp_boundary_width)
+
+        if self.ramp_signed_distance_col is not None:
+            col = int(self.ramp_signed_distance_col)
+            if 0 <= col < x.size(1):
+                signed = x[:, col : col + 1]
+                ramp_gate = torch.maximum(
+                    ramp_gate,
+                    self._linear_gate_from_distance(signed, self.ramp_boundary_width),
+                )
+
+        open_gate = (boundary_gate * (1.0 - ramp_gate)).clamp(min=0.0, max=1.0)
+        return open_gate, ramp_gate.clamp(min=0.0, max=1.0)
+
+    def _boundary_source(
+        self,
+        *,
+        x: torch.Tensor,
+        node_latent: torch.Tensor,
+        state: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        source = torch.zeros((x.size(0), 4), device=x.device, dtype=node_latent.dtype)
+        open_gate, ramp_gate = self._boundary_gates(x)
+        open_gate = open_gate.to(device=node_latent.device, dtype=node_latent.dtype)
+        ramp_gate = ramp_gate.to(device=node_latent.device, dtype=node_latent.dtype)
+
+        if self.open_boundary_head is not None and torch.any(open_gate > 0):
+            mask = self.open_boundary_source_mask.to(device=node_latent.device, dtype=node_latent.dtype).view(1, 4)
+            source = source + open_gate * self.open_boundary_head(node_latent) * mask
+
+        if self.ramp_boundary_head is not None and torch.any(ramp_gate > 0):
+            mask = self.ramp_boundary_source_mask.to(device=node_latent.device, dtype=node_latent.dtype).view(1, 4)
+            source = source + ramp_gate * self.ramp_boundary_head(node_latent) * mask
+
+        if (
+            self.ramp_pressure_source_weight != 0.0
+            and bool(self._has_ramp_normal.item())
+            and torch.any(ramp_gate > 0)
+        ):
+            normal = self.ramp_normal.to(device=node_latent.device, dtype=node_latent.dtype).view(1, 2)
+            p = state["p"].to(device=node_latent.device, dtype=node_latent.dtype).clamp_min(self.p_floor)
+            wall = node_latent.new_zeros((x.size(0), 4))
+            wall[:, 1] = p * normal[:, 0]
+            wall[:, 2] = p * normal[:, 1]
+            source = source + float(self.ramp_pressure_source_weight) * ramp_gate * wall
+
+        return source
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        *,
+        edge_attr: torch.Tensor | None = None,
+        dt: float | None = None,
+    ) -> torch.Tensor:
+        del dt
+
+        state_norm = self._state_slice(x)
+        state_abs = self._denorm_state(state_norm)
+        q_abs, state = self._primitive_abs_to_conservative(state_abs)
+
+        if edge_attr is None:
+            raise ValueError("FluxGraphNetModel requires edge_attr in forward/predict_state.")
+        if edge_attr.ndim != 2:
+            raise ValueError(f"edge_attr must be rank-2 [E,D], got shape={tuple(edge_attr.shape)}.")
+        if edge_attr.shape[1] != self.edge_attr_channels:
+            raise ValueError(
+                "edge_attr channel mismatch: "
+                f"expected {self.edge_attr_channels}, got {edge_attr.shape[1]}."
+            )
+        if edge_attr.shape[0] != edge_index.shape[1]:
+            raise ValueError(
+                "edge_attr edge count mismatch: "
+                f"edge_attr has {edge_attr.shape[0]} rows, edge_index has {edge_index.shape[1]} edges."
+            )
+
+        edge_attr = edge_attr.to(device=x.device, dtype=x.dtype)
+        node_latent = self.node_encoder(x)
+        edge_latent = self.edge_encoder(edge_attr)
+        for block in self.processor:
+            node_latent, edge_latent = block(node_latent, edge_index, edge_latent)
+            node_latent = self.block_activation(node_latent)
+            node_latent = F.dropout(node_latent, p=self.dropout, training=self.training)
+
+        q_update = self._compute_conservative_flux_update(
+            node_latent=node_latent,
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+        )
+        q_update = q_update + self._boundary_source(x=x, node_latent=node_latent, state=state)
+
+        if self.predict_type == PREDICT_TYPE_RATE:
+            prim_rate_abs = self._conservative_rate_to_primitive_rate(q_update, state)
+            return self._norm_rate(prim_rate_abs)
+
+        q_next_abs = q_abs + q_update
+        prim_next_abs = self._conservative_abs_to_primitive(q_next_abs, state_abs)
+        prim_next_norm = self._norm_state(prim_next_abs)
+        if self.predict_type == PREDICT_TYPE_STATE:
+            return prim_next_norm
+        if self.predict_type == PREDICT_TYPE_DELTA:
+            return prim_next_norm - state_norm
+        raise RuntimeError(f"Unexpected predict_type='{self.predict_type}'.")
+
+    def predict_state(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        *,
+        edge_attr: torch.Tensor | None = None,
+        dt: float,
+        state_override: torch.Tensor | None = None,
+        state_residual: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if state_override is not None and state_residual is not None:
+            raise ValueError("Pass only one of state_override or state_residual.")
+
+        state_in = self._state_slice(x)
+        state_ref = state_override if state_override is not None else state_residual
+        if state_ref is None:
+            state_base = state_in
+        else:
+            if state_ref.ndim != 2 or state_ref.shape != state_in.shape:
+                raise ValueError(
+                    "state_override/state_residual must have shape matching the state "
+                    f"slice {tuple(state_in.shape)}, got {tuple(state_ref.shape)}."
+                )
+            state_base = state_ref.to(device=x.device, dtype=x.dtype)
+
+        y = self.forward(x, edge_index, edge_attr=edge_attr, dt=dt)
+        if self.predict_type == PREDICT_TYPE_STATE:
+            if state_ref is None:
+                return y
+            return y + (state_base - state_in)
+        if self.predict_type == PREDICT_TYPE_DELTA:
+            return state_base + y
+        if self.predict_type == PREDICT_TYPE_RATE:
+            return state_base + float(dt) * y
+        raise RuntimeError(f"Unexpected predict_type='{self.predict_type}'.")
+
+
 class FeatureNet(nn.Module):
     """
     GraphSAGE encoder with a regression head that predicts features at dynamic cell centers.
