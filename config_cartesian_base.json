@@ -62,8 +62,8 @@
     "u_clip": 1000.0
   },
   "model": {
-    "name": "FeatureNet",
-    "type": "featurenet",
+    "name": "sageconv",
+    "type": "sageconv",
     "_comment_type": "Options: 'featurenet', 'sageconv', or 'meshgraphnet'. MeshGraphNet matches the 1D_advection/Burgers processor stack and uses edge_attr_channels (default 5).",
     "conv_type": "sage",
     "_comment_conv_type": "FeatureNet only: one of 'sage', 'gine', or 'nnconv'.",

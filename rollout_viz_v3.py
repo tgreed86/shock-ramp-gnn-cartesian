@@ -7,6 +7,8 @@ Long-rollout visualization script for trained models (memory-safe + faster).
 What it produces:
 - One GIF per feature, named: rollout_<feature_name>.gif
 - Default frame layout is 1x2: [Pred(t+1), GT(t+1)].
+- Optional (--save-gt-only-gif): one all-variable GT(t+1) GIF, named rollout_ground_truth_all.gif by default.
+- GIFs are written with infinite looping enabled.
 - Optional (--include-deltas) frame layout is 2x3:
     Top:    [GT(t), Pred(t+1) on Pred-mesh, GT(t+1)]
     Bottom: [GT(t+1)-GT(t) on GT(t+1), Pred(t+1)-GT(t+1) on Pred, Pred(t+1)-GT(t) on Pred]
@@ -78,6 +80,9 @@ Use:
 Use 
         --truth-gt-render-levels 0,1,2,3
     to change the maximum level of refinement shown in the GT(t+1) panel of the main GIF. By default, all levels are shown.
+Use:
+        --save-gt-only-gif
+    to also write one continuously looping GIF with all GT(t+1) variables and no predictions.
 =======================================
 """
 
@@ -140,6 +145,11 @@ def _now() -> str:
 
 def log(msg: str):
     print(f"[{_now()}] {msg}", flush=True)
+
+
+def _open_gif_writer(path: str, *, duration: float):
+    """Open a GIF writer configured to loop forever."""
+    return imageio.get_writer(path, mode="I", duration=float(duration), loop=0)
 
 class Timer:
     def __init__(self, name: str):
@@ -255,6 +265,45 @@ def _extract_xy_from_snapshot(step_obj):
     c = getattr(step_obj, "pos", getattr(step_obj, "xy", getattr(step_obj, "centers", None)))
     p = getattr(step_obj, "pos_phys", getattr(step_obj, "xy_phys", None))
     return c, p
+
+
+def _cell_edge_bbox_from_centers(centers_xy, *, H: int, W: int):
+    if not torch.is_tensor(centers_xy):
+        centers_xy = torch.as_tensor(centers_xy)
+    if centers_xy.ndim != 2 or centers_xy.size(1) < 2:
+        raise RuntimeError(
+            "Expected centers tensor with shape (N,2+) when deriving cell-edge bbox."
+        )
+    pts = centers_xy[:, :2].detach().to(device="cpu", dtype=torch.float64)
+    x = pts[:, 0]
+    y = pts[:, 1]
+    xb0 = float(x.min().item())
+    xb1 = float(x.max().item())
+    yb0 = float(y.min().item())
+    yb1 = float(y.max().item())
+
+    def _spacing(vals, n_expected: int, span: float) -> float:
+        uniq = torch.unique(vals)
+        uniq, _ = torch.sort(uniq)
+        if uniq.numel() > 1:
+            diffs = torch.diff(uniq)
+            diffs = diffs[diffs > 1e-12]
+            if diffs.numel() > 0:
+                return float(torch.median(diffs).item())
+        if n_expected > 1:
+            return float(span / float(n_expected - 1))
+        return 0.0
+
+    dx_c = _spacing(x, int(W), xb1 - xb0)
+    dy_c = _spacing(y, int(H), yb1 - yb0)
+    return (
+        xb0 - 0.5 * dx_c,
+        xb1 + 0.5 * dx_c,
+        yb0 - 0.5 * dy_c,
+        yb1 + 0.5 * dy_c,
+        dx_c,
+        dy_c,
+    )
 
 
 def _extract_hw_from_snapshot(step_obj):
@@ -1877,7 +1926,7 @@ def make_rollout_gifs(
         safe_name = str(feature_names[f]).replace(" ", "_")
         gif_path = os.path.join(out_dir, f"rollout_{safe_name}.gif")
         gif_paths.append(gif_path)
-        writers.append(imageio.get_writer(gif_path, mode="I", duration=duration))
+        writers.append(_open_gif_writer(gif_path, duration=duration))
 
     # Optionally compute global clims (still computed via sampling if clim_sample is set)
     global_top_min = None
@@ -2406,6 +2455,326 @@ def _rasterize_block_common_global(
     return img, HH, WW
 
 
+@torch.no_grad()
+def _rasterize_idw_global(
+    centers: torch.Tensor,
+    values: torch.Tensor,
+    bins: int,
+    k: int,
+    bbox: tuple[float, float, float, float],
+    chunk: int,
+):
+    """
+    IDW from cell centers to a uniform bins-by-bins grid.
+    Module-level variant used by the GT-only overview writer.
+    """
+    device_cpu = torch.device("cpu")
+    centers = centers.to(device=device_cpu, dtype=torch.float32)
+    values = values.to(device=device_cpu, dtype=torch.float32)
+    if values.dim() == 1:
+        values = values[:, None]
+    F_ = int(values.shape[1])
+
+    xmin, xmax, ymin, ymax = map(float, bbox)
+    xs = torch.linspace(xmin, xmax, int(bins), device=device_cpu)
+    ys = torch.linspace(ymin, ymax, int(bins), device=device_cpu)
+    gx, gy = torch.meshgrid(xs, ys, indexing="xy")
+    grid = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=1)
+    M = int(grid.size(0))
+
+    out = torch.full((M, F_), torch.nan, device=device_cpu, dtype=torch.float32)
+    N = int(centers.size(0))
+    kk = max(1, min(int(k), N))
+    for s in range(0, M, int(chunk)):
+        e = min(s + int(chunk), M)
+        q = grid[s:e]
+        d = torch.cdist(q, centers)
+        d, idx = torch.topk(d, k=kk, dim=1, largest=False)
+        w = 1.0 / (d + 1e-8)
+        w = w / w.sum(dim=1, keepdim=True)
+        vals = values.index_select(0, idx.reshape(-1)).view(idx.size(0), idx.size(1), F_)
+        out[s:e] = (w.unsqueeze(-1) * vals).sum(dim=1)
+    return out, int(bins), int(bins)
+
+
+def _feature_grid_shape(n_features: int) -> tuple[int, int]:
+    n = max(1, int(n_features))
+    ncols = int(np.ceil(np.sqrt(float(n))))
+    nrows = int(np.ceil(float(n) / float(ncols)))
+    return max(1, nrows), max(1, ncols)
+
+
+def _append_fig_frame(writer, fig):
+    fig.canvas.draw()
+    buf, (w, h) = fig.canvas.print_to_buffer()
+    rgba = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)
+    writer.append_data(rgba[..., :3].copy())
+
+
+@torch.inference_mode()
+def make_ground_truth_all_variables_gif(
+    examples,
+    cfg,
+    out_dir: str,
+    feature_names=None,
+    unify_clims: bool = False,
+    fps: int = 4,
+    dpi: int = 100,
+    *,
+    raw_series=None,
+    truth_mode: bool = False,
+    raster_mode: str = "block",
+    raster_bins: int = 256,
+    raster_k: int = 8,
+    raster_chunk: int = 32768,
+    raster_lmax: int | None = None,
+    progress_every: int = 1,
+    output_name: str = "rollout_ground_truth_all.gif",
+):
+    """
+    Write one overview GIF containing all target GT variables.
+
+    Normal mode renders GT(t+1) on the computational/raster grid. Truth mode
+    renders raw GT(t+1) cell centers in physical space, with no prediction panels.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    if not examples:
+        log("[WARN] make_ground_truth_all_variables_gif: no examples provided; nothing to do.")
+        return None
+
+    examples = sorted(examples, key=lambda e: int(e.get("t", 0)))
+    F = int(examples[0]["gt_tp1"].shape[1])
+    if feature_names is None:
+        feature_names = [f"Feat_{i}" for i in range(F)]
+    elif len(feature_names) < F:
+        feature_names = list(feature_names) + [f"Feat_{i}" for i in range(len(feature_names), F)]
+    else:
+        feature_names = list(feature_names)
+
+    out_path = os.path.join(out_dir, str(output_name))
+    duration = 1.0 / max(1, int(fps))
+    nrows, ncols = _feature_grid_shape(F)
+    fig_w = max(8.0, 4.2 * float(ncols))
+    fig_h = max(5.0, 3.4 * float(nrows))
+
+    top_min_f = top_max_f = None
+    truth_records = None
+    phys_extent = None
+
+    if bool(truth_mode):
+        if raw_series is None:
+            raise RuntimeError("--save-gt-only-gif with --truth-mode requires raw_series.")
+        truth_records = []
+        for step, ex in enumerate(examples):
+            t_abs = int(ex.get("t", step)) + 1
+            if t_abs < 0 or t_abs >= len(raw_series):
+                raise RuntimeError(
+                    "GT-only truth GIF requires raw snapshot at t+1 for each transition. "
+                    f"Got transition t={int(ex.get('t', step))}, required t+1={t_abs}, "
+                    f"series_length={len(raw_series)}"
+                )
+            rec = _extract_truth_snapshot_strict(
+                raw_series[t_abs],
+                feature_names=feature_names,
+                F_target=F,
+            )
+            rec["t_abs"] = int(t_abs)
+            truth_records.append(rec)
+
+        phys = torch.cat([rec["phys"] for rec in truth_records], dim=0)
+        x = phys[:, 0].detach().cpu().numpy()
+        y = phys[:, 1].detach().cpu().numpy()
+        x0 = float(np.nanmin(x)); x1 = float(np.nanmax(x))
+        y0 = float(np.nanmin(y)); y1 = float(np.nanmax(y))
+        dxp = max(1e-12, x1 - x0)
+        dyp = max(1e-12, y1 - y0)
+        pad = 0.02
+        phys_extent = (x0 - pad * dxp, x1 + pad * dxp, y0 - pad * dyp, y1 + pad * dyp)
+
+        if bool(unify_clims):
+            top_min_f = torch.full((F,), float("inf"), dtype=torch.float32)
+            top_max_f = torch.full((F,), float("-inf"), dtype=torch.float32)
+            for rec in truth_records:
+                vals = rec["features"]
+                top_min_f = torch.minimum(top_min_f, torch.nan_to_num(vals, nan=float("inf")).amin(dim=0))
+                top_max_f = torch.maximum(top_max_f, torch.nan_to_num(vals, nan=float("-inf")).amax(dim=0))
+    else:
+        if bool(unify_clims):
+            top_min_f = torch.full((F,), float("inf"), dtype=torch.float32)
+            top_max_f = torch.full((F,), float("-inf"), dtype=torch.float32)
+            for ex in examples:
+                vals = torch.as_tensor(ex["gt_tp1"], dtype=torch.float32, device="cpu")
+                top_min_f = torch.minimum(top_min_f, torch.nan_to_num(vals, nan=float("inf")).amin(dim=0))
+                top_max_f = torch.maximum(top_max_f, torch.nan_to_num(vals, nan=float("-inf")).amax(dim=0))
+
+    if top_min_f is not None and top_max_f is not None:
+        bad = (~torch.isfinite(top_min_f)) | (~torch.isfinite(top_max_f)) | (top_min_f == top_max_f)
+        if torch.any(bad):
+            top_min_f = torch.where(bad, torch.zeros_like(top_min_f), top_min_f)
+            top_max_f = torch.where(bad, torch.ones_like(top_max_f), top_max_f)
+
+    writer = _open_gif_writer(out_path, duration=duration)
+    try:
+        if bool(truth_mode):
+            log("[GT-GIF] Writing GT-only all-variable GIF in truth/physical scatter mode.")
+            assert truth_records is not None
+            assert phys_extent is not None
+            x0p, x1p, y0p, y1p = phys_extent
+            for step, rec in enumerate(truth_records):
+                t_abs = int(rec["t_abs"])
+                xy = rec["phys"].detach().cpu().numpy().astype(np.float32, copy=False)
+                vals_all = rec["features"].detach().cpu().numpy().astype(np.float32, copy=False)
+
+                fig, axs = plt.subplots(
+                    nrows,
+                    ncols,
+                    figsize=(fig_w, fig_h),
+                    dpi=int(dpi),
+                    squeeze=False,
+                    constrained_layout=True,
+                )
+                fig.suptitle(f"GT(t+1) all variables | t={t_abs}", fontsize=12)
+
+                for f in range(F):
+                    ax = axs[f // ncols, f % ncols]
+                    vals = vals_all[:, f]
+                    if top_min_f is not None:
+                        vmin = float(top_min_f[f].item())
+                        vmax = float(top_max_f[f].item())
+                    else:
+                        vmin = float(np.nanmin(vals))
+                        vmax = float(np.nanmax(vals))
+                        if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or (vmin == vmax):
+                            vmin, vmax = 0.0, 1.0
+                    sc = ax.scatter(
+                        xy[:, 0],
+                        xy[:, 1],
+                        c=vals,
+                        s=0.8,
+                        marker="o",
+                        linewidths=0.0,
+                        edgecolors="none",
+                        cmap="viridis",
+                        vmin=vmin,
+                        vmax=vmax,
+                    )
+                    ax.set_title(str(feature_names[f]))
+                    ax.set_xlabel("x (physical)")
+                    ax.set_ylabel("y (physical)")
+                    ax.set_xlim(x0p, x1p)
+                    ax.set_ylim(y0p, y1p)
+                    ax.set_aspect("equal", adjustable="box")
+                    fig.colorbar(sc, ax=ax, shrink=0.74)
+
+                for f in range(F, nrows * ncols):
+                    axs[f // ncols, f % ncols].axis("off")
+
+                _append_fig_frame(writer, fig)
+                fig.tight_layout()
+                plt.close(fig)
+
+                if (step + 1) % max(1, int(progress_every)) == 0:
+                    log(f"[GT-GIF] wrote frame {step+1}/{len(truth_records)} (t={t_abs})")
+        else:
+            refine_ratio = _get_refine_ratio(cfg)
+            mode = str(raster_mode).lower()
+            if mode not in ("block", "idw"):
+                raise ValueError(f"Invalid raster_mode={raster_mode!r}; expected block|idw.")
+            log(f"[GT-GIF] Writing GT-only all-variable GIF in raster mode ({mode}).")
+            for step, ex in enumerate(examples):
+                H = int(ex["H"])
+                W = int(ex["W"])
+                bbox = tuple(float(v) for v in ex["bbox"])
+                t_abs = int(ex.get("t", step)) + 1
+
+                centers = torch.as_tensor(ex["centers_tp1"], dtype=torch.float32, device="cpu")
+                vals = torch.as_tensor(ex["gt_tp1"], dtype=torch.float32, device="cpu")
+
+                if mode == "idw":
+                    img_flat, HH, WW = _rasterize_idw_global(
+                        centers,
+                        vals,
+                        int(raster_bins),
+                        int(raster_k),
+                        bbox,
+                        int(raster_chunk),
+                    )
+                else:
+                    levels = ex.get("level_tp1", None)
+                    if levels is None:
+                        raise KeyError("GT-only block raster GIF requires ex['level_tp1'].")
+                    levels = torch.as_tensor(levels, dtype=torch.long, device="cpu").view(-1)
+                    step_lmax = int(levels.max().item()) if levels.numel() > 0 else 0
+                    if raster_lmax is not None:
+                        step_lmax = min(int(step_lmax), int(raster_lmax))
+                    img_flat, HH, WW = _rasterize_block_common_global(
+                        centers,
+                        levels,
+                        vals,
+                        H,
+                        W,
+                        bbox,
+                        step_lmax,
+                        refine_ratio=int(refine_ratio),
+                    )
+
+                img_flat = _fill_internal_nans_nearest(img_flat, HH, WW)
+                img = img_flat.view(HH, WW, F).detach().cpu().numpy().astype(np.float32, copy=False)
+
+                fig, axs = plt.subplots(
+                    nrows,
+                    ncols,
+                    figsize=(fig_w, fig_h),
+                    dpi=int(dpi),
+                    squeeze=False,
+                    constrained_layout=True,
+                )
+                fig.suptitle(f"GT(t+1) all variables | t={t_abs}", fontsize=12)
+                xmin, xmax, ymin, ymax = bbox
+
+                for f in range(F):
+                    ax = axs[f // ncols, f % ncols]
+                    chan = img[:, :, f]
+                    if top_min_f is not None:
+                        vmin = float(top_min_f[f].item())
+                        vmax = float(top_max_f[f].item())
+                    else:
+                        vmin = float(np.nanmin(chan))
+                        vmax = float(np.nanmax(chan))
+                        if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or (vmin == vmax):
+                            vmin, vmax = 0.0, 1.0
+                    im = ax.imshow(
+                        chan,
+                        origin="lower",
+                        extent=(xmin, xmax, ymin, ymax),
+                        cmap="viridis",
+                        vmin=vmin,
+                        vmax=vmax,
+                        aspect="equal",
+                    )
+                    ax.set_title(str(feature_names[f]))
+                    ax.set_xlabel("x")
+                    ax.set_ylabel("y")
+                    fig.colorbar(im, ax=ax, shrink=0.74)
+
+                for f in range(F, nrows * ncols):
+                    axs[f // ncols, f % ncols].axis("off")
+
+                _append_fig_frame(writer, fig)
+                plt.close(fig)
+
+                if (step + 1) % max(1, int(progress_every)) == 0:
+                    log(f"[GT-GIF] wrote frame {step+1}/{len(examples)} (t={t_abs})")
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+    log(f"[INFO] wrote {out_path}")
+    return out_path
+
+
 @torch.inference_mode()
 def make_rollout_gifs_raster(
     examples,
@@ -2701,7 +3070,7 @@ def make_rollout_gifs_raster(
             safe = str(feature_names[f]).replace(" ", "_")
             path = os.path.join(out_dir, f"rollout_{safe}.gif")
             gif_paths.append(path)
-            writers.append(imageio.get_writer(path, mode="I", duration=duration))
+            writers.append(_open_gif_writer(path, duration=duration))
 
         # ----------------- PASS 2: render frames -----------------
         prev_n = None
@@ -3178,7 +3547,7 @@ def make_rollout_gifs_truth(
         safe = str(feature_names[f]).replace(" ", "_")
         path = os.path.join(out_dir, f"rollout_{safe}.gif")
         gif_paths.append(path)
-        writers.append(imageio.get_writer(path, mode="I", duration=duration))
+        writers.append(_open_gif_writer(path, duration=duration))
 
     zoom_writers = {}
     zoom_paths = {}
@@ -3188,7 +3557,7 @@ def make_rollout_gifs_truth(
             safe = str(feature_names[f]).replace(" ", "_")
             zpath = os.path.join(out_dir, f"rollout_{safe}_zoom.gif")
             zoom_paths[int(f)] = zpath
-            zoom_writers[int(f)] = imageio.get_writer(zpath, mode="I", duration=duration)
+            zoom_writers[int(f)] = _open_gif_writer(zpath, duration=duration)
             zoom_center_by_feat[int(f)] = None
 
     last_tree_t = None
@@ -3891,6 +4260,20 @@ def main():
     ap.add_argument("--progress-every", type=int, default=1,
                     help="Print progress every N rollout steps.")
     ap.add_argument(
+        "--save-gt-only-gif",
+        action="store_true",
+        help=(
+            "Also write a single GIF containing all ground-truth target variables "
+            "for GT(t+1), with no prediction panels."
+        ),
+    )
+    ap.add_argument(
+        "--gt-only-gif-name",
+        type=str,
+        default="rollout_ground_truth_all.gif",
+        help="Filename for --save-gt-only-gif output inside --out-dir.",
+    )
+    ap.add_argument(
         "--include-deltas",
         action="store_true",
         help="If set, include delta panels in rollout plots (slower). Default: off (Pred(t+1) vs GT(t+1) only).",
@@ -4245,11 +4628,11 @@ def main():
             dy = (ymax - ymin) / H
         cxy, _pxy = _extract_xy_from_snapshot(data_list[0])
         if torch.is_tensor(cxy) and cxy.ndim == 2 and cxy.size(1) >= 2 and cxy.numel() > 0:
-            cxy_cpu = cxy.detach().to(device="cpu", dtype=torch.float64)
-            xb0 = float(cxy_cpu[:, 0].min().item())
-            xb1 = float(cxy_cpu[:, 0].max().item())
-            yb0 = float(cxy_cpu[:, 1].min().item())
-            yb1 = float(cxy_cpu[:, 1].max().item())
+            xb0, xb1, yb0, yb1, dx_center, dy_center = _cell_edge_bbox_from_centers(
+                cxy,
+                H=int(H),
+                W=int(W),
+            )
             old_bbox_raw = cfg.get("data", {}).get("bbox", None)
             if isinstance(old_bbox_raw, (list, tuple)) and len(old_bbox_raw) == 4:
                 old_bbox = tuple(float(v) for v in old_bbox_raw)
@@ -4258,13 +4641,18 @@ def main():
             new_bbox = (xb0, xb1, yb0, yb1)
             if any(abs(a - b) > 1e-10 for a, b in zip(old_bbox, new_bbox)):
                 log(
-                    "[INFO] Overriding cfg data.bbox from file coordinates: "
+                    "[INFO] Overriding cfg data.bbox from file center coordinates "
+                    "expanded to cell edges: "
                     f"{old_bbox} -> {new_bbox}"
                 )
             cfg.setdefault("data", {})["bbox"] = [xb0, xb1, yb0, yb1]
             xmin, xmax, ymin, ymax = xb0, xb1, yb0, yb1
             dx = (xmax - xmin) / W
             dy = (ymax - ymin) / H
+            log(
+                "[INFO] HDF5 center spacing "
+                f"({dx_center:.6g},{dy_center:.6g}); effective dx/dy=({dx:.6g},{dy:.6g})"
+            )
     T = len(data_list)
     log(f"[INFO] Series length T={T}")
 
@@ -4593,6 +4981,28 @@ def main():
                 include_deltas=bool(args.include_deltas),
                 two_panel_fig_w=float(args.two_panel_fig_w),
                 two_panel_fig_h=float(args.two_panel_fig_h),
+            )
+
+    if bool(args.save_gt_only_gif):
+        log("[INFO] Making GT-only all-variable GIF...")
+        with Timer("make_ground_truth_all_variables_gif"):
+            make_ground_truth_all_variables_gif(
+                examples=examples,
+                cfg=cfg,
+                out_dir=out_dir,
+                feature_names=feat_names,
+                unify_clims=bool(args.unify_clims),
+                fps=int(args.fps),
+                dpi=int(args.dpi),
+                raw_series=data_list,
+                truth_mode=bool(args.truth_mode),
+                raster_mode=str(args.raster_mode),
+                raster_bins=int(args.raster_bins),
+                raster_k=int(args.viz_raster_k),
+                raster_chunk=int(args.viz_raster_chunk),
+                raster_lmax=(int(args.raster_lmax) if args.raster_lmax is not None else None),
+                progress_every=int(args.progress_every),
+                output_name=str(args.gt_only_gif_name),
             )
 
     log(f"[INFO] Done. GIFs are in: {out_dir}")

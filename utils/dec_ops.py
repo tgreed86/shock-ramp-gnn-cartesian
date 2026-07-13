@@ -1065,6 +1065,196 @@ def parc_select_feature_indices(cfg: dict, Fdim: int) -> list[int]:
 
     return _channels_to_indices(cfg, Fdim, names, default=default)
 
+def _operator_time_scale(
+    *,
+    cfg: dict,
+    dt_phys: torch.Tensor,
+    dt_ref: torch.Tensor | None,
+    predict_type: str,
+) -> torch.Tensor | float | None:
+    """
+    Time factor used when converting absolute operator rates to model inputs.
+
+    Default "model" preserves the legacy behavior:
+      rate model -> dt_ref * r / sigma, delta model -> dt_phys * r / sigma.
+
+    For operator features it is often useful to decouple this from the model
+    target and use a scale-only input such as r / sigma. Set
+    loss.parc_input_time_scale="unit" for that behavior.
+    """
+    loss = cfg.get("loss", {}) or {}
+    mode = str(loss.get("parc_input_time_scale", "model")).strip().lower()
+    aliases = {
+        "legacy": "model",
+        "target": "model",
+        "model_units": "model",
+        "dt_ref": "dt_ref",
+        "ref": "dt_ref",
+        "reference": "dt_ref",
+        "dt": "dt_phys",
+        "dt_phys": "dt_phys",
+        "physical_dt": "dt_phys",
+        "unit": "unit",
+        "none": "unit",
+        "no_dt": "unit",
+        "rate": "unit",
+    }
+    mode = aliases.get(mode, mode)
+
+    if mode == "model":
+        if str(predict_type).strip().lower() == "delta":
+            return dt_phys
+        if str(predict_type).strip().lower() == "rate":
+            return dt_ref
+        return None
+    if mode == "dt_ref":
+        return dt_ref
+    if mode == "dt_phys":
+        return dt_phys
+    if mode == "unit":
+        return 1.0
+    try:
+        return float(mode)
+    except Exception as exc:
+        raise ValueError(
+            "loss.parc_input_time_scale must be one of "
+            "{model, dt_ref, dt_phys, unit} or a numeric scalar; "
+            f"got {loss.get('parc_input_time_scale')!r}."
+        ) from exc
+
+
+def operator_rate_to_input_units(
+    r_abs: torch.Tensor,
+    *,
+    dt_phys: torch.Tensor,
+    dt_ref: torch.Tensor | None,
+    sigma: torch.Tensor | None,
+    predict_type: str,
+    cfg: dict,
+) -> torch.Tensor:
+    """Convert an absolute operator rate to PARC input units."""
+    if sigma is None:
+        sigma_use = 1.0
+    else:
+        sigma_use = sigma.view(1, -1).clamp_min(1e-12)
+
+    time_scale = _operator_time_scale(
+        cfg=cfg,
+        dt_phys=dt_phys,
+        dt_ref=dt_ref,
+        predict_type=predict_type,
+    )
+    if time_scale is None:
+        return torch.zeros_like(r_abs)
+    if torch.is_tensor(time_scale):
+        time_scale = time_scale.to(device=r_abs.device, dtype=r_abs.dtype)
+    return (r_abs * time_scale) / sigma_use
+
+
+def _feature_name_by_index(cfg: dict, Fdim: int) -> dict[int, str]:
+    names = _get_feature_name_list(cfg)
+    if not names:
+        names = [str(i) for i in range(Fdim)]
+    out: dict[int, str] = {}
+    for i in range(Fdim):
+        out[i] = str(names[i]) if i < len(names) else str(i)
+    return out
+
+
+def _scale_tensor_from_cfg_value(
+    raw,
+    *,
+    cfg: dict,
+    Fdim: int,
+    selected_indices: list[int],
+    device,
+    dtype,
+    key: str,
+) -> torch.Tensor:
+    n = len(selected_indices)
+    if n == 0:
+        return torch.empty((0,), device=device, dtype=dtype)
+    if raw is None:
+        return torch.ones((n,), device=device, dtype=dtype)
+    if isinstance(raw, (int, float)):
+        return torch.full((n,), float(raw), device=device, dtype=dtype)
+    if isinstance(raw, (list, tuple)):
+        if len(raw) == n:
+            vals = [float(v) for v in raw]
+        elif len(raw) == Fdim:
+            vals = [float(raw[int(i)]) for i in selected_indices]
+        elif len(raw) == 1:
+            vals = [float(raw[0])] * n
+        else:
+            raise ValueError(
+                f"loss.{key} must have length 1, selected-channel length {n}, "
+                f"or full feature length {Fdim}; got length {len(raw)}."
+            )
+        return torch.tensor(vals, device=device, dtype=dtype)
+    if isinstance(raw, dict):
+        names = _feature_name_by_index(cfg, Fdim)
+        lower_to_idx = {v.lower(): i for i, v in names.items()}
+        vals = []
+        for idx in selected_indices:
+            idx_i = int(idx)
+            name = names.get(idx_i, str(idx_i))
+            candidates = (str(idx_i), name, name.lower())
+            found = None
+            for cand in candidates:
+                if cand in raw:
+                    found = raw[cand]
+                    break
+            if found is None and name.lower() in lower_to_idx and name.lower() in raw:
+                found = raw[name.lower()]
+            vals.append(1.0 if found is None else float(found))
+        return torch.tensor(vals, device=device, dtype=dtype)
+    raise ValueError(
+        f"loss.{key} must be a scalar, list, or dict; got {type(raw).__name__}."
+    )
+
+
+def _parc_input_scale(
+    cfg: dict,
+    *,
+    kind: str,
+    Fdim: int,
+    selected_indices: list[int],
+    device,
+    dtype,
+) -> torch.Tensor:
+    loss = cfg.get("loss", {}) or {}
+    global_scale = _scale_tensor_from_cfg_value(
+        loss.get("parc_input_scale", None),
+        cfg=cfg,
+        Fdim=Fdim,
+        selected_indices=selected_indices,
+        device=device,
+        dtype=dtype,
+        key="parc_input_scale",
+    )
+    explicit_key = f"parc_input_scale_{kind}"
+    auto_key = f"parc_input_auto_scale_{kind}"
+    explicit = _scale_tensor_from_cfg_value(
+        loss.get(explicit_key, None),
+        cfg=cfg,
+        Fdim=Fdim,
+        selected_indices=selected_indices,
+        device=device,
+        dtype=dtype,
+        key=explicit_key,
+    )
+    auto = _scale_tensor_from_cfg_value(
+        loss.get(auto_key, None),
+        cfg=cfg,
+        Fdim=Fdim,
+        selected_indices=selected_indices,
+        device=device,
+        dtype=dtype,
+        key=auto_key,
+    )
+    return global_scale * explicit * auto
+
+
 def parc_terms_to_node_inputs(
     r_adv_abs: torch.Tensor | None,     # [N,F] absolute or None
     r_diff_abs: torch.Tensor | None,    # [N,F] absolute or None
@@ -1076,12 +1266,15 @@ def parc_terms_to_node_inputs(
     cfg: dict,
     dtype,
     detach: bool = True,
+    apply_input_scales: bool = True,
 ):
     """
     Builds the operator-derived node feature block to concatenate onto _build_X(...).
 
     Config keys (under cfg["loss"]):
       parc_input_form: "rate" (default) or "delta"
+      parc_input_time_scale: "model" (legacy), "unit", "dt_ref", or "dt_phys"
+      parc_input_scale / parc_input_scale_adv / parc_input_scale_diff
       parc_include_adv: bool (default True)
       parc_include_diff: bool (default True)
       parc_input_weighted: bool (default False)
@@ -1137,19 +1330,49 @@ def parc_terms_to_node_inputs(
             diff_u = (dt * diff_abs) / sigma_use
     else:
         if adv_abs is not None:
-            adv_u = physics_to_model_units(
-                adv_abs, dt_phys=dt_phys, dt_ref=dt_ref, sigma=sigma, predict_type=predict_type
+            adv_u = operator_rate_to_input_units(
+                adv_abs,
+                dt_phys=dt_phys,
+                dt_ref=dt_ref,
+                sigma=sigma,
+                predict_type=predict_type,
+                cfg=cfg,
             )
         if diff_abs is not None:
-            diff_u = physics_to_model_units(
-                diff_abs, dt_phys=dt_phys, dt_ref=dt_ref, sigma=sigma, predict_type=predict_type
+            diff_u = operator_rate_to_input_units(
+                diff_abs,
+                dt_phys=dt_phys,
+                dt_ref=dt_ref,
+                sigma=sigma,
+                predict_type=predict_type,
+                cfg=cfg,
             )
 
     blocks = []
     if include_adv and (adv_u is not None):
-        blocks.append(adv_u[:, sel_adv])
+        block = adv_u[:, sel_adv]
+        if apply_input_scales:
+            block = block * _parc_input_scale(
+                cfg,
+                kind="adv",
+                Fdim=Fdim,
+                selected_indices=sel_adv,
+                device=block.device,
+                dtype=block.dtype,
+            ).view(1, -1)
+        blocks.append(block)
     if include_diff and (diff_u is not None):
-        blocks.append(diff_u[:, sel_diff])
+        block = diff_u[:, sel_diff]
+        if apply_input_scales:
+            block = block * _parc_input_scale(
+                cfg,
+                kind="diff",
+                Fdim=Fdim,
+                selected_indices=sel_diff,
+                device=block.device,
+                dtype=block.dtype,
+            ).view(1, -1)
+        blocks.append(block)
 
     if len(blocks) == 0:
         out = base.new_zeros((base.size(0), 0), dtype=dtype)

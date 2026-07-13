@@ -2118,6 +2118,54 @@ def _extract_xy_from_snapshot_like(snapshot: Any) -> torch.Tensor | None:
     return None
 
 
+def _cell_edge_bbox_from_centers(
+    centers_xy: torch.Tensor,
+    *,
+    H: int,
+    W: int,
+) -> tuple[float, float, float, float, float, float]:
+    """
+    HDF5 uniform snapshots store cell centers. Convert center min/max to the
+    physical cell-edge bbox so dx/dy and parent indexing use the true domain.
+
+    Returns (xmin_edge, xmax_edge, ymin_edge, ymax_edge, dx_center, dy_center).
+    """
+    if (not torch.is_tensor(centers_xy)) or centers_xy.ndim != 2 or centers_xy.size(1) < 2:
+        raise RuntimeError(
+            "Expected centers tensor with shape (N,2+) when deriving cell-edge bbox."
+        )
+    pts = centers_xy[:, :2].detach().to(device="cpu", dtype=torch.float64)
+    x = pts[:, 0]
+    y = pts[:, 1]
+    xb0 = float(x.min().item())
+    xb1 = float(x.max().item())
+    yb0 = float(y.min().item())
+    yb1 = float(y.max().item())
+
+    def _spacing(vals: torch.Tensor, n_expected: int, span: float) -> float:
+        uniq = torch.unique(vals)
+        uniq, _ = torch.sort(uniq)
+        if uniq.numel() > 1:
+            diffs = torch.diff(uniq)
+            diffs = diffs[diffs > 1e-12]
+            if diffs.numel() > 0:
+                return float(torch.median(diffs).item())
+        if n_expected > 1:
+            return float(span / float(n_expected - 1))
+        return 0.0
+
+    dx_c = _spacing(x, int(W), xb1 - xb0)
+    dy_c = _spacing(y, int(H), yb1 - yb0)
+    return (
+        xb0 - 0.5 * dx_c,
+        xb1 + 0.5 * dx_c,
+        yb0 - 0.5 * dy_c,
+        yb1 + 0.5 * dy_c,
+        dx_c,
+        dy_c,
+    )
+
+
 def _fit_ramp_line_from_centers(
     centers_xy: torch.Tensor,
     *,
@@ -6927,6 +6975,252 @@ def sanitize_state_for_ops(x_abs: torch.Tensor, cfg: dict, rho_floor=1e-6, E_flo
     cols[idx["rho"]] = rho
     cols[idx["E"]] = E
     return torch.stack(cols, dim=1)
+
+
+def _append_abs_samples(
+    buckets: list[list[torch.Tensor]],
+    block: torch.Tensor,
+    *,
+    max_samples_per_channel: int,
+) -> None:
+    if block is None or block.numel() == 0:
+        return
+    block_cpu = block.detach().abs().to(device="cpu", dtype=torch.float32)
+    n_ch = int(block_cpu.size(1))
+    if len(buckets) != n_ch:
+        raise RuntimeError(f"Internal channel bucket mismatch: {len(buckets)} vs {n_ch}")
+
+    for j in range(n_ch):
+        vals = block_cpu[:, j].reshape(-1)
+        if vals.numel() == 0:
+            continue
+        if max_samples_per_channel > 0:
+            cur = sum(int(x.numel()) for x in buckets[j])
+            remaining = int(max_samples_per_channel) - cur
+            if remaining <= 0:
+                continue
+            if vals.numel() > remaining:
+                idx = torch.linspace(
+                    0,
+                    vals.numel() - 1,
+                    steps=remaining,
+                    dtype=torch.long,
+                )
+                vals = vals.index_select(0, idx)
+        buckets[j].append(vals)
+
+
+@torch.no_grad()
+def _maybe_calibrate_parc_input_scales(
+    *,
+    loader,
+    cfg: dict,
+    device: torch.device,
+    dx: float,
+    dy: float,
+    sigma: torch.Tensor | None,
+    predict_type: str,
+) -> None:
+    loss = cfg.get("loss", {}) or {}
+    mode = str(loss.get("parc_input_scale_mode", "none")).strip().lower()
+    if mode in ("", "none", "off", "false", "disabled"):
+        return
+    if mode not in ("robust", "scale_only_robust", "quantile"):
+        raise ValueError(
+            "loss.parc_input_scale_mode must be one of {none, robust}; "
+            f"got {loss.get('parc_input_scale_mode')!r}."
+        )
+    if not _physics_inputs_active_from_loss_cfg(loss):
+        print("[PARC-SCALE] skipped: physics_inputs_enabled=false.", flush=True)
+        return
+
+    Fdim = int(cfg.get("features", {}).get("num_features", 0) or 0)
+    if Fdim <= 0:
+        names = cfg.get("features", {}).get("names", [])
+        Fdim = len(names) if isinstance(names, (list, tuple)) else 0
+    if Fdim <= 0:
+        raise RuntimeError("Could not infer feature count for PARC input scale calibration.")
+
+    include_adv = bool(loss.get("parc_include_adv", True))
+    include_diff = bool(loss.get("parc_include_diff", True))
+    adv_w = float(loss.get("adv_weight", 1.0))
+    diff_w = float(loss.get("diff_weight", 1.0))
+    need_adv = include_adv and (adv_w != 0.0)
+    need_diff = include_diff and (diff_w != 0.0)
+    if not need_adv and not need_diff:
+        print(
+            "[PARC-SCALE] skipped: neither advection nor diffusion operators are active.",
+            flush=True,
+        )
+        return
+
+    recompute = _cfg_bool_strict(
+        loss.get("parc_input_scale_recompute", False),
+        key="loss.parc_input_scale_recompute",
+    )
+    if (not recompute) and (
+        ("parc_input_auto_scale_adv" in loss) or ("parc_input_auto_scale_diff" in loss)
+    ):
+        print("[PARC-SCALE] using existing auto scale values from config.", flush=True)
+        return
+
+    sel_adv = dec.parc_select_feature_indices_adv(cfg, Fdim)
+    sel_diff = dec.parc_select_feature_indices_diff(cfg, Fdim)
+    la = len(sel_adv) if include_adv else 0
+    ld = len(sel_diff) if include_diff else 0
+    adv_samples: list[list[torch.Tensor]] = [[] for _ in range(la)]
+    diff_samples: list[list[torch.Tensor]] = [[] for _ in range(ld)]
+
+    q = float(loss.get("parc_input_scale_quantile", loss.get("parc_input_scale_q", 0.99)))
+    q = min(max(q, 0.5), 0.9999)
+    target = float(
+        loss.get(
+            "parc_input_scale_target",
+            loss.get("parc_input_scale_target_value", 4.0),
+        )
+    )
+    eps = float(loss.get("parc_input_scale_eps", 1e-12))
+    s_min = float(loss.get("parc_input_scale_min", 0.0))
+    s_max = float(loss.get("parc_input_scale_max", 0.0))
+    max_batches = int(loss.get("parc_input_scale_max_batches", 0))
+    max_samples = int(loss.get("parc_input_scale_max_samples_per_channel", 200000))
+
+    backend = str(loss.get("physics_backend", "dec")).strip().lower()
+    if backend != "dec":
+        print(
+            f"[PARC-SCALE] skipped: robust calibration currently supports DEC backend, got {backend!r}.",
+            flush=True,
+        )
+        return
+
+    sigma_f32 = _as_stat_tensor(sigma, device=device, dtype=torch.float32)
+    if sigma_f32 is not None:
+        sigma_f32 = sigma_f32.clamp_min(1e-12)
+
+    n_batches = 0
+    n_steps = 0
+    print(
+        "[PARC-SCALE] calibrating scale-only operator inputs "
+        f"(q={q:.4g}, target={target:.4g}, max_batches={max_batches or 'all'})",
+        flush=True,
+    )
+    for batch in loader:
+        n_batches += 1
+        if max_batches > 0 and n_batches > max_batches:
+            break
+
+        dt_list = batch.get("dt_list", None)
+        if dt_list is None:
+            raise RuntimeError("PARC scale calibration requires batch['dt_list'].")
+        pred_levels_list = _require_list(batch, "pred_levels_list")
+        pred_ei_list = _require_list(batch, "pred_ei_list")
+        pred_ea_list = batch.get("pred_ea_list", None) or batch.get("pred_edge_attr_list", None)
+        if pred_ea_list is None:
+            raise RuntimeError("PARC scale calibration requires pred_edge_attr_list.")
+        feat_t_on_pred_list = _require_list(batch, "feat_t_on_pred_list")
+        K = len(feat_t_on_pred_list)
+        dt_ref_scalar = batch.get("dt_ref", None)
+        dt_ref_t = (
+            torch.tensor(float(dt_ref_scalar), device=device, dtype=torch.float32)
+            if dt_ref_scalar is not None
+            else None
+        )
+
+        for j in range(1, K):
+            dt_phys = torch.tensor(float(dt_list[j - 1]), device=device, dtype=torch.float32)
+            x_abs = feat_t_on_pred_list[j].to(device=device, dtype=torch.float32)
+            x_for_ops = sanitize_state_for_ops(x_abs, cfg, rho_floor=1e-6, E_floor=1e-6)
+            pred_levels = pred_levels_list[j].to(device=device, dtype=torch.long)
+            pei = pred_ei_list[j].to(device=device, dtype=torch.long)
+            pea = pred_ea_list[j].to(device=device, dtype=torch.float32)
+
+            r_adv_abs, r_diff_abs, _area = dec.dec_advdiff_terms_abs(
+                x_abs=x_for_ops.float(),
+                edge_index=pei,
+                pred_ea=pea,
+                levels=pred_levels,
+                dx0=float(dx),
+                dy0=float(dy),
+                cfg=cfg,
+                compute_adv=need_adv,
+                compute_diff=need_diff,
+            )
+            r_adv_abs = _sanitize_ops_term(r_adv_abs, cfg)
+            r_diff_abs = _sanitize_ops_term(r_diff_abs, cfg)
+            ref = r_adv_abs if r_adv_abs is not None else r_diff_abs
+            if ref is None:
+                continue
+            r_adv_in = r_adv_abs if r_adv_abs is not None else torch.zeros_like(ref)
+            r_diff_in = r_diff_abs if r_diff_abs is not None else torch.zeros_like(ref)
+
+            parc_raw = dec.parc_terms_to_node_inputs(
+                r_adv_in,
+                r_diff_in,
+                dt_phys=dt_phys,
+                dt_ref=dt_ref_t,
+                sigma=sigma_f32,
+                predict_type=predict_type,
+                cfg=cfg,
+                dtype=torch.float32,
+                detach=True,
+                apply_input_scales=False,
+            )
+            off = 0
+            if la > 0:
+                adv_block = parc_raw[:, off : off + la]
+                _append_abs_samples(
+                    adv_samples,
+                    adv_block,
+                    max_samples_per_channel=max_samples,
+                )
+                off += la
+            if ld > 0:
+                diff_block = parc_raw[:, off : off + ld]
+                _append_abs_samples(
+                    diff_samples,
+                    diff_block,
+                    max_samples_per_channel=max_samples,
+                )
+            n_steps += 1
+
+    def _finalize(samples: list[list[torch.Tensor]], label: str) -> list[float]:
+        scales = []
+        qvals = []
+        for parts in samples:
+            if len(parts) == 0:
+                qval = 0.0
+                scale = 1.0
+            else:
+                vals = torch.cat(parts, dim=0)
+                qval = float(torch.quantile(vals, q).item())
+                scale = float(target / max(qval, eps))
+                if s_min > 0.0:
+                    scale = max(scale, s_min)
+                if s_max > 0.0:
+                    scale = min(scale, s_max)
+            qvals.append(qval)
+            scales.append(scale)
+        if len(scales) > 0:
+            print(
+                f"[PARC-SCALE] {label} q_abs={qvals} scale={scales}",
+                flush=True,
+            )
+        return scales
+
+    if la > 0:
+        loss["parc_input_auto_scale_adv"] = _finalize(adv_samples, "adv")
+    if ld > 0:
+        loss["parc_input_auto_scale_diff"] = _finalize(diff_samples, "diff")
+    loss["parc_input_scale_mode"] = mode
+    loss["parc_input_scale_quantile"] = q
+    loss["parc_input_scale_target"] = target
+    cfg["loss"] = loss
+    print(
+        f"[PARC-SCALE] calibrated from batches={min(n_batches, max_batches or n_batches)} "
+        f"steps={n_steps}.",
+        flush=True,
+    )
+
 
 def _enforce_physical_state(
     x_abs: torch.Tensor,
@@ -12020,6 +12314,8 @@ def main(
     loss.setdefault("physics_inputs_enabled", True)
     loss.setdefault("physics_backend", "dec")
     loss.setdefault("parc_input_form", "rate")     # "rate" (dt_ref*r/sigma) or "delta" (dt*r/sigma)
+    loss.setdefault("parc_input_time_scale", "model")  # "model" preserves legacy dt_ref/dt scaling; "unit" uses r/sigma
+    loss.setdefault("parc_input_scale_mode", "none")   # "robust" calibrates scale-only PARC factors on the train loader
     loss.setdefault("parc_include_adv", True)
     loss.setdefault("parc_include_diff", True)
     loss.setdefault("parc_input_weighted", False)  # usually False
@@ -12100,6 +12396,10 @@ def main(
         int(bool(loss.get("parc_include_adv", True))),
         "include_diff=",
         int(bool(loss.get("parc_include_diff", True))),
+        "time_scale=",
+        loss.get("parc_input_time_scale"),
+        "scale_mode=",
+        loss.get("parc_input_scale_mode"),
     )
 
     # Speed defaults (non‑breaking):
@@ -12257,16 +12557,19 @@ def main(
         # Auto-sync bbox from xy/pos payload.
         pos0 = first_snap.get("pos", None)
         if torch.is_tensor(pos0) and pos0.ndim == 2 and pos0.size(1) >= 2 and pos0.numel() > 0:
-            pos0_cpu = pos0.detach().to(device="cpu", dtype=torch.float64)
-            xb0 = float(pos0_cpu[:, 0].min().item())
-            xb1 = float(pos0_cpu[:, 0].max().item())
-            yb0 = float(pos0_cpu[:, 1].min().item())
-            yb1 = float(pos0_cpu[:, 1].max().item())
-            cfg.setdefault("data", {})["bbox"] = [xb0, xb1, yb0, yb1]
-            xmin, xmax, ymin, ymax = xb0, xb1, yb0, yb1
+            xmin, xmax, ymin, ymax, dx_center, dy_center = _cell_edge_bbox_from_centers(
+                pos0,
+                H=int(H),
+                W=int(W),
+            )
+            cfg.setdefault("data", {})["bbox"] = [xmin, xmax, ymin, ymax]
             dx = (xmax - xmin) / float(W)
             dy = (ymax - ymin) / float(H)
-            print(f"[DATA] HDF5 bbox -> data.bbox=[{xb0:.6g}, {xb1:.6g}, {yb0:.6g}, {yb1:.6g}]")
+            print(
+                "[DATA] HDF5 center coordinates -> cell-edge "
+                f"data.bbox=[{xmin:.6g}, {xmax:.6g}, {ymin:.6g}, {ymax:.6g}] "
+                f"(center_spacing=({dx_center:.6g},{dy_center:.6g}), dx/dy=({dx:.6g},{dy:.6g}))"
+            )
 
     if len(source_records) > 1:
         print(f"[DATA] Loaded {len(source_records)} input simulation files (total snapshots={len(data_list)}).")
@@ -13113,6 +13416,16 @@ def main(
     if cfg.get("debug", {}).get("abs_means_abs_check_val", False):
         batchv = next(iter(val_loader))
         abs_means_abs_check(cfg=cfg, batch=batchv, mu=mu, sigma=sigma, device=device, tag="ABS-MEANS-ABS/VAL")
+
+    _maybe_calibrate_parc_input_scales(
+        loader=train_loader,
+        cfg=cfg,
+        device=device,
+        dx=float(dx),
+        dy=float(dy),
+        sigma=sigma,
+        predict_type=predict_type,
+    )
     
     # ---- DEBUG: normalization stats sanity (prints once) ----
     print("\n[NORM-STATS] computed from train_loader")
