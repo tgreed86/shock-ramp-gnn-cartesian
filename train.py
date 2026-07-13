@@ -12312,6 +12312,10 @@ def main(
     loss.setdefault("nu", 0.0)
     loss.setdefault("advection_scheme", "upwind")
     loss.setdefault("advection_type", "scalar")
+    loss.setdefault(
+        "euler_flux_pressure_source",
+        "channel" if rep == "primitive_uvrhope" and idx.get("p", None) is not None else "eos",
+    )
     loss.setdefault("rho_eps", 1e-8)
 
     # Physics-input controls (authoritative):
@@ -12387,6 +12391,7 @@ def main(
     print("[PHYSICS-CFG] backend=", loss.get("physics_backend"),
       "inputs_enabled=", int(_physics_inputs_active_from_loss_cfg(loss)),
       "advection_type=", loss.get("advection_type"),
+      "euler_p=", loss.get("euler_flux_pressure_source"),
       "mode=", loss.get("mode"),
       "adv_w=", loss.get("adv_weight"),
       "diff_w=", loss.get("diff_weight"),

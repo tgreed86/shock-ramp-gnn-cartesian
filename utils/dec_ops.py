@@ -261,6 +261,36 @@ def _normalize_limiter_name(name: str) -> str:
         return "vanleer" if n in ("van_leer", "van-leer") else n
     raise RuntimeError(f"Unsupported muscl_limiter='{name}'. Use one of: minmod, mc, vanleer.")
 
+def _normalize_euler_flux_pressure_source(
+    raw,
+    *,
+    state_rep: str,
+    has_pressure_channel: bool,
+) -> str:
+    """
+    Choose the pressure used inside the Euler numerical flux.
+
+    Default behavior prefers the primitive pressure channel when the state has one,
+    and falls back to EOS pressure for conservative states.
+    """
+    if raw is None or str(raw).strip().lower() in ("", "auto", "default"):
+        return "channel" if state_rep == "primitive_uvrhope" and has_pressure_channel else "eos"
+
+    n = str(raw).strip().lower().replace("-", "_")
+    if n in ("channel", "data", "state", "stored", "p", "pressure", "primitive"):
+        if not has_pressure_channel:
+            raise RuntimeError(
+                "loss.euler_flux_pressure_source='channel' requires a primitive pressure "
+                "channel in features.names."
+            )
+        return "channel"
+    if n in ("eos", "ideal_gas", "idealgas", "derived", "energy", "thermo"):
+        return "eos"
+    raise RuntimeError(
+        "loss.euler_flux_pressure_source must be one of {channel, eos, auto}; "
+        f"got {raw!r}."
+    )
+
 def _minmod(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     same_sign = (a * b) > 0
     return torch.where(same_sign, torch.sign(a) * torch.minimum(a.abs(), b.abs()), torch.zeros_like(a))
@@ -396,7 +426,7 @@ def dec_divergence_euler_flux(
     eps: float = 1e-8,
 ):
     """
-    Returns div(F) in conservative ordering [rho, mx, my, E] as [N,4],
+    Returns div(F) in conservative ordering [rho, mx, my, E_total] as [N,4],
     where F is the Euler flux dotted with the edge normal.
     Uses a Rusanov (local LF) numerical flux by default.
 
@@ -412,12 +442,22 @@ def dec_divergence_euler_flux(
     dst = edge_index[1].long()
     rec_kind = _normalize_reconstruction_kind(reconstruction)
 
+    state_rep = state_representation_from_cfg(cfg, Fdim)
+    idx = infer_feature_indices(cfg, Fdim)
+    has_pressure_channel = (state_rep == "primitive_uvrhope") and (idx.get("p", None) is not None)
+    pressure_source = _normalize_euler_flux_pressure_source(
+        loss.get("euler_flux_pressure_source", None),
+        state_rep=state_rep,
+        has_pressure_channel=has_pressure_channel,
+    )
+
     state = _state_views(x_abs, cfg, eps=eps)
     rho_node = state["rho"].abs().clamp_min(eps)
     mx_node = state["mx"]
     my_node = state["my"]
     E_node = state["E_tot"]
     U_nodes = torch.stack([rho_node, mx_node, my_node, E_node], dim=1)  # [N,4]
+    p_node = state["p"] if pressure_source == "channel" else None
 
     if rec_kind == "muscl":
         if edge_dist is None:
@@ -425,9 +465,18 @@ def dec_divergence_euler_flux(
         U_L, U_R = _muscl_reconstruct_face_states(
             U_nodes, edge_index, nx, ny, edge_dist, limiter=limiter, eps=eps
         )
+        if pressure_source == "channel":
+            p_L_face, p_R_face = _muscl_reconstruct_face_states(
+                p_node.reshape(-1, 1), edge_index, nx, ny, edge_dist, limiter=limiter, eps=eps
+            )
+            p_L_chan = p_L_face[:, 0]
+            p_R_chan = p_R_face[:, 0]
     else:
         U_L = U_nodes[src]
         U_R = U_nodes[dst]
+        if pressure_source == "channel":
+            p_L_chan = p_node[src]
+            p_R_chan = p_node[dst]
 
     rho_L = U_L[:, 0].clamp_min(eps)
     mx_L  = U_L[:, 1]
@@ -450,8 +499,12 @@ def dec_divergence_euler_flux(
         v_R = u_clip * torch.tanh(v_R / u_clip)
 
     p_floor = float(loss.get("p_floor", 0.0))
-    p_L = ((gamma - 1.0) * (E_L - 0.5 * (mx_L * mx_L + my_L * my_L) / rho_L)).clamp_min(p_floor)
-    p_R = ((gamma - 1.0) * (E_R - 0.5 * (mx_R * mx_R + my_R * my_R) / rho_R)).clamp_min(p_floor)
+    if pressure_source == "channel":
+        p_L = p_L_chan.clamp_min(p_floor)
+        p_R = p_R_chan.clamp_min(p_floor)
+    else:
+        p_L = ((gamma - 1.0) * (E_L - 0.5 * (mx_L * mx_L + my_L * my_L) / rho_L)).clamp_min(p_floor)
+        p_R = ((gamma - 1.0) * (E_R - 0.5 * (mx_R * mx_R + my_R * my_R) / rho_R)).clamp_min(p_floor)
     c_L = torch.sqrt((gamma * p_L / rho_L).clamp_min(0.0))
     c_R = torch.sqrt((gamma * p_R / rho_R).clamp_min(0.0))
 
