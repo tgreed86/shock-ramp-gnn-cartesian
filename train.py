@@ -12281,6 +12281,12 @@ def main(
         model_defaults.setdefault("ramp_boundary_source_channels", [1, 2])
         model_defaults.setdefault("boundary_width", 0.02)
 
+    model_cfg = cfg.setdefault("model", {})
+    predict_type = _normalize_predict_type_key(
+        model_cfg.get("predict_type", model_cfg.get("target_mode", "rate"))
+    )
+    model_cfg["predict_type"] = predict_type
+
     use_cols_cfg = features_cfg.get("use_columns", None)
     if isinstance(use_cols_cfg, (list, tuple)) and len(use_cols_cfg) > 0:
         f_guess = int(len(use_cols_cfg))
