@@ -12126,6 +12126,7 @@ def build_model_from_cfg(cfg, device, ramp_feature_ctx: Dict[str, Any] | None = 
             rho_index=int(idx.get("rho", 2 if Fdim >= 5 else 0)),
             p_index=idx.get("p", None),
             energy_index=int(idx.get("E", min(Fdim - 1, 4))),
+            pressure_prediction_mode=str(model_cfg.get("pressure_prediction_mode", "eos")),
             gamma=float(model_cfg.get("gamma", dec.gas_gamma_from_cfg(cfg))),
             rho_floor=float(model_cfg.get("rho_floor", loss.get("rho_eps", 1e-8))),
             e_floor=float(model_cfg.get("e_floor", loss.get("E_floor", 1e-8))),
@@ -12304,6 +12305,7 @@ def main(
         model_defaults.setdefault("open_boundary_flux_include_pressure", False)
         model_defaults.setdefault("ramp_boundary_source_channels", [1, 2])
         model_defaults.setdefault("boundary_width", 0.02)
+        model_defaults.setdefault("pressure_prediction_mode", "eos")
 
     model_cfg = cfg.setdefault("model", {})
     predict_type = _normalize_predict_type_key(

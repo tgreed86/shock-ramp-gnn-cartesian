@@ -568,7 +568,8 @@ class FluxGraphNetModel(nn.Module):
     Public I/O follows the project convention: normalized state/delta/rate in the
     configured feature order. Internally, primitive [U,V,RHO,P,Eint] states are
     mapped to conservative [rho,rho*u,rho*v,E_tot], updated by anti-symmetric
-    learned edge fluxes, then mapped back to primitive output channels.
+    learned edge fluxes, then mapped back to primitive output channels. Pressure
+    can either remain EOS-derived or be replaced/corrected by a learned node head.
     """
 
     def __init__(
@@ -593,6 +594,7 @@ class FluxGraphNetModel(nn.Module):
         rho_index: int = 2,
         p_index: int | None = 3,
         energy_index: int = 4,
+        pressure_prediction_mode: str = "eos",
         gamma: float = 1.4,
         rho_floor: float = 1e-6,
         e_floor: float = 1e-8,
@@ -675,6 +677,20 @@ class FluxGraphNetModel(nn.Module):
         self.rho_index = int(rho_index)
         self.p_index = None if p_index is None else int(p_index)
         self.energy_index = int(energy_index)
+        self.pressure_prediction_mode = self._normalize_pressure_prediction_mode(
+            pressure_prediction_mode
+        )
+        if self.pressure_prediction_mode != "eos":
+            if self.state_representation != "primitive_uvrhope":
+                raise ValueError(
+                    "FluxGraphNetModel pressure_prediction_mode requires "
+                    "state_representation='primitive_uvrhope'."
+                )
+            if self.p_index is None or not (0 <= self.p_index < self.out_channels):
+                raise ValueError(
+                    "FluxGraphNetModel pressure_prediction_mode requires a valid "
+                    "primitive pressure channel."
+                )
         self.gamma = float(gamma)
         self.rho_floor = float(rho_floor)
         self.e_floor = float(e_floor)
@@ -814,6 +830,26 @@ class FluxGraphNetModel(nn.Module):
             activation_elu_alpha=float(activation_elu_alpha),
             dropout=self.dropout,
         )
+        self.pressure_head = (
+            _make_mlp(
+                in_dim=self.hidden,
+                hidden_dim=self.hidden,
+                out_dim=1,
+                activation=activation,
+                activation_negative_slope=float(activation_negative_slope),
+                activation_elu_alpha=float(activation_elu_alpha),
+                dropout=self.dropout,
+            )
+            if self.pressure_prediction_mode != "eos"
+            else None
+        )
+        if self.pressure_head is not None and self.pressure_prediction_mode == "residual":
+            for module in reversed(self.pressure_head):
+                if isinstance(module, nn.Linear):
+                    nn.init.zeros_(module.weight)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+                    break
         self.open_boundary_head = (
             _make_mlp(
                 in_dim=self.hidden,
@@ -879,6 +915,33 @@ class FluxGraphNetModel(nn.Module):
         if key not in aliases:
             raise ValueError(
                 "open_boundary_mode must be one of {learned_source, boundary_flux, none}; "
+                f"got {mode!r}."
+            )
+        return aliases[key]
+
+    @staticmethod
+    def _normalize_pressure_prediction_mode(mode: str | None) -> str:
+        key = str("eos" if mode is None else mode).strip().lower().replace("-", "_")
+        aliases = {
+            "eos": "eos",
+            "derived": "eos",
+            "equation_of_state": "eos",
+            "ideal_gas": "eos",
+            "direct": "direct",
+            "learned": "direct",
+            "learned_pressure": "direct",
+            "node": "direct",
+            "node_head": "direct",
+            "pressure_head": "direct",
+            "residual": "residual",
+            "correction": "residual",
+            "eos_residual": "residual",
+            "residual_eos": "residual",
+            "eos_plus_residual": "residual",
+        }
+        if key not in aliases:
+            raise ValueError(
+                "pressure_prediction_mode must be one of {eos, direct, residual}; "
                 f"got {mode!r}."
             )
         return aliases[key]
@@ -1002,6 +1065,31 @@ class FluxGraphNetModel(nn.Module):
             return rate_abs
         sigma = self.norm_sigma.to(device=rate_abs.device, dtype=rate_abs.dtype).view(1, -1).clamp_min(1e-12)
         return rate_abs / sigma
+
+    def _apply_pressure_prediction(
+        self,
+        out: torch.Tensor,
+        node_latent: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.pressure_head is None or self.pressure_prediction_mode == "eos":
+            return out
+        if self.p_index is None:
+            return out
+        p_idx = int(self.p_index)
+        if p_idx < 0 or p_idx >= out.size(1):
+            return out
+
+        p_head = self.pressure_head(node_latent).view(-1).to(device=out.device, dtype=out.dtype)
+        out = out.clone()
+        if self.pressure_prediction_mode == "direct":
+            out[:, p_idx] = p_head
+        elif self.pressure_prediction_mode == "residual":
+            out[:, p_idx] = out[:, p_idx] + p_head
+        else:
+            raise RuntimeError(
+                f"Unexpected pressure_prediction_mode='{self.pressure_prediction_mode}'."
+            )
+        return out
 
     def _primitive_abs_to_conservative(self, state_abs: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if self.state_representation == "conservative":
@@ -1419,15 +1507,17 @@ class FluxGraphNetModel(nn.Module):
 
         if self.predict_type == PREDICT_TYPE_RATE:
             prim_rate_abs = self._conservative_rate_to_primitive_rate(q_update, state)
-            return self._norm_rate(prim_rate_abs)
+            prim_rate_norm = self._norm_rate(prim_rate_abs)
+            return self._apply_pressure_prediction(prim_rate_norm, node_latent)
 
         q_next_abs = q_abs + q_update
         prim_next_abs = self._conservative_abs_to_primitive(q_next_abs, state_abs)
         prim_next_norm = self._norm_state(prim_next_abs)
         if self.predict_type == PREDICT_TYPE_STATE:
-            return prim_next_norm
+            return self._apply_pressure_prediction(prim_next_norm, node_latent)
         if self.predict_type == PREDICT_TYPE_DELTA:
-            return prim_next_norm - state_norm
+            prim_delta_norm = prim_next_norm - state_norm
+            return self._apply_pressure_prediction(prim_delta_norm, node_latent)
         raise RuntimeError(f"Unexpected predict_type='{self.predict_type}'.")
 
     def predict_state(
