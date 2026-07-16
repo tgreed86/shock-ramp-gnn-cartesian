@@ -601,8 +601,14 @@ class FluxGraphNetModel(nn.Module):
         signed_edge_channels: tuple[int, ...] | list[int] | None = (0, 1),
         fallback_directed_flux: bool = False,
         use_open_boundary_source: bool = True,
+        open_boundary_mode: str = "learned_source",
+        open_boundary_modes_by_side: dict[str, str] | None = None,
         use_ramp_boundary_source: bool = True,
         open_boundary_source_channels: tuple[int, ...] | list[int] | None = (0, 1, 2, 3),
+        open_boundary_flux_sides: tuple[str, ...] | list[str] | str | None = None,
+        open_boundary_flux_scale: float = 0.05,
+        open_boundary_flux_outflow_only: bool = True,
+        open_boundary_flux_include_pressure: bool = False,
         ramp_boundary_source_channels: tuple[int, ...] | list[int] | None = (1, 2),
         boundary_distance_start_col: int | None = None,
         boundary_distance_dim: int = 4,
@@ -676,6 +682,19 @@ class FluxGraphNetModel(nn.Module):
         self.velocity_clip = float(velocity_clip)
         self.fallback_directed_flux = bool(fallback_directed_flux)
         self.use_open_boundary_source = bool(use_open_boundary_source)
+        self.open_boundary_mode = self._normalize_open_boundary_mode(open_boundary_mode)
+        learned_side_mask, flux_mode_side_mask = self._make_open_boundary_mode_side_masks(
+            self.open_boundary_mode,
+            open_boundary_modes_by_side,
+        )
+        self.open_boundary_flux_scale = float(open_boundary_flux_scale)
+        if self.open_boundary_flux_scale < 0.0:
+            raise ValueError(
+                "open_boundary_flux_scale must be >= 0 for FluxGraphNetModel, "
+                f"got {open_boundary_flux_scale}."
+            )
+        self.open_boundary_flux_outflow_only = bool(open_boundary_flux_outflow_only)
+        self.open_boundary_flux_include_pressure = bool(open_boundary_flux_include_pressure)
         self.use_ramp_boundary_source = bool(use_ramp_boundary_source)
         self.boundary_distance_start_col = (
             None if boundary_distance_start_col is None else int(boundary_distance_start_col)
@@ -707,6 +726,21 @@ class FluxGraphNetModel(nn.Module):
         self.register_buffer(
             "open_boundary_source_mask",
             self._make_conserved_mask(open_boundary_source_channels),
+            persistent=False,
+        )
+        self.register_buffer(
+            "open_boundary_learned_side_mask",
+            learned_side_mask,
+            persistent=False,
+        )
+        self.register_buffer(
+            "open_boundary_flux_mode_side_mask",
+            flux_mode_side_mask,
+            persistent=False,
+        )
+        self.register_buffer(
+            "open_boundary_flux_side_mask",
+            self._make_boundary_side_mask(open_boundary_flux_sides),
             persistent=False,
         )
         self.register_buffer(
@@ -790,7 +824,10 @@ class FluxGraphNetModel(nn.Module):
                 activation_elu_alpha=float(activation_elu_alpha),
                 dropout=self.dropout,
             )
-            if self.use_open_boundary_source
+            if (
+                self.use_open_boundary_source
+                and bool(torch.any(self.open_boundary_learned_side_mask > 0).item())
+            )
             else None
         )
         self.ramp_boundary_head = (
@@ -817,6 +854,111 @@ class FluxGraphNetModel(nn.Module):
             if ci < 0 or ci >= 4:
                 raise ValueError(f"Conserved source channel indices must be in [0,3], got {ci}.")
             mask[ci] = 1.0
+        return mask
+
+    @staticmethod
+    def _normalize_open_boundary_mode(mode: str | None) -> str:
+        key = str("learned_source" if mode is None else mode).strip().lower().replace("-", "_")
+        aliases = {
+            "learned": "learned_source",
+            "source": "learned_source",
+            "learned_source": "learned_source",
+            "learned_sources": "learned_source",
+            "boundary_source": "learned_source",
+            "mlp": "learned_source",
+            "flux": "boundary_flux",
+            "boundary_flux": "boundary_flux",
+            "outflow": "boundary_flux",
+            "outflow_flux": "boundary_flux",
+            "open_flux": "boundary_flux",
+            "none": "none",
+            "off": "none",
+            "disabled": "none",
+            "false": "none",
+        }
+        if key not in aliases:
+            raise ValueError(
+                "open_boundary_mode must be one of {learned_source, boundary_flux, none}; "
+                f"got {mode!r}."
+            )
+        return aliases[key]
+
+    @staticmethod
+    def _boundary_side_index(side: str) -> int:
+        aliases = {
+            "left": 0,
+            "l": 0,
+            "xmin": 0,
+            "x_min": 0,
+            "right": 1,
+            "r": 1,
+            "xmax": 1,
+            "x_max": 1,
+            "bottom": 2,
+            "b": 2,
+            "ymin": 2,
+            "y_min": 2,
+            "top": 3,
+            "t": 3,
+            "ymax": 3,
+            "y_max": 3,
+        }
+        key = str(side).strip().lower().replace("-", "_")
+        if key not in aliases:
+            raise ValueError(
+                "Boundary side entries must be drawn from {left, right, bottom, top}; "
+                f"got {side!r}."
+            )
+        return aliases[key]
+
+    @classmethod
+    def _make_open_boundary_mode_side_masks(
+        cls,
+        global_mode: str,
+        modes_by_side: dict[str, str] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        side_modes = [cls._normalize_open_boundary_mode(global_mode)] * 4
+        if modes_by_side is not None:
+            if not isinstance(modes_by_side, dict):
+                raise ValueError(
+                    "open_boundary_modes_by_side must be a JSON object mapping "
+                    "{left,right,bottom,top} to {learned_source,boundary_flux,none}."
+                )
+            for side, mode in modes_by_side.items():
+                mode_key = cls._normalize_open_boundary_mode(mode)
+                side_key = str(side).strip().lower().replace("-", "_")
+                if side_key in {"all", "*"}:
+                    side_modes = [mode_key] * 4
+                    continue
+                side_modes[cls._boundary_side_index(side_key)] = mode_key
+
+        learned = torch.zeros(4, dtype=torch.float32)
+        flux = torch.zeros(4, dtype=torch.float32)
+        for i, mode in enumerate(side_modes):
+            if mode == "learned_source":
+                learned[i] = 1.0
+            elif mode == "boundary_flux":
+                flux[i] = 1.0
+        return learned, flux
+
+    @staticmethod
+    def _make_boundary_side_mask(sides: tuple[str, ...] | list[str] | str | None) -> torch.Tensor:
+        mask = torch.ones(4, dtype=torch.float32)
+        if sides is None:
+            return mask
+        if isinstance(sides, str):
+            raw_items = [s.strip() for s in sides.replace(";", ",").split(",") if s.strip()]
+        else:
+            raw_items = [str(s).strip() for s in sides]
+        if not raw_items:
+            return mask
+
+        if any(str(s).strip().lower() in {"all", "*"} for s in raw_items):
+            return mask
+
+        mask.zero_()
+        for side in raw_items:
+            mask[FluxGraphNetModel._boundary_side_index(side)] = 1.0
         return mask
 
     def set_normalization_stats(self, mu, sigma) -> None:
@@ -1074,9 +1216,9 @@ class FluxGraphNetModel(nn.Module):
         width_t = max(float(width), 1e-12)
         return (1.0 - (dist.abs() / width_t)).clamp(min=0.0, max=1.0)
 
-    def _boundary_gates(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _boundary_side_gates_and_ramp(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         n = int(x.size(0))
-        boundary_gate = x.new_zeros((n, 1))
+        side_gates = x.new_zeros((n, 4))
         ramp_gate = x.new_zeros((n, 1))
 
         if self.boundary_distance_start_col is not None:
@@ -1084,8 +1226,12 @@ class FluxGraphNetModel(nn.Module):
             end = start + max(1, int(self.boundary_distance_dim))
             if 0 <= start < x.size(1) and end <= x.size(1):
                 d = x[:, start:end]
-                min_dist = d.abs().min(dim=1, keepdim=True).values
-                boundary_gate = self._linear_gate_from_distance(min_dist, self.boundary_width)
+                n_side = min(int(d.size(1)), 4)
+                if n_side > 0:
+                    side_gates[:, :n_side] = self._linear_gate_from_distance(
+                        d[:, :n_side],
+                        self.boundary_width,
+                    )
                 if d.size(1) >= 3:
                     bottom_dist = d[:, 2:3]
                     ramp_gate = self._linear_gate_from_distance(bottom_dist, self.ramp_boundary_width)
@@ -1099,8 +1245,77 @@ class FluxGraphNetModel(nn.Module):
                     self._linear_gate_from_distance(signed, self.ramp_boundary_width),
                 )
 
+        return side_gates, ramp_gate.clamp(min=0.0, max=1.0)
+
+    def _boundary_gates(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        side_gates, ramp_gate = self._boundary_side_gates_and_ramp(x)
+        if side_gates.numel() == 0:
+            boundary_gate = x.new_zeros((int(x.size(0)), 1))
+        else:
+            boundary_gate = side_gates.max(dim=1, keepdim=True).values
         open_gate = (boundary_gate * (1.0 - ramp_gate)).clamp(min=0.0, max=1.0)
-        return open_gate, ramp_gate.clamp(min=0.0, max=1.0)
+        return open_gate, ramp_gate
+
+    def _open_boundary_flux_source(
+        self,
+        *,
+        x: torch.Tensor,
+        state: dict[str, torch.Tensor],
+        q_abs: torch.Tensor,
+    ) -> torch.Tensor:
+        source = torch.zeros((x.size(0), 4), device=x.device, dtype=q_abs.dtype)
+        if (
+            (not self.use_open_boundary_source)
+            or self.open_boundary_flux_scale <= 0.0
+        ):
+            return source
+
+        side_gates, ramp_gate = self._boundary_side_gates_and_ramp(x)
+        if side_gates.numel() == 0:
+            return source
+        side_mask = self.open_boundary_flux_side_mask.to(device=x.device, dtype=x.dtype).view(1, 4)
+        mode_mask = self.open_boundary_flux_mode_side_mask.to(device=x.device, dtype=x.dtype).view(1, 4)
+        side_gates = (side_gates * side_mask * mode_mask * (1.0 - ramp_gate)).clamp(min=0.0, max=1.0)
+        if not torch.any(side_gates > 0):
+            return source
+
+        u = state["u"].to(device=x.device, dtype=q_abs.dtype)
+        v = state["v"].to(device=x.device, dtype=q_abs.dtype)
+        p = state["p"].to(device=x.device, dtype=q_abs.dtype).clamp_min(self.p_floor)
+        q = q_abs.to(device=x.device, dtype=q_abs.dtype)
+        channel_mask = self.open_boundary_source_mask.to(device=x.device, dtype=q_abs.dtype).view(1, 4)
+
+        normals = q.new_tensor(
+            [
+                [-1.0, 0.0],
+                [1.0, 0.0],
+                [0.0, -1.0],
+                [0.0, 1.0],
+            ]
+        )
+        for side in range(4):
+            gate = side_gates[:, side : side + 1].to(dtype=q_abs.dtype)
+            if not torch.any(gate > 0):
+                continue
+            nx = normals[side, 0]
+            ny = normals[side, 1]
+            un = (u * nx) + (v * ny)
+            speed = un.clamp_min(0.0) if self.open_boundary_flux_outflow_only else un
+
+            flux = q * speed.view(-1, 1)
+            if self.open_boundary_flux_include_pressure:
+                if self.open_boundary_flux_outflow_only:
+                    active = (speed > 0.0).to(dtype=q_abs.dtype)
+                else:
+                    active = q.new_ones(speed.shape)
+                flux = flux.clone()
+                flux[:, 1] = flux[:, 1] + p * nx * active
+                flux[:, 2] = flux[:, 2] + p * ny * active
+                flux[:, 3] = flux[:, 3] + p * speed
+
+            source = source - float(self.open_boundary_flux_scale) * gate * flux * channel_mask
+
+        return source
 
     def _boundary_source(
         self,
@@ -1108,15 +1323,32 @@ class FluxGraphNetModel(nn.Module):
         x: torch.Tensor,
         node_latent: torch.Tensor,
         state: dict[str, torch.Tensor],
+        q_abs: torch.Tensor,
     ) -> torch.Tensor:
         source = torch.zeros((x.size(0), 4), device=x.device, dtype=node_latent.dtype)
-        open_gate, ramp_gate = self._boundary_gates(x)
-        open_gate = open_gate.to(device=node_latent.device, dtype=node_latent.dtype)
+        side_gates, ramp_gate = self._boundary_side_gates_and_ramp(x)
         ramp_gate = ramp_gate.to(device=node_latent.device, dtype=node_latent.dtype)
+        learned_mask = self.open_boundary_learned_side_mask.to(
+            device=node_latent.device,
+            dtype=node_latent.dtype,
+        ).view(1, 4)
+        learned_side_gates = (
+            side_gates.to(device=node_latent.device, dtype=node_latent.dtype)
+            * learned_mask
+            * (1.0 - ramp_gate)
+        ).clamp(min=0.0, max=1.0)
+        learned_gate = learned_side_gates.max(dim=1, keepdim=True).values
 
-        if self.open_boundary_head is not None and torch.any(open_gate > 0):
+        if self.open_boundary_head is not None and torch.any(learned_gate > 0):
             mask = self.open_boundary_source_mask.to(device=node_latent.device, dtype=node_latent.dtype).view(1, 4)
-            source = source + open_gate * self.open_boundary_head(node_latent) * mask
+            source = source + learned_gate * self.open_boundary_head(node_latent) * mask
+
+        if self.use_open_boundary_source:
+            source = source + self._open_boundary_flux_source(
+                x=x,
+                state=state,
+                q_abs=q_abs,
+            ).to(dtype=node_latent.dtype)
 
         if self.ramp_boundary_head is not None and torch.any(ramp_gate > 0):
             mask = self.ramp_boundary_source_mask.to(device=node_latent.device, dtype=node_latent.dtype).view(1, 4)
@@ -1178,7 +1410,12 @@ class FluxGraphNetModel(nn.Module):
             edge_index=edge_index,
             edge_attr=edge_attr,
         )
-        q_update = q_update + self._boundary_source(x=x, node_latent=node_latent, state=state)
+        q_update = q_update + self._boundary_source(
+            x=x,
+            node_latent=node_latent,
+            state=state,
+            q_abs=q_abs,
+        )
 
         if self.predict_type == PREDICT_TYPE_RATE:
             prim_rate_abs = self._conservative_rate_to_primitive_rate(q_update, state)

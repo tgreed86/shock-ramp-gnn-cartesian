@@ -12090,6 +12090,10 @@ def build_model_from_cfg(cfg, device, ramp_feature_ctx: Dict[str, Any] | None = 
     elif model_type == "fluxgraphnet":
         idx = dec.infer_feature_indices(cfg, Fdim)
         state_rep = dec.state_representation_from_cfg(cfg, Fdim)
+        open_boundary_modes_by_side = model_cfg.get("open_boundary_modes_by_side", None)
+        open_boundary_flux_sides_default = (
+            None if open_boundary_modes_by_side is not None else ["left", "right", "top"]
+        )
 
         ramp_normal = model_cfg.get("ramp_normal", None)
         if ramp_normal is None and isinstance(ramp_feature_ctx, dict):
@@ -12130,11 +12134,20 @@ def build_model_from_cfg(cfg, device, ramp_feature_ctx: Dict[str, Any] | None = 
             signed_edge_channels=model_cfg.get("signed_edge_channels", [0, 1]),
             fallback_directed_flux=bool(model_cfg.get("fallback_directed_flux", False)),
             use_open_boundary_source=bool(model_cfg.get("use_open_boundary_source", True)),
+            open_boundary_mode=str(model_cfg.get("open_boundary_mode", "learned_source")),
+            open_boundary_modes_by_side=open_boundary_modes_by_side,
             use_ramp_boundary_source=bool(model_cfg.get("use_ramp_boundary_source", True)),
             open_boundary_source_channels=model_cfg.get(
                 "open_boundary_source_channels",
                 [0, 1, 2, 3],
             ),
+            open_boundary_flux_sides=model_cfg.get(
+                "open_boundary_flux_sides",
+                open_boundary_flux_sides_default,
+            ),
+            open_boundary_flux_scale=float(model_cfg.get("open_boundary_flux_scale", 0.05)),
+            open_boundary_flux_outflow_only=bool(model_cfg.get("open_boundary_flux_outflow_only", True)),
+            open_boundary_flux_include_pressure=bool(model_cfg.get("open_boundary_flux_include_pressure", False)),
             ramp_boundary_source_channels=model_cfg.get(
                 "ramp_boundary_source_channels",
                 [1, 2],
@@ -12276,8 +12289,19 @@ def main(
         model_defaults = cfg.setdefault("model", {})
         model_defaults.setdefault("predict_type", "rate")
         model_defaults.setdefault("use_open_boundary_source", True)
+        model_defaults.setdefault("open_boundary_mode", "learned_source")
+        model_defaults.setdefault("open_boundary_modes_by_side", None)
         model_defaults.setdefault("use_ramp_boundary_source", True)
         model_defaults.setdefault("open_boundary_source_channels", [0, 1, 2, 3])
+        if "open_boundary_flux_sides" not in model_defaults:
+            model_defaults["open_boundary_flux_sides"] = (
+                None
+                if model_defaults.get("open_boundary_modes_by_side", None) is not None
+                else ["left", "right", "top"]
+            )
+        model_defaults.setdefault("open_boundary_flux_scale", 0.05)
+        model_defaults.setdefault("open_boundary_flux_outflow_only", True)
+        model_defaults.setdefault("open_boundary_flux_include_pressure", False)
         model_defaults.setdefault("ramp_boundary_source_channels", [1, 2])
         model_defaults.setdefault("boundary_width", 0.02)
 
