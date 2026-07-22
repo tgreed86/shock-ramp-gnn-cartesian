@@ -1812,6 +1812,295 @@ def _parse_compact_decimal_token(tok: str | None) -> float | None:
         return None
 
 
+def _dmr_case_key(mach: float, shock_angle: float) -> Tuple[float, float]:
+    return (round(float(mach), 8), round(float(shock_angle), 8))
+
+
+def _combine_dmr_mach_tokens(int_token: str | None, frac_token: str | None) -> float | None:
+    """
+    DMR filenames encode Mach as two underscore-separated tokens, e.g.
+    DMR_7_5_50__125x250.h5 -> Mach=7.5, ShockAngle=50.
+    """
+    if int_token is None or frac_token is None:
+        return None
+    left = str(int_token).strip()
+    right = str(frac_token).strip()
+    if left == "" or right == "":
+        return None
+
+    compact_int_frac = (
+        re.fullmatch(r"[+-]?\d+", left) is not None
+        and re.fullmatch(r"\d+", right) is not None
+    )
+    if compact_int_frac:
+        sign = ""
+        digits = left
+        if digits[0] in "+-":
+            sign = digits[0]
+            digits = digits[1:]
+        try:
+            return float(f"{sign}{digits}.{right}")
+        except Exception:
+            return None
+
+    # Fallback for less compact names, e.g. DMR_7p5_0_50 or DMR_7.5_0_50.
+    mach = _parse_compact_decimal_token(left)
+    frac = _parse_compact_decimal_token(right)
+    if mach is None:
+        return None
+    if frac is None or abs(float(frac)) <= 1e-12:
+        return float(mach)
+    return float(mach)
+
+
+def _extract_dmr_case_from_path(path_like: str | None) -> Tuple[float, float] | None:
+    if not path_like:
+        return None
+    s = os.path.basename(str(path_like))
+    m = re.search(
+        r"^DMR[_\-]"
+        r"(-?\d+(?:[pP]\d+|\.\d+)?)"
+        r"[_\-]"
+        r"(-?\d+(?:[pP]\d+|\.\d+)?)"
+        r"[_\-]"
+        r"(-?\d+(?:[pP]\d+|\.\d+)?)"
+        r"(?=(?:[_\-]{1,2}|\.|$))",
+        s,
+        flags=re.IGNORECASE,
+    )
+    if m is None:
+        return None
+    mach = _combine_dmr_mach_tokens(m.group(1), m.group(2))
+    shock_angle = _parse_compact_decimal_token(m.group(3))
+    if mach is None or shock_angle is None:
+        return None
+    return float(mach), float(shock_angle)
+
+
+def _csv_row_value(row: Dict[str, Any], aliases: Sequence[str]) -> Any:
+    normalized = {
+        str(k).strip().lower().replace(" ", "").replace("_", ""): v
+        for k, v in row.items()
+    }
+    for alias in aliases:
+        key = str(alias).strip().lower().replace(" ", "").replace("_", "")
+        if key in normalized:
+            return normalized[key]
+    return None
+
+
+def _resolve_dt_csv_path(cfg: Dict[str, Any]) -> str | None:
+    data_cfg = cfg.get("data", {}) or {}
+    raw = None
+    for key in (
+        "dt_csv_path",
+        "dt_table_path",
+        "parameter_study_csv",
+        "dt_parameter_csv",
+    ):
+        if data_cfg.get(key, None) is not None:
+            raw = data_cfg.get(key)
+            break
+    if raw is None:
+        return None
+    raw_s = str(raw).strip()
+    if raw_s == "":
+        return None
+    return os.path.abspath(os.path.expanduser(raw_s))
+
+
+def _load_dt_parameter_table(csv_path: str) -> Dict[Tuple[float, float], float]:
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(
+            f"Configured data.dt_csv_path does not exist: {csv_path}"
+        )
+
+    table: Dict[Tuple[float, float], float] = {}
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError(f"dt CSV has no header row: {csv_path}")
+        for row_idx, row in enumerate(reader, start=2):
+            mach_raw = _csv_row_value(row, ("Mach", "mach", "M"))
+            angle_raw = _csv_row_value(
+                row,
+                ("ShockAngle", "shock_angle", "angle", "Angle", "Shock Angle"),
+            )
+            dt_raw = _csv_row_value(
+                row,
+                ("Timestep", "time_step", "dt", "delta_t", "DeltaT"),
+            )
+            if mach_raw is None or angle_raw is None or dt_raw is None:
+                raise ValueError(
+                    f"dt CSV row {row_idx} must contain Mach, ShockAngle, and Timestep columns."
+                )
+            try:
+                mach = float(mach_raw)
+                angle = float(angle_raw)
+                dt = float(dt_raw)
+            except Exception as exc:
+                raise ValueError(
+                    f"Could not parse dt CSV row {row_idx}: {row!r}"
+                ) from exc
+            if not np.isfinite(dt) or dt <= 0.0:
+                raise ValueError(
+                    f"dt CSV row {row_idx} has invalid Timestep={dt_raw!r}; expected finite positive dt."
+                )
+            key = _dmr_case_key(mach, angle)
+            prev = table.get(key, None)
+            if prev is not None and abs(float(prev) - dt) > 1e-12:
+                raise ValueError(
+                    f"dt CSV has conflicting Timestep values for Mach={mach:g}, "
+                    f"ShockAngle={angle:g}: {prev:g} vs {dt:g}."
+                )
+            table[key] = float(dt)
+
+    if len(table) == 0:
+        raise ValueError(f"dt CSV contains no data rows: {csv_path}")
+    return table
+
+
+def _dt_known_case_summary(table: Dict[Tuple[float, float], float], *, limit: int = 10) -> str:
+    keys = sorted(table.keys())
+    shown = ", ".join(f"(Mach={m:g}, ShockAngle={a:g})" for m, a in keys[:limit])
+    if len(keys) > limit:
+        shown += f", ... ({len(keys)} total)"
+    return shown
+
+
+def _build_dt_transitions_from_cfg(
+    cfg: Dict[str, Any],
+    data_list: Sequence[Any],
+    *,
+    step_source_ids: Sequence[int] | None = None,
+    source_records: Sequence[Dict[str, Any]] | None = None,
+    source_paths: Sequence[str] | None = None,
+    log_fn: Any = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build per-transition physical dt values.
+
+    Required mode: data.dt_csv_path points to a parameter-study CSV containing
+    Mach, ShockAngle, and Timestep. The DMR case is parsed from each input path.
+    """
+    n = int(len(data_list))
+    if n < 2:
+        raise RuntimeError(f"Need at least 2 snapshots to build dt transitions, got {n}.")
+
+    def _log(msg: str) -> None:
+        if log_fn is not None:
+            log_fn(msg)
+        else:
+            print(msg, flush=True)
+
+    if step_source_ids is None:
+        src_ids_np = np.zeros(n, dtype=np.int64)
+    else:
+        if len(step_source_ids) != n:
+            raise RuntimeError(
+                f"step_source_ids length ({len(step_source_ids)}) must match data_list length ({n})."
+            )
+        src_ids_np = np.asarray(step_source_ids, dtype=np.int64)
+
+    dt_csv_path = _resolve_dt_csv_path(cfg)
+    if dt_csv_path is None:
+        raise RuntimeError(
+            "data.dt_csv_path is required because snapshot time values in the DMR HDF5 files "
+            "are not physical time steps. Add this under the data block, for example: "
+            '"dt_csv_path": "cache/parameter_study.csv".'
+        )
+
+    eps_dt = 1e-12
+    dt_list: List[float] = []
+
+    table = _load_dt_parameter_table(dt_csv_path)
+    cfg.setdefault("data", {})["dt_csv_path"] = dt_csv_path
+
+    records: List[Dict[str, Any]] = []
+    if source_records is not None:
+        records = [dict(r) for r in source_records]
+    elif source_paths is not None:
+        records = [
+            {"source_id": int(i), "pt_path": os.path.abspath(os.path.expanduser(str(p)))}
+            for i, p in enumerate(source_paths)
+        ]
+    else:
+        raise RuntimeError(
+            "data.dt_csv_path is configured, but no source path information was provided "
+            "for matching DMR files to CSV rows."
+        )
+
+    dt_by_source: Dict[int, float] = {}
+    case_by_source: Dict[int, Tuple[float, float]] = {}
+    for fallback_sid, rec in enumerate(records):
+        sid = int(rec.get("source_id", fallback_sid))
+        path = rec.get("pt_path", rec.get("path", None))
+        case = _extract_dmr_case_from_path(path)
+        if case is None:
+            raise RuntimeError(
+                "Could not parse DMR Mach/ShockAngle from input path while using data.dt_csv_path. "
+                f"path={path!r}, csv={dt_csv_path}"
+            )
+        key = _dmr_case_key(case[0], case[1])
+        if key not in table:
+            raise RuntimeError(
+                "No Timestep entry in data.dt_csv_path for "
+                f"Mach={case[0]:g}, ShockAngle={case[1]:g} parsed from {path!r}. "
+                f"Known cases: {_dt_known_case_summary(table)}"
+            )
+        dt_by_source[sid] = float(table[key])
+        case_by_source[sid] = (float(case[0]), float(case[1]))
+
+    valid_same_src: List[float] = []
+    for i in range(n - 1):
+        sid0 = int(src_ids_np[i])
+        sid1 = int(src_ids_np[i + 1])
+        if sid0 == sid1:
+            if sid0 not in dt_by_source:
+                raise RuntimeError(
+                    f"No dt CSV mapping was built for source_id={sid0}; "
+                    f"available source ids: {sorted(dt_by_source.keys())}"
+                )
+            dti = float(dt_by_source[sid0])
+            valid_same_src.append(dti)
+            dt_list.append(dti)
+        else:
+            dt_list.append(float("nan"))
+
+    if len(valid_same_src) > 0:
+        boundary_placeholder_dt = float(np.median(np.asarray(valid_same_src, dtype=np.float64)))
+    else:
+        boundary_placeholder_dt = float(np.median(np.asarray(list(dt_by_source.values()), dtype=np.float64)))
+    dt_list = [
+        boundary_placeholder_dt if (not np.isfinite(v) or (v <= eps_dt)) else float(v)
+        for v in dt_list
+    ]
+    dt_arr = np.asarray(dt_list, dtype=np.float64)
+    dt_transitions = torch.as_tensor(dt_arr, dtype=torch.float32).contiguous()
+    dt_ref = dt_transitions.median()
+
+    cfg.setdefault("data", {})["dt_source"] = "parameter_study_csv"
+    cfg["data"]["dt_ref"] = float(dt_ref.detach().cpu().item())
+
+    per_source_items = [
+        f"source_id={sid}: Mach={case_by_source[sid][0]:g}, "
+        f"ShockAngle={case_by_source[sid][1]:g}, dt={dt_by_source[sid]:.9g}"
+        for sid in sorted(dt_by_source.keys())
+    ]
+    per_source = "; ".join(per_source_items[:8])
+    if len(per_source_items) > 8:
+        per_source += f"; ... ({len(per_source_items)} sources total)"
+    _log(f"[DT] Using physical per-trajectory dt from data.dt_csv_path={dt_csv_path}")
+    _log(f"[DT] {per_source}")
+    _log(
+        "[DT] transitions="
+        f"{len(dt_list)} dt_ref={float(dt_ref):.9g} "
+        f"min/median/max=({float(np.min(dt_arr)):.9g}, "
+        f"{float(np.median(dt_arr)):.9g}, {float(np.max(dt_arr)):.9g})"
+    )
+    return dt_transitions, dt_ref
+
+
 def _extract_pressure_from_path(path_like: str | None) -> float | None:
     if not path_like:
         return None
@@ -12898,43 +13187,12 @@ def main(
             if isinstance(src_map, (list, tuple)) and len(src_map) >= (end + 1):
                 ramp_feature_ctx["source_id_by_t"] = [int(v) for v in src_map[start : end + 1]]
 
-    # -------------------------------
-    # NEW: build dt transitions (t -> t+1) from the raw snapshots
-    # -------------------------------
-    # For multi-file training we allow time to reset at file boundaries.
-    def _snapshot_time_value(snap: Any) -> float:
-        if isinstance(snap, dict):
-            tv = snap.get("time", snap.get("t", None))
-        else:
-            tv = getattr(snap, "time", getattr(snap, "t", None))
-        if tv is None:
-            raise RuntimeError("Each snapshot must provide 'time' (or 't') to build dt transitions.")
-        if torch.is_tensor(tv):
-            if tv.numel() != 1:
-                raise RuntimeError(f"Snapshot time must be scalar, got shape={tuple(tv.shape)}")
-            return float(tv.detach().cpu().item())
-        return float(tv)
-
-    times_np = np.asarray([_snapshot_time_value(s) for s in data_list], dtype=np.float64)
-    eps_dt = 1e-12
-    src_ids_np = np.asarray(step_source_ids, dtype=np.int64)
-    dt_list: List[float] = []
-    positive_same_src: List[float] = []
-    for i in range(len(times_np) - 1):
-        if src_ids_np[i] == src_ids_np[i + 1]:
-            dti = float(times_np[i + 1] - times_np[i])
-            if dti > eps_dt:
-                positive_same_src.append(dti)
-            dt_list.append(dti)
-        else:
-            # Placeholder for boundary transition; windows crossing boundaries are filtered out.
-            dt_list.append(float("nan"))
-    fallback_dt = float(np.median(positive_same_src)) if len(positive_same_src) > 0 else 1.0
-    dt_list = [fallback_dt if (not np.isfinite(v) or (v <= eps_dt)) else float(v) for v in dt_list]
-    dt_transitions = torch.as_tensor(dt_list, dtype=torch.float32).contiguous()
-
-    # Optional: choose a reference dt to keep magnitudes stable (recommended but not required)
-    dt_ref = dt_transitions.median()  # scalar
+    dt_transitions, dt_ref = _build_dt_transitions_from_cfg(
+        cfg,
+        data_list,
+        step_source_ids=step_source_ids,
+        source_records=source_records,
+    )
 
     full_ds = CellRefineWindowDataset(
         series=data_list,       # <-- pass the list directly

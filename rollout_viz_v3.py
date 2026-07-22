@@ -131,6 +131,7 @@ from train import (
     _physics_inputs_active_from_loss_cfg,
     _load_series_from_pt_path,
     _build_ramp_feature_context,
+    _build_dt_transitions_from_cfg,
 )
 from models import ParcFeatureAdapter
 from utils_geom import build_idw_map, apply_idw_map
@@ -208,44 +209,6 @@ def _get_refine_ratio(cfg: dict) -> int:
     if rr < 2:
         raise ValueError(f"refine_ratio must be >=2, got {rr}")
     return rr
-
-def _extract_time(step_obj) -> Optional[float]:
-    """Try to pull a float time from a PyG Data-like object or dict."""
-    if isinstance(step_obj, dict):
-        for k in ("time", "t", "sim_time"):
-            if k in step_obj:
-                try:
-                    return float(step_obj[k])
-                except Exception:
-                    pass
-        return None
-
-    for k in ("time", "t", "sim_time"):
-        if hasattr(step_obj, k):
-            try:
-                return float(getattr(step_obj, k))
-            except Exception:
-                pass
-        try:
-            v = step_obj[k]
-            try:
-                return float(v)
-            except Exception:
-                pass
-        except Exception:
-            pass
-    return None
-
-def _compute_dt_transitions(series):
-    """dt_transitions[i] = time[i+1]-time[i] if metadata exists, else empty list."""
-    times = [_extract_time(s) for s in series]
-    if any(t is None for t in times):
-        return [], None
-    dts = [float(times[i + 1] - times[i]) for i in range(len(times) - 1)]
-    if not dts:
-        return [], None
-    dt_ref = float(np.median(np.asarray(dts, dtype=np.float64)))
-    return dts, dt_ref
 
 def _maybe_empty_device_cache(device: torch.device):
     if device.type == "cuda":
@@ -4662,8 +4625,12 @@ def main():
             f"Need start_t+horizon < T."
         )
 
-    # dt info (if present in snapshots)
-    dt_transitions, dt_ref = _compute_dt_transitions(data_list)
+    dt_transitions, dt_ref = _build_dt_transitions_from_cfg(
+        cfg,
+        data_list,
+        source_paths=[resolved_pt_path],
+        log_fn=log,
+    )
 
     mesh_spec_cfg = (cfg.get("mesh", {}) or {}).get("starting_mesh_path", None)
     mesh_spec_path = (
