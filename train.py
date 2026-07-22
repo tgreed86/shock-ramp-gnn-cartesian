@@ -13207,6 +13207,7 @@ def main(
         raise RuntimeError(
             f"Internal mismatch: full_ds.steps={len(full_ds.steps)} vs source-id map={len(step_source_ids)}."
         )
+    src_ids_np = np.asarray(step_source_ids, dtype=np.int64)
     for ii, step in enumerate(full_ds.steps):
         if isinstance(step, dict):
             step["__source_id"] = int(step_source_ids[ii])
